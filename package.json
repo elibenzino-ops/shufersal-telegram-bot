@@ -9,6 +9,7 @@
   "scripts": {
     "dev": "tsx watch src/index.ts",
     "start": "node dist/index.js",
+    "sync-once": "node dist/syncOnce.js",
     "build": "tsc",
     "typecheck": "tsc --noEmit",
     "test": "vitest run",

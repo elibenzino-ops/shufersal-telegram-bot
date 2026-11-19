@@ -46,6 +46,7 @@ export interface ShufersalClientOptions {
   password: string;
   chromePath?: string;
   browserWsEndpoint?: string;
+  proxyUrl?: string;
   headless: boolean;
   sessionFilePath: string;
   screenshotsDir: string;
@@ -130,18 +131,23 @@ export class ShufersalClient {
       return;
     }
 
+    const launchArgs = [
+      '--no-sandbox',
+      '--disable-setuid-sandbox',
+      '--disable-dev-shm-usage',
+      '--disable-gpu',
+      '--lang=he-IL',
+      '--window-size=1366,900',
+    ];
+    if (this.options.proxyUrl) {
+      launchArgs.push(`--proxy-server=${this.options.proxyUrl}`);
+    }
+
     logger.info(`Launching Chromium from: ${this.options.chromePath}`);
     this.browser = await puppeteer.launch({
       executablePath: this.options.chromePath,
       headless: this.options.headless,
-      args: [
-        '--no-sandbox',
-        '--disable-setuid-sandbox',
-        '--disable-dev-shm-usage',
-        '--disable-gpu',
-        '--lang=he-IL',
-        '--window-size=1366,900',
-      ],
+      args: launchArgs,
     });
   }
 

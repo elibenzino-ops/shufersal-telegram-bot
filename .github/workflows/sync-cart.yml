@@ -1,0 +1,61 @@
+name: Sync Telegram Groceries to Shufersal Cart
+
+on:
+  # 1. לחיצה ידנית מאפליקציית/אתר GitHub ("Run workflow") לפני שעושים קניות
+  workflow_dispatch:
+  # 2. אופציונלי: ריצה מתוזמנת כל 30 דקות (בטל הערה אם תרצה סנכרון תקופתי אוטומטי)
+  # schedule:
+  #   - cron: '*/30 * * * *'
+
+jobs:
+  sync-shufersal:
+    # חשוב: שופרסל חוסמת כתובות IP של שרתי ענן בארה"ב (כמו ubuntu-latest הרגיל של GitHub).
+    # לכן יש 2 אפשרויות להרצה דרך GitHub Actions:
+    #   א. הגדרת GitHub Self-Hosted Runner על מחשב ביתי בישראל (ברירת מחדל: RUNNER_LABEL=self-hosted)
+    #   ב. שימוש ב-ubuntu-latest יחד עם פרוקסי ישראלי ב-Secret בשם PROXY_URL
+    runs-on: ${{ vars.RUNNER_LABEL || 'ubuntu-latest' }}
+    timeout-minutes: 10
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js 24
+        uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+          cache: 'npm'
+
+      - name: Install Chromium (if missing on Linux runner)
+        if: runner.os == 'Linux'
+        run: |
+          if ! command -v chromium >/dev/null 2>&1 && ! command -v google-chrome >/dev/null 2>&1; then
+            sudo apt-get update
+            sudo apt-get install -y --no-install-recommends chromium fonts-noto-core
+          fi
+
+      - name: Restore cached Shufersal session & learned preferences
+        uses: actions/cache@v4
+        with:
+          path: ./data
+          key: shufersal-bot-data-${{ github.run_id }}
+          restore-keys: |
+            shufersal-bot-data-
+
+      - name: Install dependencies & build
+        run: |
+          npm ci
+          npm run build
+
+      - name: Sync queued Telegram messages to Shufersal Online
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          ALLOWED_CHAT_IDS: ${{ secrets.ALLOWED_CHAT_IDS }}
+          ADMIN_USER_IDS: ${{ secrets.ADMIN_USER_IDS }}
+          SHUFERSAL_USERNAME: ${{ secrets.SHUFERSAL_USERNAME }}
+          SHUFERSAL_PASSWORD: ${{ secrets.SHUFERSAL_PASSWORD }}
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          PROXY_URL: ${{ secrets.PROXY_URL }}
+          HEADLESS: 'true'
+          TZ: 'Asia/Jerusalem'
+        run: npm run sync-once

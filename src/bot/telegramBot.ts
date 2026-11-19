@@ -154,28 +154,77 @@ function renderCartSummaryHtml(
   return lines.join('\n');
 }
 
+export type AdminCheckContext = Pick<
+  Context,
+  'from' | 'chat' | 'msg' | 'getChatAdministrators' | 'getChatMember'
+>;
+
+export async function checkIsUserAdmin(
+  ctx: AdminCheckContext,
+  adminUserIds: number[],
+): Promise<boolean> {
+  // 1. Private 1-on-1 chat with the bot
+  if (ctx.chat?.type === 'private') {
+    return true;
+  }
+
+  // 2. Anonymous group owner/admin ("Remain Anonymous" -> sender_chat matches group chat)
+  if (ctx.msg?.sender_chat && ctx.chat && ctx.msg.sender_chat.id === ctx.chat.id) {
+    return true;
+  }
+
+  const userId = ctx.from?.id;
+  if (!userId) return false;
+
+  // 3. Explicit ADMIN_USER_IDS allowlist (additive — never blocks actual Telegram group owners/admins)
+  if (adminUserIds.includes(userId)) {
+    return true;
+  }
+
+  // 4. Primary check: getChatAdministrators works in all groups & supergroups even when the bot itself is NOT a group admin
+  try {
+    const admins = await ctx.getChatAdministrators();
+    if (
+      admins.some(
+        (m) =>
+          m.user.id === userId &&
+          (m.status === 'creator' || m.status === 'administrator'),
+      )
+    ) {
+      return true;
+    }
+  } catch (err) {
+    logger.warn(
+      `getChatAdministrators failed for chat=${ctx.chat?.id} user=${userId}, falling back to getChatMember`,
+      err,
+    );
+  }
+
+  // 5. Fallback check: getChatMember
+  try {
+    const member = await ctx.getChatMember(userId);
+    if (member.status === 'creator' || member.status === 'administrator') {
+      return true;
+    }
+  } catch (err) {
+    logger.warn(
+      `getChatMember failed for chat=${ctx.chat?.id} user=${userId}`,
+      err,
+    );
+  }
+
+  logger.info(
+    `Admin check denied for user=${userId} in chat=${ctx.chat?.id} (type=${ctx.chat?.type}, configuredAdmins=${JSON.stringify(adminUserIds)})`,
+  );
+  return false;
+}
+
 export function createTelegramBot(deps: CreateTelegramBotDeps): Bot {
   const { config, db, shufersal, ai } = deps;
   const bot = new Bot(config.telegramBotToken);
 
   async function isUserAdmin(ctx: Context): Promise<boolean> {
-    const userId = ctx.from?.id;
-    if (!userId) return false;
-
-    if (config.adminUserIds.length > 0) {
-      return config.adminUserIds.includes(userId);
-    }
-
-    if (ctx.chat?.type === 'private') {
-      return true;
-    }
-
-    try {
-      const member = await ctx.getChatMember(userId);
-      return member.status === 'creator' || member.status === 'administrator';
-    } catch {
-      return false;
-    }
+    return checkIsUserAdmin(ctx, config.adminUserIds);
   }
 
   // Always allow /id so the owner can easily copy chat & user IDs during setup
@@ -567,7 +616,10 @@ export function createTelegramBot(deps: CreateTelegramBotDeps): Bot {
 
   bot.command('checkout', async (ctx) => {
     if (!(await isUserAdmin(ctx))) {
-      await ctx.reply('⛔ רק מנהל/ת הקבוצה רשאי/ת ליזום סגירה ואישור הזמנה.');
+      await ctx.reply(
+        `⛔ רק מנהל/ת הקבוצה רשאי/ת ליזום סגירה ואישור הזמנה.\n<i>(למתן הרשאה למשתמש נוסף ניתן להוסיף ל-<code>ADMIN_USER_IDS</code> את המזהה: <code>${ctx.from?.id ?? ''}</code>)</i>`,
+        { parse_mode: 'HTML' },
+      );
       return;
     }
 
@@ -587,7 +639,10 @@ export function createTelegramBot(deps: CreateTelegramBotDeps): Bot {
 
   bot.command('clear', async (ctx) => {
     if (!(await isUserAdmin(ctx))) {
-      await ctx.reply('⛔ רק מנהל/ת הקבוצה רשאי/ת לרוקן את כל העגלה.');
+      await ctx.reply(
+        `⛔ רק מנהל/ת הקבוצה רשאי/ת לרוקן את כל העגלה.\n<i>(מזהה המשתמש שלך: <code>${ctx.from?.id ?? ''}</code>)</i>`,
+        { parse_mode: 'HTML' },
+      );
       return;
     }
 

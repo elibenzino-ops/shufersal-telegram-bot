@@ -235,7 +235,7 @@ export class BotDatabase {
 
   getContributorsByChat(chatId: number): Map<string, string[]> {
     const stmt = this.db.prepare(
-      `SELECT product_code, sender_name FROM cart_contributors WHERE chat_id = ? ORDER BY updated_at ASC`,
+      `SELECT product_code, sender_name FROM cart_contributors WHERE chat_id = ? ORDER BY updated_at ASC, rowid ASC`,
     );
     const rows = stmt.all(chatId) as Array<{
       product_code: string;

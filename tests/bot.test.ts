@@ -3,6 +3,11 @@ import os from 'node:os';
 import path from 'node:path';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import {
+  checkIsUserAdmin,
+  type AdminCheckContext,
+} from '../src/bot/telegramBot.js';
+import { parseAdminUserIds, parseIdList } from '../src/config.js';
+import {
   parseCartModifications,
   parseOrderCodeFromConfirmation,
   parseOrderInUpdateMode,
@@ -292,5 +297,82 @@ describe('format helpers', () => {
     expect(formatCurrency(123.4)).toBe('₪123.40');
     expect(escapeHtml('חלב <3%> & "טרי"')).toBe('חלב &lt;3%&gt; &amp; &quot;טרי&quot;');
     expect(normalizeHebrewQuery('  קוטג\' "תנובה" ')).toBe('קוטג תנובה');
+  });
+});
+
+describe('Admin permissions & ID parsing', () => {
+  it('ignores accidental negative chat IDs in ADMIN_USER_IDS while keeping them in ALLOWED_CHAT_IDS', () => {
+    expect(parseIdList('-1001234567890, 555666777')).toEqual([
+      -1001234567890,
+      555666777,
+    ]);
+    expect(parseAdminUserIds('-1001234567890, -4998877, 555666777')).toEqual([
+      555666777,
+    ]);
+    expect(parseAdminUserIds('-1001234567890')).toEqual([]);
+  });
+
+  it('allows Telegram group owner (creator) even when bot is not a group admin and ADMIN_USER_IDS has another ID', async () => {
+    const ownerId = 777888999;
+    const ctx = {
+      from: { id: ownerId, is_bot: false, first_name: 'Eli' },
+      chat: { id: -412345678, type: 'group', title: 'משפחה' },
+      msg: undefined,
+      getChatAdministrators: vi.fn(async () => [
+        {
+          status: 'creator',
+          is_anonymous: false,
+          user: { id: ownerId, is_bot: false, first_name: 'Eli' },
+        },
+      ]),
+      getChatMember: vi.fn(async () => {
+        throw new Error('Bad Request: method is available only for chat administrators');
+      }),
+    } as unknown as AdminCheckContext;
+
+    // Even if ADMIN_USER_IDS was configured with someone else's ID (111222333), group owner is STILL allowed!
+    await expect(checkIsUserAdmin(ctx, [111222333])).resolves.toBe(true);
+    await expect(checkIsUserAdmin(ctx, [])).resolves.toBe(true);
+  });
+
+  it('allows anonymous group owner sending on behalf of the group (sender_chat)', async () => {
+    const chatId = -10099887766;
+    const ctx = {
+      from: { id: 1087968824, is_bot: true, first_name: 'Group' },
+      chat: { id: chatId, type: 'supergroup', title: 'קניות הבית' },
+      msg: { sender_chat: { id: chatId, type: 'supergroup', title: 'קניות הבית' } },
+      getChatAdministrators: vi.fn(async () => []),
+      getChatMember: vi.fn(async () => ({ status: 'left' })),
+    } as unknown as AdminCheckContext;
+
+    await expect(checkIsUserAdmin(ctx, [])).resolves.toBe(true);
+  });
+
+  it('allows non-admin group member explicitly listed in ADMIN_USER_IDS, and rejects unlisted regular members', async () => {
+    const spouseId = 222333444;
+    const kidId = 999000111;
+    const ownerId = 777888999;
+
+    const makeCtx = (userId: number) =>
+      ({
+        from: { id: userId, is_bot: false, first_name: 'Member' },
+        chat: { id: -412345678, type: 'group', title: 'משפחה' },
+        msg: undefined,
+        getChatAdministrators: vi.fn(async () => [
+          {
+            status: 'creator',
+            is_anonymous: false,
+            user: { id: ownerId, is_bot: false, first_name: 'Eli' },
+          },
+        ]),
+        getChatMember: vi.fn(async () => ({
+          status: 'member',
+          user: { id: userId, is_bot: false, first_name: 'Member' },
+        })),
+      }) as unknown as AdminCheckContext;
+
+    await expect(checkIsUserAdmin(makeCtx(spouseId), [spouseId])).resolves.toBe(true);
+    await expect(checkIsUserAdmin(makeCtx(kidId), [spouseId])).resolves.toBe(false);
+    await expect(checkIsUserAdmin(makeCtx(kidId), [])).resolves.toBe(false);
   });
 });

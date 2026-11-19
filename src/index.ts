@@ -16,6 +16,7 @@ async function main(): Promise<void> {
     password: config.shufersalPassword,
     chromePath: config.chromePath,
     browserWsEndpoint: config.browserWsEndpoint,
+    proxyUrl: config.proxyUrl,
     headless: config.headless,
     sessionFilePath: config.sessionFilePath,
     screenshotsDir: config.screenshotsDir,

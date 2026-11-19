@@ -5,14 +5,19 @@ import { z } from 'zod';
 
 dotenv.config();
 
-function parseIdList(raw: string | undefined): number[] {
+export function parseIdList(raw: string | undefined): number[] {
   if (!raw || !raw.trim()) return [];
   return raw
     .split(',')
     .map((s) => s.trim())
     .filter(Boolean)
     .map((s) => Number(s))
-    .filter((n) => !Number.isNaN(n));
+    .filter((n) => Number.isInteger(n) && n !== 0);
+}
+
+export function parseAdminUserIds(raw: string | undefined): number[] {
+  // Telegram user IDs are strictly positive integers (> 0); negative IDs are group/channel chat IDs
+  return parseIdList(raw).filter((n) => n > 0);
 }
 
 function detectChromeExecutable(): string | undefined {
@@ -47,6 +52,7 @@ const EnvSchema = z.object({
 
   CHROME_PATH: z.string().optional(),
   BROWSER_WS_ENDPOINT: z.string().optional(),
+  PROXY_URL: z.string().optional(),
   HEADLESS: z
     .string()
     .optional()
@@ -69,6 +75,7 @@ export interface AppConfig {
   geminiModel: string;
   chromePath?: string;
   browserWsEndpoint?: string;
+  proxyUrl?: string;
   headless: boolean;
   dataDir: string;
   dbPath: string;
@@ -102,13 +109,14 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
   return {
     telegramBotToken: data.TELEGRAM_BOT_TOKEN,
     allowedChatIds: parseIdList(data.ALLOWED_CHAT_IDS),
-    adminUserIds: parseIdList(data.ADMIN_USER_IDS),
+    adminUserIds: parseAdminUserIds(data.ADMIN_USER_IDS),
     shufersalUsername: data.SHUFERSAL_USERNAME,
     shufersalPassword: data.SHUFERSAL_PASSWORD,
     geminiApiKey: data.GEMINI_API_KEY,
     geminiModel: data.GEMINI_MODEL,
     chromePath,
     browserWsEndpoint: data.BROWSER_WS_ENDPOINT,
+    proxyUrl: data.PROXY_URL?.trim() || undefined,
     headless: data.HEADLESS,
     dataDir,
     dbPath: path.join(dataDir, 'bot.sqlite'),
