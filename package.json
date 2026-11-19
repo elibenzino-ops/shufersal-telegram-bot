@@ -1,0 +1,32 @@
+{
+  "name": "shufersal-telegram-bot",
+  "version": "1.0.0",
+  "description": "בוט טלגרם חכם להזמנות קבוצתיות אוטומטיות בשופרסל אונליין עם זיהוי מוצרים ב-AI, ניהול עגלה, בחירת משלוח ואישור מנהל",
+  "type": "module",
+  "engines": {
+    "node": ">=22.5.0"
+  },
+  "scripts": {
+    "dev": "tsx watch src/index.ts",
+    "start": "node dist/index.js",
+    "build": "tsc",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run",
+    "test:watch": "vitest"
+  },
+  "dependencies": {
+    "@google/genai": "^3.6.0",
+    "dayjs": "^1.11.23",
+    "dotenv": "^16.4.7",
+    "grammy": "^1.46.0",
+    "puppeteer-core": "^25.18.1",
+    "zod": "^4.6.7"
+  },
+  "devDependencies": {
+    "@types/node": "^24.0.0",
+    "tsx": "^4.21.0",
+    "typescript": "^5.9.2",
+    "vitest": "^3.2.0"
+  },
+  "license": "MIT"
+}

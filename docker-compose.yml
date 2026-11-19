@@ -1,0 +1,15 @@
+services:
+  shufersal-bot:
+    build: .
+    container_name: shufersal-telegram-bot
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      - TZ=Asia/Jerusalem
+      - DATA_DIR=/app/data
+      - CHROME_PATH=/usr/bin/chromium
+      - HEADLESS=true
+    shm_size: '512mb'
+    volumes:
+      - ./data:/app/data
