@@ -39,6 +39,17 @@ export type CallbackPayload =
       orderCode: string;
     }
   | {
+      kind: 'cart_edit_page';
+      page: number;
+    }
+  | {
+      kind: 'cart_item_op';
+      productCode: string;
+      sellingMethod: ShufersalSellingMethodCode;
+      op: 'rm' | 'dec';
+      page: number;
+    }
+  | {
       kind: 'checkout_exec';
       removeMissingItems: boolean;
     };

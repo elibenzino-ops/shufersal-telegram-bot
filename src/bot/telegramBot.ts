@@ -266,6 +266,7 @@ export function createTelegramBot(deps: CreateTelegramBotDeps): Bot {
         `אני אזהה אוטומטית את המוצרים לפי היסטוריית הרכישות שלכם, אוסיף אותם לעגלה בשופרסל, ואציג כפתורים להחלפת מוצר או שינוי כמות (ואלמד את ההעדפות שלכם!).\n\n` +
         `<b>פקודות זמינות:</b>\n` +
         `• /cart – צפייה בעגלת שופרסל הנוכחית וסה"כ לתשלום\n` +
+        `• /remove <code>[מוצר]</code> – הסרה או עריכת כמות של פריטים בעגלה / בהזמנה שנטענה\n` +
         `• /search <code>&lt;מוצר&gt;</code> – חיפוש ידני ובחירה מתוך תוצאות\n` +
         `• /slots – בחירת יום ושעת משלוח בשופרסל\n` +
         `• /orders – צפייה בהזמנות פעילות וטעינת הזמנה קיימת לעדכון\n` +
@@ -276,6 +277,141 @@ export function createTelegramBot(deps: CreateTelegramBotDeps): Bot {
     );
   });
 
+  function buildCartActionKeyboard(orderInUpdateMode: string | null): InlineKeyboard {
+    const kb = new InlineKeyboard()
+      .text(
+        orderInUpdateMode
+          ? '🗑 הסר / ערוך פריטים בהזמנה'
+          : '🗑 הסר / ערוך פריטים בעגלה',
+        'nav:edit_cart',
+      )
+      .row()
+      .text('🔄 רענן עגלה', 'nav:cart');
+
+    if (!orderInUpdateMode) {
+      kb.text('🚚 בחר חלון משלוח', 'nav:slots');
+    }
+    kb.row().text(
+      orderInUpdateMode
+        ? `💳 שמור עדכון הזמנה #${orderInUpdateMode} (מנהל)`
+        : '💳 סיכום ואישור הזמנה (מנהל)',
+      'nav:checkout',
+    );
+    return kb;
+  }
+
+  async function renderCartEditView(
+    chatId: number,
+    page: number,
+    messageIdToEdit?: number,
+    noticeText?: string,
+  ): Promise<void> {
+    const cart = await shufersal.getEnrichedCart(chatId);
+
+    if (cart.items.length === 0) {
+      const emptyMsg =
+        (noticeText ? `${noticeText}\n\n` : '') +
+        '🛒 העגלה ריקה כרגע – אין פריטים נוספים להסרה.';
+      const kb = new InlineKeyboard().text('⬅️ חזרה לעגלה', 'nav:cart');
+      if (messageIdToEdit) {
+        await bot.api.editMessageText(chatId, messageIdToEdit, emptyMsg, {
+          parse_mode: 'HTML',
+          reply_markup: kb,
+        });
+      } else {
+        await bot.api.sendMessage(chatId, emptyMsg, {
+          parse_mode: 'HTML',
+          reply_markup: kb,
+        });
+      }
+      return;
+    }
+
+    const ITEMS_PER_PAGE = 8;
+    const totalPages = Math.max(1, Math.ceil(cart.items.length / ITEMS_PER_PAGE));
+    const safePage = Math.max(0, Math.min(page, totalPages - 1));
+    const startIdx = safePage * ITEMS_PER_PAGE;
+    const pageItems = cart.items.slice(startIdx, startIdx + ITEMS_PER_PAGE);
+
+    const header = cart.orderInUpdateMode
+      ? `🗑 <b>הסרה ועריכת פריטים – הזמנה #${escapeHtml(cart.orderInUpdateMode)}</b>`
+      : `🗑 <b>הסרה ועריכת פריטים בעגלת שופרסל</b>`;
+
+    const lines: string[] = [header];
+    if (noticeText) {
+      lines.push(noticeText);
+    }
+    lines.push(
+      `לחצו <b>❌</b> להסרה מלאה של מוצר, או <b>➖</b> להפחתת כמות (סה"כ כעת: <b>${formatCurrency(cart.totalPrice)}</b> • ${cart.items.length} פריטים` +
+        (totalPages > 1 ? ` • עמוד ${safePage + 1}/${totalPages}` : '') +
+        `):`,
+    );
+
+    const kb = new InlineKeyboard();
+    for (const item of pageItems) {
+      const displayName = item.productName ?? item.productCode;
+      const sellingMethod = item.sellingMethod ?? 'BY_UNIT';
+      const qtyShort = formatQuantity(item.quantity, sellingMethod);
+      const oosPrefix = item.inStock ? '' : '⚠️ ';
+      const rmTok = db.saveCallbackPayload({
+        kind: 'cart_item_op',
+        productCode: item.productCode,
+        sellingMethod,
+        op: 'rm',
+        page: safePage,
+      });
+      const decTok = db.saveCallbackPayload({
+        kind: 'cart_item_op',
+        productCode: item.productCode,
+        sellingMethod,
+        op: 'dec',
+        page: safePage,
+      });
+
+      const truncatedName =
+        displayName.length > 24 ? `${displayName.slice(0, 23)}…` : displayName;
+      kb.text(`❌ ${oosPrefix}${truncatedName} (${qtyShort})`, `a:${rmTok}`)
+        .text('➖', `a:${decTok}`)
+        .row();
+    }
+
+    if (totalPages > 1) {
+      if (safePage > 0) {
+        const prevTok = db.saveCallbackPayload({
+          kind: 'cart_edit_page',
+          page: safePage - 1,
+        });
+        kb.text('⬅️ הקודם', `a:${prevTok}`);
+      }
+      if (safePage < totalPages - 1) {
+        const nextTok = db.saveCallbackPayload({
+          kind: 'cart_edit_page',
+          page: safePage + 1,
+        });
+        kb.text('הבא ➡️', `a:${nextTok}`);
+      }
+      kb.row();
+    }
+
+    kb.text('⬅️ חזרה לעגלה', 'nav:cart').text(
+      cart.orderInUpdateMode ? '💳 שמור עדכון (מנהל)' : '💳 להזמנה (מנהל)',
+      'nav:checkout',
+    );
+
+    const text = lines.join('\n\n');
+    if (messageIdToEdit) {
+      await bot.api.editMessageText(chatId, messageIdToEdit, text, {
+        parse_mode: 'HTML',
+        reply_markup: kb,
+      });
+    } else {
+      await bot.api.sendMessage(chatId, text, {
+        parse_mode: 'HTML',
+        reply_markup: kb,
+      });
+    }
+  }
+
   bot.command(['cart', 'agala'], async (ctx) => {
     const loading = await ctx.reply('🔄 טוען את מצב העגלה משופרסל אונליין...');
     try {
@@ -284,11 +420,7 @@ export function createTelegramBot(deps: CreateTelegramBotDeps): Bot {
         shufersal.getSelectedSlot().catch(() => null),
       ]);
 
-      const kb = new InlineKeyboard()
-        .text('🔄 רענן עגלה', 'nav:cart')
-        .text('🚚 בחר חלון משלוח', 'nav:slots')
-        .row()
-        .text('💳 סיכום ואישור הזמנה (מנהל)', 'nav:checkout');
+      const kb = buildCartActionKeyboard(cart.orderInUpdateMode);
 
       await ctx.api.editMessageText(
         ctx.chat.id,
@@ -301,6 +433,69 @@ export function createTelegramBot(deps: CreateTelegramBotDeps): Bot {
       );
     } catch (err) {
       logger.error('/cart command failed', err);
+      await ctx.api.editMessageText(
+        ctx.chat.id,
+        loading.message_id,
+        formatUserFacingError(err),
+        { parse_mode: 'HTML' },
+      );
+    }
+  });
+
+  bot.command(['remove', 'edit'], async (ctx) => {
+    const query = ctx.match.trim();
+    if (!query) {
+      const loading = await ctx.reply('🗑 טוען את רשימת הפריטים בעגלה להסרה/עריכה...');
+      try {
+        await renderCartEditView(ctx.chat.id, 0, loading.message_id);
+      } catch (err) {
+        logger.error('/remove command failed', err);
+        await ctx.api.editMessageText(
+          ctx.chat.id,
+          loading.message_id,
+          formatUserFacingError(err),
+          { parse_mode: 'HTML' },
+        );
+      }
+      return;
+    }
+
+    const loading = await ctx.reply(
+      `🗑 מחפש ומסיר את <b>${escapeHtml(query)}</b> מהעגלה...`,
+      { parse_mode: 'HTML' },
+    );
+    try {
+      const { removedItem, cart } = await shufersal.removeMatchingProduct({
+        chatId: ctx.chat.id,
+        query,
+      });
+
+      if (!removedItem) {
+        const kb = new InlineKeyboard().text(
+          '🗑 פתח רשימת כל הפריטים להסרה',
+          'nav:edit_cart',
+        );
+        await ctx.api.editMessageText(
+          ctx.chat.id,
+          loading.message_id,
+          `ℹ️ לא נמצא בעגלה מוצר תואם ל-"<b>${escapeHtml(query)}</b>".\nלחצו על הכפתור כדי לבחור מתוך רשימת הפריטים בעגלה:`,
+          { parse_mode: 'HTML', reply_markup: kb },
+        );
+        return;
+      }
+
+      const kb = new InlineKeyboard()
+        .text('🗑 הסר פריטים נוספים', 'nav:edit_cart')
+        .text('🛒 הצג עגלה', 'nav:cart');
+      await ctx.api.editMessageText(
+        ctx.chat.id,
+        loading.message_id,
+        `🗑 <b>הוסר מהעגלה:</b> ${escapeHtml(removedItem.productName ?? removedItem.productCode)}\n` +
+          `💰 סה"כ עגלה כעת: <b>${formatCurrency(cart.totalPrice)}</b> (${cart.items.length} פריטים)`,
+        { parse_mode: 'HTML', reply_markup: kb },
+      );
+    } catch (err) {
+      logger.error('/remove <query> command failed', err);
       await ctx.api.editMessageText(
         ctx.chat.id,
         loading.message_id,
@@ -679,15 +874,17 @@ export function createTelegramBot(deps: CreateTelegramBotDeps): Bot {
           shufersal.getEnrichedCart(chatId),
           shufersal.getSelectedSlot().catch(() => null),
         ]);
-        const kb = new InlineKeyboard()
-          .text('🔄 רענן עגלה', 'nav:cart')
-          .text('🚚 בחר חלון משלוח', 'nav:slots')
-          .row()
-          .text('💳 סיכום ואישור הזמנה (מנהל)', 'nav:checkout');
+        const kb = buildCartActionKeyboard(cart.orderInUpdateMode);
         await ctx.editMessageText(renderCartSummaryHtml(cart, slot), {
           parse_mode: 'HTML',
           reply_markup: cart.items.length > 0 ? kb : undefined,
         });
+        return;
+      }
+
+      if (data === 'nav:edit_cart') {
+        await ctx.answerCallbackQuery('פותח רשימת פריטים להסרה ועריכה...');
+        await renderCartEditView(chatId, 0, messageId);
         return;
       }
 
@@ -977,14 +1174,61 @@ export function createTelegramBot(deps: CreateTelegramBotDeps): Bot {
             chatId,
             payload.orderCode,
           );
+          const kb = buildCartActionKeyboard(
+            cart.orderInUpdateMode ?? payload.orderCode,
+          );
           await ctx.editMessageText(
             `✏️ <b>הזמנה #${escapeHtml(payload.orderCode)} נטענה לעגלה במצב עדכון!</b>\n\n` +
-              `כל מצרך שיישלח עכשיו בקבוצה יתווסף להזמנה זו.\n` +
-              `⚠️ <b>חשוב:</b> בסיום הוספת המצרכים, על המנהל/ת להריץ /checkout ולאשר את שמירת העדכון בשופרסל!\n\n` +
+              `• להוספת מוצרים – כתבו כרגיל בקבוצה.\n` +
+              `• להסרת מוצרים – לחצו <b>🗑 הסר / ערוך פריטים בהזמנה</b> למטה, הקלידו <code>/remove</code>, או כתבו <i>"תורידו את..."</i>.\n` +
+              `⚠️ <b>חשוב:</b> בסיום העריכה, על המנהל/ת להריץ /checkout (או ללחוץ שמור עדכון) כדי לשמור את השינויים בשופרסל!\n\n` +
               renderCartSummaryHtml(cart),
-            { parse_mode: 'HTML' },
+            {
+              parse_mode: 'HTML',
+              reply_markup: cart.items.length > 0 ? kb : undefined,
+            },
           );
           return;
+        }
+
+        if (payload.kind === 'cart_edit_page') {
+          await ctx.answerCallbackQuery();
+          await renderCartEditView(chatId, payload.page, messageId);
+          return;
+        }
+
+        if (payload.kind === 'cart_item_op') {
+          if (payload.op === 'rm') {
+            await ctx.answerCallbackQuery('מסיר מוצר מהעגלה...');
+            const { removedItem } = await shufersal.removeProductByCode({
+              chatId,
+              productCode: payload.productCode,
+            });
+            const notice = removedItem
+              ? `✅ <b>הוסר מהעגלה:</b> ${escapeHtml(removedItem.productName ?? removedItem.productCode)}`
+              : `ℹ️ המוצר כבר אינו בעגלה.`;
+            await renderCartEditView(chatId, payload.page, messageId, notice);
+            return;
+          }
+
+          if (payload.op === 'dec') {
+            const step = payload.sellingMethod === 'BY_WEIGHT' ? 0.5 : 1;
+            await ctx.answerCallbackQuery('מפחית כמות בעגלה...');
+            const cached = db.getCachedProduct(payload.productCode);
+            const { newQuantity } = await shufersal.adjustQuantityByDelta({
+              chatId,
+              productCode: payload.productCode,
+              sellingMethod: payload.sellingMethod,
+              delta: -step,
+            });
+            const label = escapeHtml(cached?.name ?? payload.productCode);
+            const notice =
+              newQuantity <= 0
+                ? `✅ <b>הוסר מהעגלה:</b> ${label}`
+                : `✅ <b>עודכנה כמות:</b> ${label} → <b>${escapeHtml(formatQuantity(newQuantity, payload.sellingMethod))}</b>`;
+            await renderCartEditView(chatId, payload.page, messageId, notice);
+            return;
+          }
         }
 
         if (payload.kind === 'checkout_exec') {
@@ -1206,6 +1450,7 @@ export function createTelegramBot(deps: CreateTelegramBotDeps): Bot {
 export async function registerBotCommands(bot: Bot): Promise<void> {
   await bot.api.setMyCommands([
     { command: 'cart', description: 'הצגת עגלת שופרסל הנוכחית וסה"כ לתשלום' },
+    { command: 'remove', description: 'הסרה או עריכת כמות של פריטים בעגלה / בהזמנה' },
     { command: 'slots', description: 'בחירת יום ושעת משלוח בשופרסל' },
     { command: 'checkout', description: '(מנהל) אישור וסגירת הזמנה בשופרסל' },
     { command: 'orders', description: 'צפייה בהזמנות פעילות וטעינת הזמנה לעדכון' },
