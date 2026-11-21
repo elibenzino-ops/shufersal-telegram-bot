@@ -12,6 +12,10 @@ import {
   type RawCartPage,
 } from './cartParser.js';
 import {
+  STORE_META,
+  type StoreClient,
+} from '../stores/types.js';
+import {
   ShufersalAuthError,
   ShufersalManualVerificationRequiredError,
   type ActiveOrderSummary,
@@ -73,7 +77,10 @@ function normalizeSellingMethod(raw?: string | null): ShufersalSellingMethodCode
   return 'BY_UNIT';
 }
 
-export class ShufersalClient {
+export class ShufersalClient implements StoreClient {
+  readonly storeId = 'shufersal' as const;
+  readonly meta = STORE_META.shufersal;
+
   private browser: Browser | null = null;
   private context: BrowserContext | null = null;
   private page: Page | null = null;
@@ -409,8 +416,14 @@ export class ShufersalClient {
           ? categoryGroup.name.replace(/^\d+-/, '')
           : null;
 
+    const code = String(raw['code'] ?? '');
+    const strippedCode = code.replace(/^P_/i, '').trim();
+    const barcode = /^\d{6,14}$/.test(strippedCode) ? strippedCode : null;
+
     return {
-      code: String(raw['code'] ?? ''),
+      code,
+      storeId: 'shufersal',
+      barcode,
       name: String(raw['name'] ?? ''),
       brandName,
       unitDescription:

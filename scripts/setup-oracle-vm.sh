@@ -38,6 +38,18 @@ if [ ! -f .env ]; then
   read -r -p "Enter SHUFERSAL_USERNAME (email or ID): " SHUF_USER
   read -r -s -p "Enter SHUFERSAL_PASSWORD: " SHUF_PASS
   echo ""
+  read -r -p "Enter HAZI_HINAM_USERNAME (optional, Enter for guest comparison): " HAZI_USER
+  HAZI_PASS=""
+  if [ -n "$HAZI_USER" ]; then
+    read -r -s -p "Enter HAZI_HINAM_PASSWORD: " HAZI_PASS
+    echo ""
+  fi
+  read -r -p "Enter SUPER_HAVIV_USERNAME (optional, Enter for guest comparison): " HAVIV_USER
+  HAVIV_PASS=""
+  if [ -n "$HAVIV_USER" ]; then
+    read -r -s -p "Enter SUPER_HAVIV_PASSWORD: " HAVIV_PASS
+    echo ""
+  fi
   read -r -p "Enter GEMINI_API_KEY (from aistudio.google.com): " GEMINI_KEY
   read -r -p "Enter ALLOWED_CHAT_IDS (optional, press Enter to set later via /id): " CHAT_IDS
   read -r -p "Enter ADMIN_USER_IDS (optional, press Enter to allow Telegram Group Admins): " ADMIN_IDS
@@ -46,8 +58,13 @@ if [ ! -f .env ]; then
 TELEGRAM_BOT_TOKEN=${TG_TOKEN}
 ALLOWED_CHAT_IDS=${CHAT_IDS}
 ADMIN_USER_IDS=${ADMIN_IDS}
+ENABLED_STORES=shufersal,hazi_hinam,super_haviv
 SHUFERSAL_USERNAME=${SHUF_USER}
 SHUFERSAL_PASSWORD=${SHUF_PASS}
+HAZI_HINAM_USERNAME=${HAZI_USER}
+HAZI_HINAM_PASSWORD=${HAZI_PASS}
+SUPER_HAVIV_USERNAME=${HAVIV_USER}
+SUPER_HAVIV_PASSWORD=${HAVIV_PASS}
 GEMINI_API_KEY=${GEMINI_KEY}
 GEMINI_MODEL=gemini-2.5-flash
 HEADLESS=true

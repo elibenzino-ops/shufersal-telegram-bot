@@ -1,36 +1,25 @@
 import { Bot } from 'grammy';
 import { GroceryAiService } from './ai/groceryAi.js';
+import { renderComparisonHtml } from './bot/telegramBot.js';
 import { loadConfig } from './config.js';
 import { logger } from './logger.js';
-import { ShufersalClient } from './shufersal/client.js';
-import { ShufersalManager } from './shufersal/manager.js';
 import { BotDatabase } from './store/database.js';
-import { escapeHtml, formatCurrency, formatQuantity } from './utils/format.js';
+import { createMultiStoreManager } from './stores/factory.js';
+import { escapeHtml, formatQuantity } from './utils/format.js';
 
 /**
  * One-shot batch synchronization mode (ideal for GitHub Actions / cron jobs).
  * Pulls all unread Telegram group messages queued by Telegram's servers,
- * parses groceries via Gemini AI, updates the Shufersal cart, posts a summary
+ * parses groceries via Gemini AI, updates carts across all enabled stores
+ * (Shufersal, Hazi Hinam, Super Haviv), posts a cheapest-cart comparison summary
  * back to the group, acknowledges the processed updates, and exits cleanly.
  */
 async function runBatchSync(): Promise<void> {
-  logger.info('Starting one-shot Telegram -> Shufersal batch sync...');
+  logger.info('Starting one-shot multi-store Telegram -> Grocery batch sync...');
   const config = loadConfig();
   const bot = new Bot(config.telegramBotToken);
   const db = new BotDatabase(config.dbPath);
-
-  const client = new ShufersalClient({
-    username: config.shufersalUsername,
-    password: config.shufersalPassword,
-    chromePath: config.chromePath,
-    browserWsEndpoint: config.browserWsEndpoint,
-    proxyUrl: config.proxyUrl,
-    headless: config.headless,
-    sessionFilePath: config.sessionFilePath,
-    screenshotsDir: config.screenshotsDir,
-  });
-
-  const shufersal = new ShufersalManager(client, db);
+  const stores = createMultiStoreManager(config, db);
   const ai = new GroceryAiService(config.geminiApiKey, config.geminiModel);
 
   try {
@@ -79,79 +68,88 @@ async function runBatchSync(): Promise<void> {
 
       for (const req of parsed.items) {
         if (req.action === 'remove') {
-          const { removedItem } = await shufersal.removeMatchingProduct({
+          const removed = await stores.removeAcrossStores({
             chatId,
             query: req.searchQuery,
           });
-          if (removedItem) {
+          const names = removed
+            .filter((r) => r.removedItem)
+            .map((r) => `${r.meta.emoji} ${r.meta.shortName}`);
+          if (names.length > 0) {
             chatLog.push(
-              `🗑 הוסר: <b>${escapeHtml(removedItem.productName ?? removedItem.productCode)}</b>`,
+              `🗑 הוסר <b>${escapeHtml(req.searchQuery)}</b> (${names.join(', ')})`,
             );
           }
           continue;
         }
 
-        const learned = db.getPreference(req.searchQuery);
-        const candidates = await shufersal.search(req.searchQuery, 15);
-        const selection = await ai.selectBestProduct({
-          request: req,
-          candidates,
-          learnedProductCode: learned?.productCode ?? null,
-        });
-
-        if (!selection.selected) {
-          chatLog.push(
-            `⚠️ לא נמצא במלאי: <b>${escapeHtml(req.searchQuery)}</b>`,
-          );
-          continue;
-        }
-
-        const { finalQuantity } = await shufersal.addOrIncrementProduct({
+        const res = await stores.addItemAcrossStores({
           chatId,
           senderName,
-          product: selection.selected,
-          quantity: selection.adjustedQuantity,
-          mode: req.action === 'set' ? 'set' : 'increment',
-          comment: req.pickerComment,
+          request: req,
+          ai,
         });
 
-        chatLog.push(
-          `✅ <b>${escapeHtml(selection.selected.name)}</b> — ${escapeHtml(formatQuantity(finalQuantity, selection.selected.sellingMethod))} (${escapeHtml(selection.selected.formattedPrice)}) <i>[${escapeHtml(senderName)}]</i>`,
-        );
+        const addedParts = res.outcomes
+          .filter((o) => o.status === 'added' && o.product)
+          .map((o) => {
+            const win = res.cheapestItemStoreId === o.storeId ? ' 🏆' : '';
+            const qty = formatQuantity(
+              o.addedQty ?? 1,
+              o.product!.sellingMethod,
+            );
+            return `${o.meta.emoji} ${escapeHtml(o.meta.shortName)}: ${escapeHtml(o.product!.formattedPrice)} (${escapeHtml(qty)})${win}`;
+          });
+
+        if (addedParts.length > 0) {
+          chatLog.push(
+            `✅ <b>${escapeHtml(req.searchQuery)}</b> (${escapeHtml(senderName)}): ${addedParts.join(' | ')}`,
+          );
+        } else {
+          chatLog.push(
+            `😕 לא נמצא במלאי: <b>${escapeHtml(req.searchQuery)}</b>`,
+          );
+        }
       }
 
-      changesByChat.set(chatId, chatLog);
+      if (chatLog.length > 0) {
+        changesByChat.set(chatId, chatLog);
+      }
     }
 
-    for (const [chatId, logs] of changesByChat.entries()) {
-      if (logs.length === 0) continue;
-      const cart = await shufersal.getEnrichedCart(chatId);
-      const summary =
-        `🛒 <b>סיכום סנכרון אוטומטי לעגלת שופרסל:</b>\n\n` +
-        logs.join('\n') +
-        `\n\n💰 <b>סה"כ בעגלה כעת: ${formatCurrency(cart.totalPrice)}</b> (${cart.items.filter((i) => i.inStock).length} פריטים במלאי)\n` +
-        `🔗 <a href="https://www.shufersal.co.il/online/he/cart">מעבר לעגלה בשופרסל אונליין</a>`;
+    // Post per-chat batch summary + live cheapest-cart comparison
+    for (const [chatId, lines] of changesByChat.entries()) {
+      const comparison = await stores.compareCarts(chatId);
+      const comparisonHtml = renderComparisonHtml(
+        comparison,
+        '⚖️ השוואת עגלות מעודכנת בין הרשתות',
+      );
 
-      await bot.api.sendMessage(chatId, summary, { parse_mode: 'HTML' });
+      await bot.api.sendMessage(
+        chatId,
+        `🔄 <b>סנכרון מצרכים הושלם בהצלחה!</b>\n\n` +
+          `${lines.join('\n')}\n\n` +
+          `${comparisonHtml}`,
+        { parse_mode: 'HTML' },
+      );
     }
 
-    // Acknowledge all processed updates so Telegram clears them from its queue
+    // Acknowledge processed updates so Telegram won't re-deliver them next run
     if (highestUpdateId > 0) {
       await bot.api.getUpdates({
         offset: highestUpdateId + 1,
-        limit: 1,
         timeout: 0,
+        limit: 1,
       });
+      logger.info(`Acknowledged Telegram updates up to ID ${highestUpdateId}`);
     }
-
-    logger.info(`Batch sync complete. Processed up to update_id=${highestUpdateId}.`);
   } finally {
-    await shufersal.shutdown();
+    await stores.shutdown().catch(() => {});
     db.close();
   }
 }
 
 runBatchSync().catch((err) => {
-  logger.error('Batch sync failed', err);
+  logger.error('One-shot batch sync failed', err);
   process.exit(1);
 });

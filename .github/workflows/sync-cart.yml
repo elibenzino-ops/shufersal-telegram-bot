@@ -47,13 +47,19 @@ jobs:
           npm ci
           npm run build
 
-      - name: Sync queued Telegram messages to Shufersal Online
+      - name: Sync queued Telegram messages to Grocery Stores
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           ALLOWED_CHAT_IDS: ${{ secrets.ALLOWED_CHAT_IDS }}
           ADMIN_USER_IDS: ${{ secrets.ADMIN_USER_IDS }}
+          ENABLED_STORES: ${{ secrets.ENABLED_STORES }}
           SHUFERSAL_USERNAME: ${{ secrets.SHUFERSAL_USERNAME }}
           SHUFERSAL_PASSWORD: ${{ secrets.SHUFERSAL_PASSWORD }}
+          HAZI_HINAM_USERNAME: ${{ secrets.HAZI_HINAM_USERNAME }}
+          HAZI_HINAM_PASSWORD: ${{ secrets.HAZI_HINAM_PASSWORD }}
+          SUPER_HAVIV_USERNAME: ${{ secrets.SUPER_HAVIV_USERNAME }}
+          SUPER_HAVIV_PASSWORD: ${{ secrets.SUPER_HAVIV_PASSWORD }}
+          SUPER_HAVIV_BRANCH_ID: ${{ secrets.SUPER_HAVIV_BRANCH_ID }}
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
           PROXY_URL: ${{ secrets.PROXY_URL }}
           HEADLESS: 'true'
