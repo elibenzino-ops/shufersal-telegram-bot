@@ -127,7 +127,7 @@ const EnvSchema = z.object({
   VICTORY_DELIVERY_FEE: z.string().optional(),
 
   GEMINI_API_KEY: z.string().min(1, 'חובה להגדיר GEMINI_API_KEY לזיהוי חכם של מצרכים'),
-  GEMINI_MODEL: z.string().default('gemini-2.5-flash'),
+  GEMINI_MODEL: z.string().default('gemini-3.8-flash'),
 
   CHROME_PATH: z.string().optional(),
   BROWSER_WS_ENDPOINT: z.string().optional(),

@@ -1076,11 +1076,17 @@ export class SelfPointClient implements StoreClient {
         !this.token &&
         (msg.includes('HTTP 401') ||
           msg.includes('HTTP 403') ||
-          msg.includes('HTTP 405'))
+          msg.includes('HTTP 404') ||
+          msg.includes('HTTP 405') ||
+          msg.includes('ST10'))
       ) {
         this.guestCartApiUnsupported = true;
+        logger.debug(
+          `${this.storeId} guest REST cart creation unavailable (${msg}); tracking live cart locally`,
+        );
+      } else {
+        logger.warn(`${this.storeId} REST cart sync fallback used`, err);
       }
-      logger.warn(`${this.storeId} REST cart sync fallback used`, err);
     }
 
     return this.buildTrackedCartState();

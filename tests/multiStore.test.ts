@@ -3,7 +3,11 @@ import os from 'node:os';
 import path from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import type { GroceryAiService, ParsedGroceryItem } from '../src/ai/groceryAi.js';
+import {
+  extractRecommendedGeminiModel,
+  type GroceryAiService,
+  type ParsedGroceryItem,
+} from '../src/ai/groceryAi.js';
 import { renderComparisonHtml } from '../src/bot/telegramBot.js';
 import { parseEnabledStores } from '../src/config.js';
 import { BotDatabase } from '../src/store/database.js';
@@ -32,7 +36,12 @@ import {
   type StoreClient,
   type StoreId,
 } from '../src/stores/types.js';
-import { VictoryClient } from '../src/stores/victoryClient.js';
+import {
+  VictoryClient,
+  extractVictoryBarcodeFromUrl,
+  parseVictoryDomCards,
+  parseVictoryJsonProducts,
+} from '../src/stores/victoryClient.js';
 
 function jsonResponse(body: unknown, status = 200): Response {
   return new Response(JSON.stringify(body), {
@@ -349,7 +358,7 @@ describe('SuperHavivClient (Self-Point / Prutah)', () => {
   });
 });
 
-describe('VictoryClient (Self-Point / Prutah)', () => {
+describe('VictoryClient (Next.js storefront)', () => {
   let tmpDir: string;
 
   beforeEach(() => {
@@ -360,49 +369,83 @@ describe('VictoryClient (Self-Point / Prutah)', () => {
     fs.rmSync(tmpDir, { recursive: true, force: true });
   });
 
-  it('extracts barcode from image URL when gtin is omitted, searches retailer 1470 / branch 2427, and builds a cart', async () => {
-    const mockFetch = vi.fn(async (input: string | URL | Request, init?: RequestInit) => {
-      const url = typeof input === 'string' ? input : input.toString();
+  it('extracts GS1 barcodes from _next/image CloudFront URLs and parses Victory Next.js DOM product cards', () => {
+    const encodedImg =
+      'https://www.victoryonline.co.il/_next/image?url=https%3A%2F%2Fdlv1nnscfbvda.cloudfront.net%2Fgs1%2F7290019014751%2F729001901475103-20-2022_13-03-24.jpg&w=3840&q=100';
+    expect(extractVictoryBarcodeFromUrl(encodedImg)).toBe('7290019014751');
 
-      if (url.includes('/v2/retailers/1470/branches/2427/products')) {
+    const parsed = parseVictoryDomCards([
+      {
+        href: '/product/%D7%97%D7%9C%D7%91-1-%D7%A7%D7%A8%D7%98%D7%95%D7%9F-1-%D7%9C%D7%99%D7%98%D7%A8',
+        title: 'חלב 1% קרטון 1 ליטר',
+        imgSrc: encodedImg,
+        text: 'חלב 1% קרטון 1 ליטר 1 ליטר ₪6.92 ₪0.69 ל100 מ״ל הוספה לסל',
+      },
+      {
+        href: '/product/trix-480',
+        title: 'דגני בוקר טריקס 480 גרם',
+        imgSrc: 'https://dlv1nnscfbvda.cloudfront.net/gs1/7290004127329/img.jpg',
+        text: 'מבצע 2 ב-₪36.9 נסטלה טריקס 480 גרם ₪11.90₪25.90 ₪5.4 ל100 גרם',
+      },
+      {
+        href: '/product/avocado',
+        title: 'אבוקדו',
+        imgSrc: null,
+        text: '₪4.9 לק"ג 500גרם500גרם אבוקדו ₪4.90₪8.90 ₪4.45 ל500 גרם',
+      },
+    ]);
+
+    expect(parsed).toHaveLength(3);
+    expect(parsed[0]?.barcode).toBe('7290019014751');
+    expect(parsed[0]?.price).toBe(6.92);
+    expect(parsed[0]?.sellingMethod).toBe('BY_UNIT');
+
+    expect(parsed[1]?.barcode).toBe('7290004127329');
+    expect(parsed[1]?.price).toBe(11.9);
+    expect(parsed[1]?.promotionMsg).toContain('2 ב-₪36.9');
+
+    expect(parsed[2]?.price).toBe(4.9);
+    expect(parsed[2]?.sellingMethod).toBe('BY_WEIGHT');
+  });
+
+  it('parses Victory JSON search responses, tracks cart totals, and returns checkout handoff link', async () => {
+    const jsonProducts = parseVictoryJsonProducts({
+      data: {
+        products: [
+          {
+            id: 30112233,
+            name: "קוטג' 5% תנובה",
+            imageUrl:
+              'https://dlv1nnscfbvda.cloudfront.net/gs1/7290004127329/pic.jpg',
+            brand: { name: 'תנובה' },
+            regularPrice: 6.4,
+            salePrice: 5.5,
+            inStock: true,
+          },
+        ],
+      },
+    });
+    expect(jsonProducts).toHaveLength(1);
+    expect(jsonProducts[0]?.barcode).toBe('7290004127329');
+    expect(jsonProducts[0]?.price).toBe(5.5);
+
+    const mockFetch = vi.fn(async (input: string | URL | Request) => {
+      const url = typeof input === 'string' ? input : input.toString();
+      if (url.includes('/api/search?q=')) {
         return jsonResponse({
           products: [
             {
-              id: 30112233,
-              localName: "קוטג' 5% תנובה",
-              image: 'https://cdn.example/products/7290004127329-medium.jpg',
-              brand: { names: { '1': 'תנובה' } },
-              branch: {
-                regularPrice: 6.4,
-                salePrice: 5.5,
-                isActive: true,
-                isVisible: true,
-                isOutOfStock: false,
-              },
+              id: '30112233',
+              name: "קוטג' 5% תנובה",
+              barcode: '7290004127329',
+              regularPrice: 6.4,
+              salePrice: 5.5,
+              inStock: true,
             },
           ],
         });
       }
-
-      if (url.includes('/v2/retailers/1470/branches/2427/carts') && init?.method === 'POST') {
-        const body = JSON.parse(String(init.body ?? '{}')) as {
-          lines: Array<{ retailerProductId: number; quantity: number }>;
-        };
-        const subtotal = body.lines.reduce((s, l) => s + l.quantity * 5.5, 0);
-        return jsonResponse({
-          id: 'victory-cart-xyz',
-          lines: body.lines.map((l) => ({
-            retailerProductId: l.retailerProductId,
-            quantity: l.quantity,
-            isActive: true,
-            totalPrice: Number((l.quantity * 5.5).toFixed(2)),
-            product: { id: l.retailerProductId, localName: "קוטג' 5% תנובה" },
-          })),
-          total: { priceForView: subtotal },
-        });
-      }
-
-      return jsonResponse({});
+      return jsonResponse({}, 404);
     }) as unknown as typeof fetch;
 
     const client = new VictoryClient({
@@ -1080,22 +1123,22 @@ describe('rankStoreQuotes & MultiStoreManager', () => {
     expect(client.getAuthWarning()).toContain('wrong user name');
   });
 
-  it('auto-discovers active Victory branch when default branch returns empty and preserves tracked guest cart on 401', async () => {
+  it('auto-discovers active Self-Point branch when default branch returns empty and preserves tracked guest cart on 404 ST10', async () => {
     const mockFetch = vi.fn(async (input: string | URL | Request, init?: RequestInit) => {
       const url = typeof input === 'string' ? input : input.toString();
 
-      // Default branch 2427 returns empty products
-      if (url.includes('/branches/2427/products')) {
+      // Default branch 3507 returns empty products
+      if (url.includes('/branches/3507/products')) {
         return jsonResponse({ products: [] });
       }
-      // Branch discovery endpoint returns active branch 2568
-      if (url.includes('/v2/retailers/1470/branches?')) {
+      // Branch discovery endpoint returns active branch 3999
+      if (url.includes('/v2/retailers/1579/branches?')) {
         return jsonResponse({
-          branches: [{ id: 2568, isActive: true, isDelivery: true }],
+          branches: [{ id: 3999, isActive: true, isDelivery: true }],
         });
       }
-      // Discovered branch 2568 returns products!
-      if (url.includes('/branches/2568/products')) {
+      // Discovered branch 3999 returns products!
+      if (url.includes('/branches/3999/products')) {
         return jsonResponse({
           products: [
             {
@@ -1125,16 +1168,16 @@ describe('rankStoreQuotes & MultiStoreManager', () => {
           ],
         });
       }
-      // Guest cart POST returns 401 Unauthorized on Self-Point
+      // Guest cart POST returns 404 ST10 Object not found on Self-Point
       if (url.includes('/carts') && init?.method === 'POST') {
-        return jsonResponse({ message: 'Unauthorized' }, 401);
+        return jsonResponse({ error: 'Object not found', errorCode: 'ST10' }, 404);
       }
       return jsonResponse({});
     }) as unknown as typeof fetch;
 
-    const client = new VictoryClient({
+    const client = new SuperHavivClient({
       headless: true,
-      sessionFilePath: path.join(tmpDir, 'victory-discover.json'),
+      sessionFilePath: path.join(tmpDir, 'haviv-discover.json'),
       screenshotsDir: tmpDir,
       fetchFn: mockFetch,
     });
@@ -1143,7 +1186,7 @@ describe('rankStoreQuotes & MultiStoreManager', () => {
     expect(found).toHaveLength(2);
     expect(found[0]?.code).toBe('50001');
 
-    // Batch-add both items even when guest POST /carts returns 401
+    // Batch-add both items even when guest POST /carts returns 404 ST10
     const cart = await client.setItemsInCart([
       { productCode: '50001', quantity: 2, sellingMethod: 'BY_UNIT' },
       { productCode: '50002', quantity: 1, sellingMethod: 'BY_UNIT' },
@@ -1155,5 +1198,11 @@ describe('rankStoreQuotes & MultiStoreManager', () => {
     const reloaded = await client.getCartState();
     expect(reloaded.items).toHaveLength(2);
     expect(reloaded.totalPrice).toBe(17.5);
+  });
+
+  it('extracts recommended Gemini replacement model from 404 deprecation errors', () => {
+    const errMsg =
+      'ApiError: {"error":{"code":404,"message":"This model models/gemini-2.5-flash is no longer available to new users. Please update your code to use models/gemini-3.8-flash for the latest features and improvements.","status":"NOT_FOUND"}}';
+    expect(extractRecommendedGeminiModel(errMsg)).toBe('gemini-3.8-flash');
   });
 });

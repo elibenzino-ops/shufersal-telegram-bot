@@ -2389,7 +2389,13 @@ export function createTelegramBot(deps: CreateTelegramBotDeps): Bot {
         }
       }
     } catch (err) {
-      logger.error(`Error handling callback query "${data}"`, err);
+      if (err instanceof StoreManualVerificationRequiredError) {
+        logger.info(
+          `Manual checkout/verification handoff for ${err.storeId} (${err.reason}) on callback "${data}"`,
+        );
+      } else {
+        logger.error(`Error handling callback query "${data}"`, err);
+      }
       await ctx.answerCallbackQuery().catch(() => {});
       await bot.api.sendMessage(chatId, formatUserFacingError(err), {
         parse_mode: 'HTML',

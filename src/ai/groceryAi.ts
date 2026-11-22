@@ -23,14 +23,67 @@ export interface ProductSelectionResult {
   reason?: string;
 }
 
+export const DEFAULT_GEMINI_MODEL = 'gemini-3.8-flash';
+
+export function extractRecommendedGeminiModel(errorMessage: string): string | null {
+  // Matches e.g. "Please update your code to use models/gemini-3.8-flash"
+  const useMatch = /use\s+models\/([a-z0-9][a-z0-9._-]+)/i.exec(errorMessage);
+  if (useMatch?.[1]) {
+    return useMatch[1];
+  }
+  const allModels = [...errorMessage.matchAll(/models\/([a-z0-9][a-z0-9._-]+)/gi)];
+  if (allModels.length >= 2) {
+    return allModels[allModels.length - 1]?.[1] ?? null;
+  }
+  return null;
+}
+
 export class GroceryAiService {
   private readonly ai: GoogleGenAI;
+  private activeModel: string;
 
-  constructor(
-    apiKey: string,
-    private readonly model: string = 'gemini-2.5-flash',
-  ) {
+  constructor(apiKey: string, model: string = DEFAULT_GEMINI_MODEL) {
     this.ai = new GoogleGenAI({ apiKey });
+    this.activeModel = model.trim() || DEFAULT_GEMINI_MODEL;
+  }
+
+  get currentModel(): string {
+    return this.activeModel;
+  }
+
+  private async generateWithAutoFallback(params: {
+    contents: string;
+    config: Record<string, unknown>;
+  }) {
+    try {
+      return await this.ai.models.generateContent({
+        model: this.activeModel,
+        contents: params.contents,
+        config: params.config,
+      });
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      const isModelNotFound =
+        msg.includes('NOT_FOUND') ||
+        msg.includes('404') ||
+        msg.includes('no longer available');
+      if (isModelNotFound) {
+        const suggested =
+          extractRecommendedGeminiModel(msg) ?? DEFAULT_GEMINI_MODEL;
+        if (suggested && suggested !== this.activeModel) {
+          logger.warn(
+            `Gemini model "${this.activeModel}" returned 404/NOT_FOUND; automatically switching to "${suggested}"`,
+          );
+          this.activeModel = suggested;
+          return await this.ai.models.generateContent({
+            model: this.activeModel,
+            contents: params.contents,
+            config: params.config,
+          });
+        }
+      }
+      throw err;
+    }
   }
 
   async parseGroupMessage(messageText: string): Promise<ParsedMessageResult> {
@@ -54,8 +107,7 @@ export class GroceryAiService {
    - pickerComment: הערה למלקט אם צוינה (למשל "ירוקות", "בשלות", "פרוס דק"), אחרת מחרוזת ריקה.`;
 
     try {
-      const response = await this.ai.models.generateContent({
-        model: this.model,
+      const response = await this.generateWithAutoFallback({
         contents: trimmed,
         config: {
           systemInstruction,
@@ -217,8 +269,7 @@ export class GroceryAiService {
    - אם המוצר נמכר ב-BY_WEIGHT והמשתמש ביקש למשל "4 מלפפונים" (unitPreference="UNIT"), הערך משקל הגיוני בק"ג (למשל 0.5 ק"ג).`;
 
     try {
-      const response = await this.ai.models.generateContent({
-        model: this.model,
+      const response = await this.generateWithAutoFallback({
         contents: prompt,
         config: {
           systemInstruction,
