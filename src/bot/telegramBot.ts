@@ -1145,13 +1145,6 @@ export function createTelegramBot(deps: CreateTelegramBotDeps): Bot {
         }
 
         if (payload.kind === 'order_edit') {
-          if (!(await isUserAdmin(ctx))) {
-            await ctx.answerCallbackQuery({
-              text: '⛔ טעינת הזמנה לעדכון מיועדת למנהלי הקבוצה בלבד',
-              show_alert: true,
-            });
-            return;
-          }
           await ctx.answerCallbackQuery('טוען את ההזמנה לעגלה...');
           const cart = await shufersal.loadOrderForUpdate(
             chatId,
