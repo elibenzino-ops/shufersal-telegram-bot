@@ -34,6 +34,10 @@ export class StoreManager {
     return this.mutex.pending;
   }
 
+  getAuthWarning(): string | null {
+    return this.client.getAuthWarning?.() ?? null;
+  }
+
   async search(query: string, limit = 15): Promise<CatalogProduct[]> {
     return this.mutex.runExclusive(async () => {
       const results = await this.client.searchProducts(query, limit);
@@ -96,6 +100,44 @@ export class StoreManager {
         previousQuantity,
         finalQuantity: targetQuantity,
       };
+    });
+  }
+
+  async setMatchedItemsBatch(params: {
+    chatId: number;
+    senderName: string;
+    entries: Array<{ product: CatalogProduct; quantity: number }>;
+  }): Promise<CartState> {
+    return this.mutex.runExclusive(async () => {
+      if (params.entries.length === 0) {
+        const rawCart = await this.client.getCartState();
+        return this.enrichCart(params.chatId, rawCart);
+      }
+
+      const taggedProducts = params.entries.map((e) => ({
+        ...e.product,
+        storeId: this.storeId,
+      }));
+      this.db.cacheProducts(taggedProducts, this.storeId);
+
+      const inputs = params.entries.map((e) => ({
+        productCode: e.product.code,
+        quantity: Number(e.quantity.toFixed(2)),
+        sellingMethod: e.product.sellingMethod,
+      }));
+
+      const updatedCart = await this.client.setItemsInCart(inputs);
+
+      for (const p of taggedProducts) {
+        this.db.addContributor(
+          params.chatId,
+          p.code,
+          params.senderName,
+          this.storeId,
+        );
+      }
+
+      return this.enrichCart(params.chatId, updatedCart);
     });
   }
 

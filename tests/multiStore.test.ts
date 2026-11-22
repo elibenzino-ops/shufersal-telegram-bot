@@ -14,6 +14,7 @@ import {
 } from '../src/stores/haziHinamClient.js';
 import {
   MultiStoreManager,
+  buildMirrorSearchQueries,
   rankStoreQuotes,
 } from '../src/stores/multiStoreManager.js';
 import { StoreManager } from '../src/stores/storeManager.js';
@@ -1006,5 +1007,153 @@ describe('rankStoreQuotes & MultiStoreManager', () => {
     // Hazi Hinam matched both items cheaply (3*5.90 + 2*6.20 = 30.10 + 29.90 = 60.00 vs Shufersal 35.20 + 29.90 = 65.10)
     expect(res.comparison.cheapestStoreId).toBe('hazi_hinam');
     expect(res.comparison.savingsVsSecondCheapest).toBe(5.1);
+    // Batch sync called once per target store after mirror matching
+    expect(haziClient.setItemsInCart).toHaveBeenCalledTimes(2); // 1 pre-populated stale item + 1 batch sync
+    expect(victoryClient.setItemsInCart).toHaveBeenCalledTimes(1);
+  });
+
+  it('builds cleaned Hebrew fallback queries from verbose Shufersal product names', () => {
+    expect(buildMirrorSearchQueries('עגבניות שרי תמר שופרסל 500 גרם')).toEqual([
+      'עגבניות שרי תמר',
+      'עגבניות שרי',
+    ]);
+    expect(
+      buildMirrorSearchQueries("גבינת קוטג' 5% שומן תנובה 250 גרם"),
+    ).toEqual([
+      "גבינת קוטג' 5% תנובה",
+      "גבינת קוטג' 5%",
+      "גבינת קוטג'",
+    ]);
+    expect(
+      buildMirrorSearchQueries('חלב טרי 3% בקרטון תנובה 1 ליטר'),
+    ).toEqual(['חלב 3% תנובה', 'חלב תנובה 3%', 'חלב תנובה']);
+  });
+
+  it('falls back to Hazi Hinam guest session when OAuth credentials fail so price comparison still works', async () => {
+    const mockFetch = vi.fn(async (input: string | URL | Request) => {
+      const url = typeof input === 'string' ? input : input.toString();
+      if (url.endsWith('/connect/token')) {
+        return jsonResponse(
+          { error: 'invalid_grant', error_description: 'wrong user name' },
+          400,
+        );
+      }
+      if (url.endsWith('/proxy/init')) {
+        return jsonResponse({
+          Results: {
+            AnonymousToken: {
+              access_token: 'hazi-guest-token-999999',
+              expires_in: 86400,
+            },
+          },
+        });
+      }
+      if (url.includes('/proxy/api/item/getItemsBySearch')) {
+        return jsonResponse({
+          IsOK: true,
+          Results: {
+            Items: [
+              {
+                Id: 4040,
+                BarKod: '7290004127329',
+                Name: "קוטג' 5% תנובה",
+                Price_Regular: 5.9,
+                IsInStock: true,
+              },
+            ],
+          },
+        });
+      }
+      return jsonResponse({ IsOK: true });
+    }) as unknown as typeof fetch;
+
+    const client = new HaziHinamClient({
+      username: 'wrong@example.com',
+      password: 'bad',
+      sessionFilePath: path.join(tmpDir, 'hazi-fallback.json'),
+      fetchFn: mockFetch,
+    });
+
+    const found = await client.searchProducts("קוטג' 5%");
+    expect(found).toHaveLength(1);
+    expect(found[0]?.price).toBe(5.9);
+    expect(client.getAuthWarning()).toContain('wrong user name');
+  });
+
+  it('auto-discovers active Victory branch when default branch returns empty and preserves tracked guest cart on 401', async () => {
+    const mockFetch = vi.fn(async (input: string | URL | Request, init?: RequestInit) => {
+      const url = typeof input === 'string' ? input : input.toString();
+
+      // Default branch 2427 returns empty products
+      if (url.includes('/branches/2427/products')) {
+        return jsonResponse({ products: [] });
+      }
+      // Branch discovery endpoint returns active branch 2568
+      if (url.includes('/v2/retailers/1470/branches?')) {
+        return jsonResponse({
+          branches: [{ id: 2568, isActive: true, isDelivery: true }],
+        });
+      }
+      // Discovered branch 2568 returns products!
+      if (url.includes('/branches/2568/products')) {
+        return jsonResponse({
+          products: [
+            {
+              id: 50001,
+              localName: "קוטג' 5% תנובה",
+              gtin: '7290004127329',
+              branch: {
+                regularPrice: 5.7,
+                salePrice: 0,
+                isActive: true,
+                isVisible: true,
+                isOutOfStock: false,
+              },
+            },
+            {
+              id: 50002,
+              localName: 'חלב 3% תנובה',
+              gtin: '7290000000111',
+              branch: {
+                regularPrice: 6.1,
+                salePrice: 0,
+                isActive: true,
+                isVisible: true,
+                isOutOfStock: false,
+              },
+            },
+          ],
+        });
+      }
+      // Guest cart POST returns 401 Unauthorized on Self-Point
+      if (url.includes('/carts') && init?.method === 'POST') {
+        return jsonResponse({ message: 'Unauthorized' }, 401);
+      }
+      return jsonResponse({});
+    }) as unknown as typeof fetch;
+
+    const client = new VictoryClient({
+      headless: true,
+      sessionFilePath: path.join(tmpDir, 'victory-discover.json'),
+      screenshotsDir: tmpDir,
+      fetchFn: mockFetch,
+    });
+
+    const found = await client.searchProducts("קוטג' 5%");
+    expect(found).toHaveLength(2);
+    expect(found[0]?.code).toBe('50001');
+
+    // Batch-add both items even when guest POST /carts returns 401
+    const cart = await client.setItemsInCart([
+      { productCode: '50001', quantity: 2, sellingMethod: 'BY_UNIT' },
+      { productCode: '50002', quantity: 1, sellingMethod: 'BY_UNIT' },
+    ]);
+    expect(cart.items).toHaveLength(2);
+    expect(cart.totalPrice).toBe(17.5);
+
+    // Subsequent getCartState() preserves all locally tracked items (never wiped!)
+    const reloaded = await client.getCartState();
+    expect(reloaded.items).toHaveLength(2);
+    expect(reloaded.totalPrice).toBe(17.5);
   });
 });

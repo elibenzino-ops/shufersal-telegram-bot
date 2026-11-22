@@ -60,6 +60,7 @@ export interface MirrorStoreSummary {
   matchedCount: number;
   missingItems: string[];
   error?: string;
+  authWarning?: string | null;
 }
 
 export interface MirrorCartResult {
@@ -612,6 +613,7 @@ export class MultiStoreManager {
           meta: m.meta,
           matchedCount: 0,
           missingItems: [],
+          authWarning: m.getAuthWarning(),
         })),
         comparison,
       };
@@ -619,6 +621,10 @@ export class MultiStoreManager {
 
     const summaryByStore = new Map<StoreId, MirrorStoreSummary>();
     const failedStores = new Set<StoreId>();
+    const matchedByStore = new Map<
+      StoreId,
+      Map<string, { product: CatalogProduct; quantity: number }>
+    >();
 
     for (const mgr of targetManagers) {
       summaryByStore.set(mgr.storeId, {
@@ -627,6 +633,7 @@ export class MultiStoreManager {
         matchedCount: 0,
         missingItems: [],
       });
+      matchedByStore.set(mgr.storeId, new Map());
     }
 
     // Clear target carts first so the comparison matches the source cart 1:1
@@ -638,9 +645,12 @@ export class MultiStoreManager {
           } catch (err) {
             logger.warn(`Failed clearing ${mgr.storeId} before mirror`, err);
             const msg = err instanceof Error ? err.message : String(err);
-            const entry = summaryByStore.get(mgr.storeId)!;
-            entry.error = msg;
-            failedStores.add(mgr.storeId);
+            // Only abort the store if it hit a hard security gate; otherwise continue mirroring
+            if (msg.includes('CAPTCHA') || msg.includes('WAF')) {
+              const entry = summaryByStore.get(mgr.storeId)!;
+              entry.error = msg;
+              failedStores.add(mgr.storeId);
+            }
           }
         }),
       );
@@ -659,7 +669,7 @@ export class MultiStoreManager {
       const strippedCode = item.productCode.replace(/^P_/i, '').trim();
       const sourceBarcode =
         cached?.barcode ??
-        (/^\d{6,14}$/.test(strippedCode) ? strippedCode : null);
+        (/^\d{7,14}$/.test(strippedCode) ? strippedCode : null);
 
       const sellingMethod =
         item.sellingMethod ?? cached?.sellingMethod ?? 'BY_UNIT';
@@ -680,21 +690,38 @@ export class MultiStoreManager {
         senderName: params.senderName,
       });
 
+      const fallbackQueries = buildMirrorSearchQueries(displayName);
+
       await Promise.all(
         targetManagers.map(async (targetMgr) => {
           if (failedStores.has(targetMgr.storeId)) return;
           const summary = summaryByStore.get(targetMgr.storeId)!;
           try {
             let candidates: CatalogProduct[] = [];
-            // Try exact barcode search first for fast, apples-to-apples SKU matching
+
+            // Stage 1: exact barcode search for fast, apples-to-apples SKU matching
             if (sourceBarcode) {
-              candidates = await targetMgr.search(sourceBarcode, 8).catch(() => []);
+              candidates = await targetMgr.search(sourceBarcode, 8).catch((err) => {
+                const errMsg = err instanceof Error ? err.message : String(err);
+                if (errMsg.includes('CAPTCHA') || errMsg.includes('WAF')) {
+                  throw err;
+                }
+                return [];
+              });
             }
-            const hasInStockBarcode = candidates.some(
-              (c) => c.inStock && c.purchasable,
-            );
-            if (!hasInStockBarcode && displayName) {
-              candidates = await targetMgr.search(displayName, 12);
+
+            const hasAvailable = (list: CatalogProduct[]) =>
+              list.some((c) => c.inStock && c.purchasable);
+
+            // Stage 2+: cleaned Hebrew product name -> short core query -> original name
+            if (!hasAvailable(candidates)) {
+              for (const q of fallbackQueries) {
+                const found = await targetMgr.search(q, 12);
+                if (hasAvailable(found)) {
+                  candidates = found;
+                  break;
+                }
+              }
             }
 
             const learned = this.db.getPreference(displayName, targetMgr.storeId);
@@ -711,13 +738,18 @@ export class MultiStoreManager {
               return;
             }
 
-            await targetMgr.addOrIncrementProduct({
-              chatId: params.chatId,
-              senderName: params.senderName,
-              product: selection.selected,
-              quantity: selection.adjustedQuantity,
-              mode: 'increment',
-            });
+            const storeMatches = matchedByStore.get(targetMgr.storeId)!;
+            const prev = storeMatches.get(selection.selected.code);
+            if (prev) {
+              prev.quantity = Number(
+                (prev.quantity + selection.adjustedQuantity).toFixed(2),
+              );
+            } else {
+              storeMatches.set(selection.selected.code, {
+                product: selection.selected,
+                quantity: selection.adjustedQuantity,
+              });
+            }
             summary.matchedCount++;
           } catch (err) {
             logger.warn(
@@ -745,6 +777,32 @@ export class MultiStoreManager {
       }
     }
 
+    // Batch-sync all matched items to each target store in parallel (1 sync per store instead of N)
+    await Promise.all(
+      targetManagers.map(async (targetMgr) => {
+        const summary = summaryByStore.get(targetMgr.storeId)!;
+        summary.authWarning = targetMgr.getAuthWarning();
+        if (failedStores.has(targetMgr.storeId)) return;
+
+        const entries = [...matchedByStore.get(targetMgr.storeId)!.values()];
+        if (entries.length === 0) return;
+
+        try {
+          await targetMgr.setMatchedItemsBatch({
+            chatId: params.chatId,
+            senderName: params.senderName,
+            entries,
+          });
+        } catch (err) {
+          logger.warn(
+            `Batch cart sync failed on ${targetMgr.storeId} after mirror matching`,
+            err,
+          );
+          summary.error = err instanceof Error ? err.message : String(err);
+        }
+      }),
+    );
+
     const comparison = await this.compareCarts(params.chatId);
     return {
       sourceStoreId: params.sourceStoreId,
@@ -760,4 +818,87 @@ export class MultiStoreManager {
       [...this.managers.values()].map((m) => m.shutdown()),
     );
   }
+}
+
+const MIRROR_STORE_BRAND_NOISE_RE =
+  /(?:^|[\s,./\-()]+)(?:שופרסל\s+גרין|שופרסל\s+דיל|שופרסל|green|רמי\s+לוי|חצי\s+חינם|ויקטורי|סופר\s+חביב)(?=$|[\s,./\-()]+)/giu;
+const MIRROR_QUANTITY_UNIT_NOISE_RE =
+  /(?:^|[\s,./\-()]+)\d+(?:\.\d+)?\s*(?:גרם|גר'|ג'|ג״|ק"ג|ק״ג|קג|קילו|מ"ל|מ״ל|מל|ליטר|ל'|יח'|יח״|יחידות|גלילים|מגבונים|כדורים|שקיות|קפסולות|טבליות|פחיות|בקבוקים)(?=$|[\s,./\-()]+)/giu;
+const MIRROR_PACKAGING_WORDS = new Set([
+  'מארז',
+  'באריזה',
+  'בקרטון',
+  'בבקבוק',
+  'בשקית',
+  'בקופסה',
+  'בפחית',
+  'בגביע',
+  'בצנצנת',
+  'שומן',
+  'במשקל',
+  'מובחר',
+  'מובחרות',
+  'מובחרים',
+  'טרי',
+  'טרייה',
+  'טריות',
+  "יח'",
+  'יחידות',
+  'יחידה',
+  'זוג',
+  'שלישיית',
+  'רביעיית',
+  'שישיית',
+]);
+
+/**
+ * Generates a prioritized, deduplicated list of Hebrew search queries from a verbose
+ * source-store product title (e.g. Shufersal's `"קוטג' 5% שומן תנובה 250 גרם"`) so
+ * strict AND-tokenized search engines (Self-Point / Hazi Hinam) match reliably.
+ */
+export function buildMirrorSearchQueries(displayName: string): string[] {
+  const original = displayName.trim();
+  if (!original) return [];
+
+  const cleaned = original
+    .replace(/\([^)]*\)/g, ' ')
+    .replace(MIRROR_STORE_BRAND_NOISE_RE, ' ')
+    .replace(MIRROR_QUANTITY_UNIT_NOISE_RE, ' ')
+    .replace(/[,/\\|–—\-*+•]+/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+
+  const tokens = cleaned
+    .split(' ')
+    .map((t) => t.trim())
+    .filter((t) => t.length > 0 && !MIRROR_PACKAGING_WORDS.has(t));
+
+  const cleanedQuery = tokens.join(' ').trim();
+
+  // Build a concise 2–3 word core query (preserving fat/percentage tokens like "5%" or "3%")
+  const nonPercentTokens = tokens.filter((t) => !t.includes('%'));
+  const percentToken = tokens.find((t) => t.includes('%'));
+  const coreParts = nonPercentTokens.slice(0, 2);
+  if (percentToken && !coreParts.includes(percentToken)) {
+    coreParts.push(percentToken);
+  }
+  const coreQuery = coreParts.join(' ').trim();
+
+  // Even broader 2-word fallback without % in case percentage formatting differs ("5%" vs "5 אחוז")
+  const broadTwoWord = nonPercentTokens.slice(0, 2).join(' ').trim();
+
+  const out: string[] = [];
+  const pushUnique = (q: string) => {
+    const trimmed = q.trim();
+    if (trimmed.length >= 2 && !out.includes(trimmed)) {
+      out.push(trimmed);
+    }
+  };
+
+  if (cleanedQuery) pushUnique(cleanedQuery);
+  if (coreQuery) pushUnique(coreQuery);
+  if (broadTwoWord) pushUnique(broadTwoWord);
+  if (out.length === 0) pushUnique(original);
+
+  return out.slice(0, 3);
 }

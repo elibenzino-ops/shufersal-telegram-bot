@@ -226,6 +226,7 @@ export interface StoreClient {
   getActiveOrders(): Promise<ActiveOrderSummary[]>;
   putOrderInUpdateMode(orderCode: string): Promise<CartState>;
   placeOrder(options: { removeMissingItems: boolean }): Promise<CheckoutResult>;
+  getAuthWarning?(): string | null;
   shutdown(): Promise<void>;
 }
 

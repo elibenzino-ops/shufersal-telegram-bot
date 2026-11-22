@@ -504,6 +504,7 @@ export function createTelegramBot(deps: CreateTelegramBotDeps): Bot {
         `אני ממלא אוטומטית את העגלה בכל הרשתות במקביל, משווה מחירים כולל דמי משלוח, ובזמן ההזמנה בוחרים את <b>העגלה הזולה ביותר 🏆</b>!\n\n` +
         `<b>פקודות זמינות:</b>\n` +
         `• /compare – השוואת מחירים חיה בין כל הרשתות וזיהוי הסל הזול ביותר\n` +
+        `• /mirror – העתקת כל הפריטים מהעגלה/הזמנה בשופרסל לשאר הרשתות והשוואה\n` +
         `• /cart – צפייה בעגלות ופירוט פריטים בכל חנות\n` +
         `• /remove <code>[מוצר]</code> – הסרה או עריכת כמות של פריטים בעגלות / בהזמנה שנטענה\n` +
         `• /stores – סטטוס החנויות המחוברות וקישורים ישירים\n` +
@@ -532,10 +533,14 @@ export function createTelegramBot(deps: CreateTelegramBotDeps): Bot {
       const mode = s.supportsAutoCheckout
         ? 'תשלום אוטומטי או קישור קופה'
         : 'מילוי עגלה אוטומטי + קישור ישיר לתשלום';
+      const authWarn = stores.getStore(s.id)?.getAuthWarning();
+      const warnLine = authWarn
+        ? `\n   ⚠️ <i>מצב אורח: ${escapeHtml(authWarn.slice(0, 120))}</i>`
+        : '';
       lines.push(
         `${s.emoji} <b>${escapeHtml(s.displayName)}</b>\n` +
           `   🚚 ${fee}${min}\n` +
-          `   💳 ${mode}\n` +
+          `   💳 ${mode}${warnLine}\n` +
           `   🔗 <a href="${escapeHtml(s.cartUrl)}">עגלת ${escapeHtml(s.shortName)}</a>`,
       );
     }
@@ -577,6 +582,158 @@ export function createTelegramBot(deps: CreateTelegramBotDeps): Bot {
         { parse_mode: 'HTML' },
       );
     }
+  });
+
+  const activeMirrorChats = new Set<number>();
+
+  async function runMirrorForChat(params: {
+    chatId: number;
+    sourceStoreId: StoreId;
+    senderName: string;
+  }): Promise<void> {
+    const { chatId, sourceStoreId, senderName } = params;
+    const sourceMeta = STORE_META[sourceStoreId];
+
+    if (!stores.isMultiStore()) {
+      await bot.api.sendMessage(
+        chatId,
+        'ℹ️ נדרשות לפחות שתי רשתות פעילות כדי להשוות סלים.',
+        { parse_mode: 'HTML' },
+      );
+      return;
+    }
+
+    if (activeMirrorChats.has(chatId)) {
+      await bot.api.sendMessage(
+        chatId,
+        '⏳ העתקה והשוואה כבר רצה כרגע בקבוצה – אנא המתינו לסיומה.',
+        { parse_mode: 'HTML' },
+      );
+      return;
+    }
+
+    activeMirrorChats.add(chatId);
+    const statusMsg = await bot.api.sendMessage(
+      chatId,
+      `⏳ <b>מעתיק את כל הפריטים מ-${escapeHtml(sourceMeta.displayName)} לשאר הרשתות ומשווה מחירים...</b>\n` +
+        `<i>מרוקן עגלות קודמות בשאר הרשתות כדי שההשוואה תהיה מדויקת (1:1).</i>`,
+      { parse_mode: 'HTML' },
+    );
+
+    try {
+      let lastReported = 0;
+      const result = await stores.mirrorCartToOtherStores({
+        chatId,
+        sourceStoreId,
+        senderName,
+        ai,
+        clearTargetFirst: true,
+        onProgress: async (done, total) => {
+          if (done === total || done === 1 || done - lastReported >= 3) {
+            lastReported = done;
+            try {
+              await bot.api.editMessageText(
+                chatId,
+                statusMsg.message_id,
+                `⏳ <b>מעתיק ומשווה פריטים מ-${escapeHtml(sourceMeta.displayName)}...</b>\n` +
+                  `📦 התקדמות: <b>${done}/${total}</b> פריטים` +
+                  (done === total ? '\n🔄 מסנכרן עגלות ומחשב מחיר סופי...' : ''),
+                { parse_mode: 'HTML' },
+              );
+            } catch {
+              // Ignore transient Telegram rate-limit or unchanged-message edit errors
+            }
+          }
+        },
+      });
+
+      if (result.totalSourceItems === 0) {
+        await bot.api.editMessageText(
+          chatId,
+          statusMsg.message_id,
+          `🛒 אין פריטים במלאי בעגלת ${escapeHtml(sourceMeta.displayName)} להעתקה והשוואה.\n` +
+            `אם יש לכם הזמנה פתוחה בשופרסל, טענו אותה קודם דרך /orders.`,
+          { parse_mode: 'HTML' },
+        );
+        return;
+      }
+
+      const buildMirrorHtml = (includeMissingNames: boolean): string => {
+        const summaryLines: string[] = [
+          `📋 <b>הועתקו ${result.totalSourceItems} פריטים מ-${escapeHtml(sourceMeta.displayName)} לשאר הרשתות:</b>`,
+        ];
+        for (const s of result.storeSummaries) {
+          const guestNote = s.authWarning
+            ? ` <i>(מצב אורח – התחברות נכשלה)</i>`
+            : '';
+          if (s.error) {
+            summaryLines.push(
+              `${s.meta.emoji} <b>${escapeHtml(s.meta.shortName)}</b>: ⚠️ ${escapeHtml(s.error.slice(0, 140))}`,
+            );
+          } else {
+            let missingNote = ' ✅';
+            if (s.missingItems.length > 0) {
+              if (includeMissingNames) {
+                const sample = s.missingItems
+                  .slice(0, 3)
+                  .map((n) => escapeHtml(n.slice(0, 35)))
+                  .join(', ');
+                missingNote = ` (חסרים ${s.missingItems.length}: ${sample}${s.missingItems.length > 3 ? ` +${s.missingItems.length - 3}` : ''})`;
+              } else {
+                missingNote = ` (חסרים ${s.missingItems.length} פריטים)`;
+              }
+            }
+            summaryLines.push(
+              `${s.meta.emoji} <b>${escapeHtml(s.meta.shortName)}</b>: הותאמו <b>${s.matchedCount}/${result.totalSourceItems}</b>${missingNote}${guestNote}`,
+            );
+          }
+        }
+
+        const cancelReminder = result.sourceOrderInUpdateMode
+          ? `\n\n💡 <i>שימו לב: אם תבחרו להזמין מרשת אחרת, זכרו לבטל את ההזמנה הפתוחה #${escapeHtml(result.sourceOrderInUpdateMode)} ב-${escapeHtml(sourceMeta.shortName)}.</i>`
+          : '';
+
+        return (
+          `${summaryLines.join('\n')}\n\n` +
+          renderComparisonHtml(result.comparison) +
+          cancelReminder
+        );
+      };
+
+      let fullHtml = buildMirrorHtml(true);
+      if (fullHtml.length > 3950) {
+        fullHtml = buildMirrorHtml(false);
+      }
+      if (fullHtml.length > 4000) {
+        fullHtml = `${fullHtml.slice(0, 3980)}...`;
+      }
+
+      await bot.api.editMessageText(chatId, statusMsg.message_id, fullHtml, {
+        parse_mode: 'HTML',
+        reply_markup: buildComparisonKeyboard(result.comparison, true),
+      });
+    } catch (err) {
+      logger.error(`Mirror from ${sourceStoreId} failed`, err);
+      await bot.api
+        .editMessageText(
+          chatId,
+          statusMsg.message_id,
+          formatUserFacingError(err),
+          { parse_mode: 'HTML' },
+        )
+        .catch(() => {});
+    } finally {
+      activeMirrorChats.delete(chatId);
+    }
+  }
+
+  bot.command('mirror', async (ctx) => {
+    const sourceStoreId = stores.getPrimaryStore().storeId;
+    await runMirrorForChat({
+      chatId: ctx.chat.id,
+      sourceStoreId,
+      senderName: getSenderDisplayName(ctx),
+    });
   });
 
   function buildStoreCartActionKeyboard(
@@ -2114,88 +2271,10 @@ export function createTelegramBot(deps: CreateTelegramBotDeps): Bot {
           await ctx.answerCallbackQuery(
             `מעתיק פריטים מ-${sourceMeta.shortName} ומשווה...`,
           );
-
-          if (!stores.isMultiStore()) {
-            await ctx.editMessageText(
-              'ℹ️ נדרשות לפחות שתי רשתות פעילות כדי להשוות סלים.',
-              { parse_mode: 'HTML' },
-            );
-            return;
-          }
-
-          await ctx.editMessageText(
-            `⏳ <b>מעתיק את כל הפריטים מ-${escapeHtml(sourceMeta.displayName)} לשאר הרשתות ומשווה מחירים...</b>\n` +
-              `<i>מרוקן עגלות קודמות בשאר הרשתות כדי שההשוואה תהיה מדויקת (1:1).</i>`,
-            { parse_mode: 'HTML' },
-          );
-
-          let lastReported = 0;
-          const result = await stores.mirrorCartToOtherStores({
+          await runMirrorForChat({
             chatId,
             sourceStoreId: payload.sourceStoreId,
             senderName: getSenderDisplayName(ctx),
-            ai,
-            clearTargetFirst: true,
-            onProgress: async (done, total) => {
-              if (done === total || done === 1 || done - lastReported >= 3) {
-                lastReported = done;
-                try {
-                  await ctx.api.editMessageText(
-                    chatId,
-                    messageId,
-                    `⏳ <b>מעתיק ומשווה פריטים מ-${escapeHtml(sourceMeta.displayName)}...</b>\n` +
-                      `📦 התקדמות: <b>${done}/${total}</b> פריטים`,
-                    { parse_mode: 'HTML' },
-                  );
-                } catch {
-                  // Ignore transient rate-limit or unchanged-message edit errors
-                }
-              }
-            },
-          });
-
-          if (result.totalSourceItems === 0) {
-            await ctx.editMessageText(
-              `🛒 אין פריטים במלאי בעגלת ${escapeHtml(sourceMeta.displayName)} להעתקה והשוואה.`,
-              { parse_mode: 'HTML' },
-            );
-            return;
-          }
-
-          const summaryLines: string[] = [
-            `📋 <b>הועתקו ${result.totalSourceItems} פריטים מ-${escapeHtml(sourceMeta.displayName)} לשאר הרשתות:</b>`,
-          ];
-          for (const s of result.storeSummaries) {
-            if (s.error) {
-              summaryLines.push(
-                `${s.meta.emoji} <b>${escapeHtml(s.meta.shortName)}</b>: ⚠️ ${escapeHtml(s.error)}`,
-              );
-            } else {
-              const missingNote =
-                s.missingItems.length > 0
-                  ? ` (חסרים ${s.missingItems.length}: ${s.missingItems
-                      .slice(0, 3)
-                      .map((n) => escapeHtml(n))
-                      .join(', ')}${s.missingItems.length > 3 ? ` +${s.missingItems.length - 3}` : ''})`
-                  : ' ✅';
-              summaryLines.push(
-                `${s.meta.emoji} <b>${escapeHtml(s.meta.shortName)}</b>: הותאמו <b>${s.matchedCount}/${result.totalSourceItems}</b>${missingNote}`,
-              );
-            }
-          }
-
-          const cancelReminder = result.sourceOrderInUpdateMode
-            ? `\n\n💡 <i>שימו לב: אם תבחרו להזמין מרשת אחרת, זכרו לבטל את ההזמנה הפתוחה #${escapeHtml(result.sourceOrderInUpdateMode)} ב-${escapeHtml(sourceMeta.shortName)}.</i>`
-            : '';
-
-          const fullHtml =
-            `${summaryLines.join('\n')}\n\n` +
-            renderComparisonHtml(result.comparison) +
-            cancelReminder;
-
-          await ctx.api.editMessageText(chatId, messageId, fullHtml, {
-            parse_mode: 'HTML',
-            reply_markup: buildComparisonKeyboard(result.comparison, true),
           });
           return;
         }
@@ -2525,6 +2604,7 @@ export function createTelegramBot(deps: CreateTelegramBotDeps): Bot {
 export async function registerBotCommands(bot: Bot): Promise<void> {
   await bot.api.setMyCommands([
     { command: 'compare', description: 'השוואת מחירים בין שופרסל, חצי חינם, סופר חביב וויקטורי' },
+    { command: 'mirror', description: 'העתקת כל הפריטים מהעגלה/הזמנה בשופרסל לשאר הרשתות' },
     { command: 'cart', description: 'הצגת העגלות ופירוט פריטים בכל חנות' },
     { command: 'remove', description: 'הסרה או עריכת כמות של פריטים בעגלות / בהזמנה' },
     { command: 'checkout', description: 'בחירת הסל הזול ביותר ואישור הזמנה' },

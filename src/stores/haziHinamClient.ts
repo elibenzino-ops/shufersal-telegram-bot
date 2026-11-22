@@ -23,6 +23,8 @@ export const HAZI_HINAM_AUTH_URL = 'https://auth.hazi-hinam.co.il';
 const DEFAULT_USER_AGENT =
   'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36';
 
+const HTTP_TIMEOUT_MS = 15_000;
+
 export interface HaziHinamClientOptions {
   username?: string;
   password?: string;
@@ -35,6 +37,7 @@ export interface HaziHinamClientOptions {
 
 interface PersistedHaziSession {
   savedAt: string;
+  username?: string;
   accessToken?: string;
   expiresAt?: number;
   isGuest?: boolean;
@@ -288,6 +291,8 @@ export class HaziHinamClient implements StoreClient {
   private accessToken: string | null = null;
   private tokenExpiresAt = 0;
   private isGuestSession = true;
+  private oauthFailed = false;
+  private authFallbackReason: string | null = null;
   private cookieHeader: string | null = null;
   private readonly knownProducts = new Map<string, CatalogProduct>();
   private readonly trackedCart = new Map<string, TrackedCartEntry>();
@@ -302,6 +307,31 @@ export class HaziHinamClient implements StoreClient {
     this.fetchFn = options.fetchFn ?? fetch;
     this.defaultDeliveryFee =
       options.defaultDeliveryFee ?? STORE_META.hazi_hinam.defaultDeliveryFee;
+  }
+
+  getAuthWarning(): string | null {
+    return this.authFallbackReason;
+  }
+
+  private async fetchWithTimeout(
+    url: string,
+    init?: RequestInit,
+  ): Promise<Response> {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), HTTP_TIMEOUT_MS);
+    try {
+      return await this.fetchFn(url, {
+        ...init,
+        signal: init?.signal ?? controller.signal,
+      });
+    } catch (err) {
+      if (err instanceof Error && err.name === 'AbortError') {
+        throw new Error(`חצי חינם לא הגיב תוך ${HTTP_TIMEOUT_MS / 1000} שניות`);
+      }
+      throw err;
+    } finally {
+      clearTimeout(timer);
+    }
   }
 
   private baseHeaders(includeAuth = true): Record<string, string> {
@@ -326,6 +356,20 @@ export class HaziHinamClient implements StoreClient {
     try {
       const raw = fs.readFileSync(this.options.sessionFilePath, 'utf8');
       const parsed = JSON.parse(raw) as PersistedHaziSession;
+      const configuredUser = this.options.username?.trim();
+
+      // If credentials are configured, ignore saved sessions belonging to a different username
+      if (
+        configuredUser &&
+        !parsed.isGuest &&
+        parsed.username &&
+        parsed.username !== configuredUser
+      ) {
+        logger.info(
+          'Hazi Hinam username changed in .env; ignoring cached session for previous user',
+        );
+        return false;
+      }
 
       // Support saved cookies (including Playwright storage_state format)
       if (Array.isArray(parsed.cookies) && parsed.cookies.length > 0) {
@@ -379,6 +423,9 @@ export class HaziHinamClient implements StoreClient {
     try {
       const payload: PersistedHaziSession = {
         savedAt: new Date().toISOString(),
+        username: this.isGuestSession
+          ? undefined
+          : this.options.username?.trim(),
         accessToken: this.accessToken,
         expiresAt: this.tokenExpiresAt,
         isGuest: this.isGuestSession,
@@ -399,18 +446,37 @@ export class HaziHinamClient implements StoreClient {
     }
 
     if (this.tryLoadSavedSession()) {
-      // If we now have credentials configured but only a guest token was saved, upgrade to OAuth
+      // If we now have credentials configured (and OAuth hasn't failed yet) but only a guest token was saved, upgrade to OAuth
       if (
         !this.isGuestSession ||
+        this.oauthFailed ||
         !(this.options.username && this.options.password)
       ) {
         return;
       }
     }
 
-    if (this.options.username && this.options.password) {
-      await this.performOAuthLogin(this.options.username, this.options.password);
-      return;
+    if (this.options.username && this.options.password && !this.oauthFailed) {
+      try {
+        await this.performOAuthLogin(this.options.username, this.options.password);
+        this.authFallbackReason = null;
+        return;
+      } catch (err) {
+        const reason = err instanceof Error ? err.message : String(err);
+        logger.warn(
+          `Hazi Hinam OAuth login failed (${reason}); falling back to guest session for live price comparison`,
+        );
+        this.oauthFailed = true;
+        this.authFallbackReason = reason;
+        // Fall back to anonymous session so price comparison & mirroring keep working!
+        try {
+          await this.initAnonymousSession();
+          return;
+        } catch (guestErr) {
+          logger.warn('Hazi Hinam anonymous session fallback also failed', guestErr);
+          throw err;
+        }
+      }
     }
 
     await this.initAnonymousSession();
@@ -436,7 +502,7 @@ export class HaziHinamClient implements StoreClient {
       password,
     });
 
-    const res = await this.fetchFn(`${this.authBaseUrl}/connect/token`, {
+    const res = await this.fetchWithTimeout(`${this.authBaseUrl}/connect/token`, {
       method: 'POST',
       headers: {
         'Content-Type': 'application/x-www-form-urlencoded',
@@ -496,7 +562,7 @@ export class HaziHinamClient implements StoreClient {
 
   private async initAnonymousSession(): Promise<void> {
     logger.info('Initializing Hazi Hinam guest session via /proxy/init...');
-    const res = await this.fetchFn(`${this.baseUrl}/proxy/init`, {
+    const res = await this.fetchWithTimeout(`${this.baseUrl}/proxy/init`, {
       method: 'GET',
       headers: this.baseHeaders(false),
     });
@@ -535,7 +601,7 @@ export class HaziHinamClient implements StoreClient {
     retryOn401 = true,
   ): Promise<Record<string, unknown>> {
     await this.ensureAuthenticated();
-    const res = await this.fetchFn(`${this.baseUrl}${path}`, {
+    const res = await this.fetchWithTimeout(`${this.baseUrl}${path}`, {
       method: init.method,
       headers: this.baseHeaders(true),
       body: init.body !== undefined ? JSON.stringify(init.body) : undefined,
@@ -663,11 +729,15 @@ export class HaziHinamClient implements StoreClient {
           this.isGuestSession,
         );
         if (parsed) {
-          if (parsed.items.length > 0 || this.trackedCart.size === 0) {
+          if (
+            this.trackedCart.size === 0 ||
+            (!this.isGuestSession && parsed.items.length > 0) ||
+            parsed.items.length >= this.trackedCart.size
+          ) {
             this.syncTrackedFromServer(parsed);
             return parsed;
           }
-          // If server returned empty cart in guest mode while we have tracked additions, return tracked state
+          // If server returned empty/partial cart in guest mode while we have tracked additions, keep tracked state
           return this.buildTrackedCartState();
         }
       } catch {
@@ -679,6 +749,7 @@ export class HaziHinamClient implements StoreClient {
 
   async setItemsInCart(items: AddCartItemInput[]): Promise<CartState> {
     await this.ensureAuthenticated();
+    const isBatch = items.length > 1;
 
     for (const item of items) {
       const numericId = Number(item.productCode);
@@ -698,14 +769,38 @@ export class HaziHinamClient implements StoreClient {
         },
       };
 
-      const resp = await this.apiFetchJson('/proxy/api/item/addItemToCart', {
-        method: 'POST',
-        body,
-      });
+      try {
+        const resp = await this.apiFetchJson('/proxy/api/item/addItemToCart', {
+          method: 'POST',
+          body,
+        });
 
-      if (resp['IsOK'] === false) {
-        const errInfo = JSON.stringify(resp['ErrorResponse'] ?? resp).slice(0, 180);
-        throw new Error(`חצי חינם דחה את הוספת המוצר (${item.productCode}): ${errInfo}`);
+        if (resp['IsOK'] === false) {
+          const errInfo = JSON.stringify(resp['ErrorResponse'] ?? resp).slice(0, 180);
+          if (isBatch) {
+            logger.warn(
+              `Hazi Hinam rejected batch item ${item.productCode}: ${errInfo}`,
+            );
+            continue;
+          }
+          throw new Error(`חצי חינם דחה את הוספת המוצר (${item.productCode}): ${errInfo}`);
+        }
+      } catch (err) {
+        if (isBatch && !this.isGuestSession) {
+          logger.warn(
+            `Hazi Hinam failed adding batch item ${item.productCode}; continuing batch`,
+            err,
+          );
+          continue;
+        }
+        if (!isBatch) {
+          throw err;
+        }
+        // In guest mode, if addItemToCart endpoint fails, still keep tracked live price for comparison
+        logger.warn(
+          `Hazi Hinam guest addItemToCart failed for ${item.productCode}; tracking locally`,
+          err,
+        );
       }
 
       this.trackedCart.set(item.productCode, {

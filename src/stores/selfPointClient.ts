@@ -26,6 +26,7 @@ import {
 const APP_ID = 4;
 const LANGUAGE_ID = 1;
 const NAVIGATION_TIMEOUT = 35_000;
+const HTTP_TIMEOUT_MS = 15_000;
 const IMAGE_BARCODE_RE = /\/(\d{7,14})-/;
 
 const DEFAULT_USER_AGENT =
@@ -71,6 +72,7 @@ export interface SelfPointClientOptions {
 
 interface PersistedSelfPointSession {
   savedAt: string;
+  username?: string;
   token?: string;
   userId?: string | number;
   cartId?: string;
@@ -328,6 +330,10 @@ export class SelfPointClient implements StoreClient {
   private userId: string | null = null;
   private cartId: string | null = null;
   private isGuestSession = true;
+  private browserLoginAttempted = false;
+  private authFallbackReason: string | null = null;
+  private branchDiscoveryAttempted = false;
+  private guestCartApiUnsupported = false;
   private selectedSlot: DeliverySlot | null = null;
   private readonly knownProducts = new Map<string, CatalogProduct>();
   private readonly trackedCart = new Map<string, TrackedCartEntry>();
@@ -346,6 +352,10 @@ export class SelfPointClient implements StoreClient {
     this.fetchFn = options.fetchFn ?? fetch;
     this.deliveryFee =
       options.defaultDeliveryFee ?? STORE_META[options.storeId].defaultDeliveryFee;
+  }
+
+  getAuthWarning(): string | null {
+    return this.authFallbackReason;
   }
 
   private apiBase(): string {
@@ -371,6 +381,17 @@ export class SelfPointClient implements StoreClient {
     try {
       const raw = fs.readFileSync(this.options.sessionFilePath, 'utf8');
       const parsed = JSON.parse(raw) as PersistedSelfPointSession;
+      const configuredUser = this.options.username?.trim();
+      if (
+        configuredUser &&
+        parsed.username &&
+        parsed.username !== configuredUser
+      ) {
+        logger.info(
+          `${this.storeId} username changed in .env; ignoring cached session`,
+        );
+        return false;
+      }
       if (parsed.token) {
         this.token = parsed.token;
         this.userId = parsed.userId ? String(parsed.userId) : null;
@@ -392,6 +413,7 @@ export class SelfPointClient implements StoreClient {
     try {
       const payload: PersistedSelfPointSession = {
         savedAt: new Date().toISOString(),
+        username: this.options.username?.trim(),
         token: this.token ?? undefined,
         userId: this.userId ?? undefined,
         cartId: this.cartId ?? undefined,
@@ -587,8 +609,25 @@ export class SelfPointClient implements StoreClient {
   }
 
   private async ensureReady(): Promise<void> {
-    if (this.options.username && this.options.password && !this.token) {
-      await this.ensureBrowserLogin();
+    if (
+      this.options.username &&
+      this.options.password &&
+      !this.token &&
+      !this.browserLoginAttempted
+    ) {
+      this.browserLoginAttempted = true;
+      try {
+        await this.ensureBrowserLogin();
+        this.authFallbackReason = null;
+      } catch (err) {
+        const reason = err instanceof Error ? err.message : String(err);
+        logger.warn(
+          `${this.storeId} browser login failed (${reason}); continuing in public API guest mode for live price comparison`,
+        );
+        this.authFallbackReason = reason;
+        this.isGuestSession = true;
+        await this.shutdown().catch(() => {});
+      }
     } else if (!this.token) {
       this.tryLoadSavedSession();
     }
@@ -598,13 +637,29 @@ export class SelfPointClient implements StoreClient {
     url: string,
     init?: RequestInit,
   ): Promise<T> {
-    const res = await this.fetchFn(url, {
-      ...init,
-      headers: {
-        ...this.apiHeaders(),
-        ...(init?.headers as Record<string, string> | undefined),
-      },
-    });
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), HTTP_TIMEOUT_MS);
+    let res: Response;
+    try {
+      res = await this.fetchFn(url, {
+        ...init,
+        signal: init?.signal ?? controller.signal,
+        headers: {
+          ...this.apiHeaders(),
+          ...(init?.headers as Record<string, string> | undefined),
+        },
+      });
+    } catch (err) {
+      if (err instanceof Error && err.name === 'AbortError') {
+        throw new Error(
+          `${this.meta.shortName} לא הגיב תוך ${HTTP_TIMEOUT_MS / 1000} שניות`,
+        );
+      }
+      throw err;
+    } finally {
+      clearTimeout(timer);
+    }
+
     const text = await res.text();
     if (!res.ok) {
       const lower = text.toLowerCase();
@@ -633,33 +688,19 @@ export class SelfPointClient implements StoreClient {
     }
   }
 
-  async searchProducts(query: string, limit = 15): Promise<CatalogProduct[]> {
-    const cleanQuery = query.trim();
-    if (!cleanQuery) return [];
-    await this.ensureReady();
-
-    const qs = new URLSearchParams({
-      appId: String(APP_ID),
-      query: cleanQuery,
-      size: String(Math.max(limit, 15)),
-      from: '0',
-      isSearch: 'true',
-      languageId: String(LANGUAGE_ID),
-      filters: STANDARD_SELFPOINT_FILTERS,
-    });
-
-    const data = await this.httpJson<Record<string, unknown>>(
-      `${this.apiBase()}/products?${qs.toString()}`,
-      { method: 'GET' },
-    );
-
+  private parseRawProductList(
+    data: Record<string, unknown>,
+    limit: number,
+  ): CatalogProduct[] {
     const rawProducts = Array.isArray(data['products'])
       ? (data['products'] as Array<Record<string, unknown>>)
       : Array.isArray(data['data'])
         ? (data['data'] as Array<Record<string, unknown>>)
-        : Array.isArray(data)
-          ? (data as unknown as Array<Record<string, unknown>>)
-          : [];
+        : Array.isArray(data['items'])
+          ? (data['items'] as Array<Record<string, unknown>>)
+          : Array.isArray(data)
+            ? (data as unknown as Array<Record<string, unknown>>)
+            : [];
 
     const parsed: CatalogProduct[] = [];
     for (const raw of rawProducts) {
@@ -671,6 +712,168 @@ export class SelfPointClient implements StoreClient {
       if (parsed.length >= limit) break;
     }
     return parsed;
+  }
+
+  /**
+   * If a retailer's default branchId returns 0 products (e.g. retired/changed branch),
+   * auto-discover an active online fulfillment branch from /v2/retailers/{id}/branches.
+   */
+  private async tryDiscoverActiveBranch(): Promise<boolean> {
+    if (this.branchDiscoveryAttempted) return false;
+    this.branchDiscoveryAttempted = true;
+
+    const urls = [
+      `${this.baseUrl}/v2/retailers/${this.retailerId}/branches?appId=${APP_ID}&languageId=${LANGUAGE_ID}`,
+      `${this.baseUrl}/v2/retailers/${this.retailerId}/branches?appId=${APP_ID}&deliveryTypeId=1&languageId=${LANGUAGE_ID}`,
+    ];
+
+    for (const url of urls) {
+      try {
+        const data = await this.httpJson<Record<string, unknown>>(url, {
+          method: 'GET',
+        });
+        const branches = Array.isArray(data['branches'])
+          ? (data['branches'] as Array<Record<string, unknown>>)
+          : Array.isArray(data['data'])
+            ? (data['data'] as Array<Record<string, unknown>>)
+            : Array.isArray(data)
+              ? (data as unknown as Array<Record<string, unknown>>)
+              : [];
+        if (branches.length === 0) continue;
+
+        const activeBranches = branches.filter(
+          (b) =>
+            b['isActive'] !== false &&
+            Number(b['id'] ?? b['branchId'] ?? 0) > 0,
+        );
+        if (activeBranches.length === 0) continue;
+
+        // If current branchId is already in activeBranches, pick another active delivery branch
+        // only if the current one isn't listed at all.
+        const currentIsListed = activeBranches.some(
+          (b) => Number(b['id'] ?? b['branchId']) === this.branchId,
+        );
+        if (currentIsListed) {
+          return false;
+        }
+
+        const deliveryBranch =
+          activeBranches.find(
+            (b) => b['isDelivery'] === true || b['hasDelivery'] === true,
+          ) ?? activeBranches[0]!;
+        const discoveredId = Number(
+          deliveryBranch['id'] ?? deliveryBranch['branchId'],
+        );
+        if (discoveredId > 0 && discoveredId !== this.branchId) {
+          logger.info(
+            `Auto-discovered active ${this.storeId} branchId=${discoveredId} (previous ${this.branchId} not active)`,
+          );
+          this.branchId = discoveredId;
+          return true;
+        }
+      } catch (err) {
+        logger.debug(`${this.storeId} branch discovery probe failed`, err);
+      }
+    }
+    return false;
+  }
+
+  private async runProductQuery(
+    cleanQuery: string,
+    limit: number,
+    includeStandardFilters: boolean,
+  ): Promise<CatalogProduct[]> {
+    const qs = new URLSearchParams({
+      appId: String(APP_ID),
+      query: cleanQuery,
+      size: String(Math.max(limit, 15)),
+      from: '0',
+      isSearch: 'true',
+      languageId: String(LANGUAGE_ID),
+    });
+    if (includeStandardFilters) {
+      qs.set('filters', STANDARD_SELFPOINT_FILTERS);
+    }
+
+    const data = await this.httpJson<Record<string, unknown>>(
+      `${this.apiBase()}/products?${qs.toString()}`,
+      { method: 'GET' },
+    );
+    return this.parseRawProductList(data, limit);
+  }
+
+  async searchProducts(query: string, limit = 15): Promise<CatalogProduct[]> {
+    const cleanQuery = query.trim();
+    if (!cleanQuery) return [];
+    await this.ensureReady();
+
+    let results: CatalogProduct[] = [];
+    try {
+      results = await this.runProductQuery(cleanQuery, limit, true);
+    } catch (err) {
+      if (err instanceof StoreManualVerificationRequiredError) {
+        throw err;
+      }
+      logger.warn(
+        `${this.storeId} filtered search failed for "${cleanQuery}"; retrying without strict filters`,
+        err,
+      );
+    }
+
+    // Fallback 1: retry without strict Elasticsearch filters (some retailers omit family.categoriesPaths.id)
+    if (results.length === 0) {
+      try {
+        results = await this.runProductQuery(cleanQuery, limit, false);
+      } catch (err) {
+        if (err instanceof StoreManualVerificationRequiredError) {
+          throw err;
+        }
+        logger.warn(
+          `${this.storeId} unfiltered search failed for "${cleanQuery}"`,
+          err,
+        );
+      }
+    }
+
+    // Fallback 2: if still empty, verify/discover active branch once and retry
+    if (results.length === 0 && !this.branchDiscoveryAttempted) {
+      const switched = await this.tryDiscoverActiveBranch();
+      if (switched) {
+        try {
+          results = await this.runProductQuery(cleanQuery, limit, true);
+          if (results.length === 0) {
+            results = await this.runProductQuery(cleanQuery, limit, false);
+          }
+        } catch (err) {
+          if (err instanceof StoreManualVerificationRequiredError) {
+            throw err;
+          }
+        }
+      }
+    }
+
+    // Fallback 3: try autocomplete endpoint if /products still returned empty
+    if (results.length === 0) {
+      try {
+        const autoQs = new URLSearchParams({
+          appId: String(APP_ID),
+          query: cleanQuery,
+          size: String(Math.max(limit, 10)),
+          languageId: String(LANGUAGE_ID),
+        });
+        const autoData = await this.httpJson<Record<string, unknown>>(
+          `${this.apiBase()}/products/autocomplete?${autoQs.toString()}`,
+          { method: 'GET' },
+        );
+        results = this.parseRawProductList(autoData, limit);
+      } catch (err) {
+        if (err instanceof StoreManualVerificationRequiredError) {
+          throw err;
+        }
+      }
+    }
+
+    return results;
   }
 
   private buildTrackedCartState(): CartState {
@@ -718,6 +921,23 @@ export class SelfPointClient implements StoreClient {
         quantity: item.quantity,
         unitPrice,
         sellingMethod: item.sellingMethod ?? known?.sellingMethod ?? 'BY_UNIT',
+        inStock: item.inStock,
+      });
+    }
+  }
+
+  private mergeServerPricesIntoTracked(cart: CartState): void {
+    for (const item of cart.items) {
+      const existing = this.trackedCart.get(item.productCode);
+      if (!existing) continue;
+      const unitPrice =
+        item.quantity > 0 && item.itemPrice > 0
+          ? Number((item.itemPrice / item.quantity).toFixed(2))
+          : existing.unitPrice;
+      this.trackedCart.set(item.productCode, {
+        ...existing,
+        productName: item.productName ?? existing.productName,
+        unitPrice,
         inStock: item.inStock,
       });
     }
@@ -797,9 +1017,12 @@ export class SelfPointClient implements StoreClient {
             false,
             this.storeId,
           );
-          if (parsed.items.length > 0 || lines.length === 0) {
+          if (lines.length === 0 || parsed.items.length >= lines.length) {
             this.syncTrackedFromCartState(parsed);
             return parsed;
+          }
+          if (parsed.items.length > 0) {
+            this.mergeServerPricesIntoTracked(parsed);
           }
         }
       } catch (err) {
@@ -808,6 +1031,10 @@ export class SelfPointClient implements StoreClient {
           err,
         );
       }
+    }
+
+    if (this.isGuestSession && !this.token && this.guestCartApiUnsupported) {
+      return this.buildTrackedCartState();
     }
 
     const targetUrl = this.cartId
@@ -832,13 +1059,26 @@ export class SelfPointClient implements StoreClient {
         this.isGuestSession,
         this.storeId,
       );
-      if (parsed.items.length > 0 || lines.length === 0) {
+      if (lines.length === 0 || parsed.items.length >= lines.length) {
         this.syncTrackedFromCartState(parsed);
         return parsed;
+      }
+      if (parsed.items.length > 0) {
+        this.mergeServerPricesIntoTracked(parsed);
       }
     } catch (err) {
       if (err instanceof StoreManualVerificationRequiredError) {
         throw err;
+      }
+      const msg = err instanceof Error ? err.message : String(err);
+      if (
+        this.isGuestSession &&
+        !this.token &&
+        (msg.includes('HTTP 401') ||
+          msg.includes('HTTP 403') ||
+          msg.includes('HTTP 405'))
+      ) {
+        this.guestCartApiUnsupported = true;
       }
       logger.warn(`${this.storeId} REST cart sync fallback used`, err);
     }
@@ -849,7 +1089,7 @@ export class SelfPointClient implements StoreClient {
   async getCartState(): Promise<CartState> {
     await this.ensureReady();
 
-    if (this.cartId) {
+    if (this.cartId && !this.guestCartApiUnsupported) {
       try {
         const resp = await this.httpJson<Record<string, unknown>>(
           `${this.apiBase()}/carts/${encodeURIComponent(this.cartId)}?appId=${APP_ID}&languageId=${LANGUAGE_ID}`,
@@ -862,9 +1102,16 @@ export class SelfPointClient implements StoreClient {
           this.isGuestSession,
           this.storeId,
         );
-        if (parsed.items.length > 0 || this.trackedCart.size === 0) {
+        // Never allow a partial/stale server cart to wipe locally tracked items
+        if (
+          this.trackedCart.size === 0 ||
+          parsed.items.length >= this.trackedCart.size
+        ) {
           this.syncTrackedFromCartState(parsed);
           return parsed;
+        }
+        if (parsed.items.length > 0) {
+          this.mergeServerPricesIntoTracked(parsed);
         }
       } catch {
         // fall through to tracked state
