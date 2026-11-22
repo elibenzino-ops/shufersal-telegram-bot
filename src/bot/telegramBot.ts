@@ -270,7 +270,7 @@ export function createTelegramBot(deps: CreateTelegramBotDeps): Bot {
         `• /search <code>&lt;מוצר&gt;</code> – חיפוש ידני ובחירה מתוך תוצאות\n` +
         `• /slots – בחירת יום ושעת משלוח בשופרסל\n` +
         `• /orders – צפייה בהזמנות פעילות וטעינת הזמנה קיימת לעדכון\n` +
-        `• /checkout – <b>(מנהלים)</b> סיכום ואישור ביצוע/עדכון ההזמנה בשופרסל\n` +
+        `• /checkout – סיכום ואישור ביצוע/עדכון ההזמנה בשופרסל\n` +
         `• /clear – <b>(מנהלים)</b> ריקון העגלה\n` +
         `• /id – הצגת מזהי הקבוצה והמשתמש`,
       { parse_mode: 'HTML' },
@@ -293,8 +293,8 @@ export function createTelegramBot(deps: CreateTelegramBotDeps): Bot {
     }
     kb.row().text(
       orderInUpdateMode
-        ? `💳 שמור עדכון הזמנה #${orderInUpdateMode} (מנהל)`
-        : '💳 סיכום ואישור הזמנה (מנהל)',
+        ? `💳 שמור עדכון הזמנה #${orderInUpdateMode}`
+        : '💳 סיכום ואישור הזמנה',
       'nav:checkout',
     );
     return kb;
@@ -394,7 +394,7 @@ export function createTelegramBot(deps: CreateTelegramBotDeps): Bot {
     }
 
     kb.text('⬅️ חזרה לעגלה', 'nav:cart').text(
-      cart.orderInUpdateMode ? '💳 שמור עדכון (מנהל)' : '💳 להזמנה (מנהל)',
+      cart.orderInUpdateMode ? '💳 שמור עדכון' : '💳 להזמנה',
       'nav:checkout',
     );
 
@@ -792,9 +792,7 @@ export function createTelegramBot(deps: CreateTelegramBotDeps): Bot {
       .text('🕒 החלף חלון משלוח', 'nav:slots')
       .text('❌ ביטול', 'nav:cancel');
 
-    const fullText =
-      `${summaryHtml}${modeNote}\n\n` +
-      `🔐 <i>אישור סופי זמין למנהלי הקבוצה בלבד.</i>`;
+    const fullText = `${summaryHtml}${modeNote}`;
 
     if (messageIdToEdit) {
       await bot.api.editMessageText(chatId, messageIdToEdit, fullText, {
@@ -810,14 +808,6 @@ export function createTelegramBot(deps: CreateTelegramBotDeps): Bot {
   }
 
   bot.command('checkout', async (ctx) => {
-    if (!(await isUserAdmin(ctx))) {
-      await ctx.reply(
-        `⛔ רק מנהל/ת הקבוצה רשאי/ת ליזום סגירה ואישור הזמנה.\n<i>(למתן הרשאה למשתמש נוסף ניתן להוסיף ל-<code>ADMIN_USER_IDS</code> את המזהה: <code>${ctx.from?.id ?? ''}</code>)</i>`,
-        { parse_mode: 'HTML' },
-      );
-      return;
-    }
-
     const loading = await ctx.reply('💳 מכין סיכום הזמנה ובודק חלון משלוח בשופרסל...');
     try {
       await renderCheckoutConfirmation(ctx.chat.id, loading.message_id);
@@ -895,13 +885,6 @@ export function createTelegramBot(deps: CreateTelegramBotDeps): Bot {
       }
 
       if (data === 'nav:checkout') {
-        if (!(await isUserAdmin(ctx))) {
-          await ctx.answerCallbackQuery({
-            text: '⛔ פעולה זו מיועדת למנהלי הקבוצה בלבד',
-            show_alert: true,
-          });
-          return;
-        }
         await ctx.answerCallbackQuery('מכין סיכום לאישור...');
         await renderCheckoutConfirmation(chatId, messageId);
         return;
@@ -1148,7 +1131,7 @@ export function createTelegramBot(deps: CreateTelegramBotDeps): Bot {
               ? ` • דמי משלוח: <b>${formatCurrency(chosen.deliveryFee)}</b>`
               : '';
           const kb = new InlineKeyboard().text(
-            '💳 המשך לסיכום ואישור הזמנה (מנהל)',
+            '💳 המשך לסיכום ואישור הזמנה',
             'nav:checkout',
           );
 
@@ -1162,13 +1145,6 @@ export function createTelegramBot(deps: CreateTelegramBotDeps): Bot {
         }
 
         if (payload.kind === 'order_edit') {
-          if (!(await isUserAdmin(ctx))) {
-            await ctx.answerCallbackQuery({
-              text: '⛔ טעינת הזמנה לעדכון מיועדת למנהלי הקבוצה בלבד',
-              show_alert: true,
-            });
-            return;
-          }
           await ctx.answerCallbackQuery('טוען את ההזמנה לעגלה...');
           const cart = await shufersal.loadOrderForUpdate(
             chatId,
@@ -1181,7 +1157,7 @@ export function createTelegramBot(deps: CreateTelegramBotDeps): Bot {
             `✏️ <b>הזמנה #${escapeHtml(payload.orderCode)} נטענה לעגלה במצב עדכון!</b>\n\n` +
               `• להוספת מוצרים – כתבו כרגיל בקבוצה.\n` +
               `• להסרת מוצרים – לחצו <b>🗑 הסר / ערוך פריטים בהזמנה</b> למטה, הקלידו <code>/remove</code>, או כתבו <i>"תורידו את..."</i>.\n` +
-              `⚠️ <b>חשוב:</b> בסיום העריכה, על המנהל/ת להריץ /checkout (או ללחוץ שמור עדכון) כדי לשמור את השינויים בשופרסל!\n\n` +
+              `⚠️ <b>חשוב:</b> בסיום העריכה, יש להריץ /checkout (או ללחוץ שמור עדכון) כדי לשמור את השינויים בשופרסל!\n\n` +
               renderCartSummaryHtml(cart),
             {
               parse_mode: 'HTML',
@@ -1232,14 +1208,6 @@ export function createTelegramBot(deps: CreateTelegramBotDeps): Bot {
         }
 
         if (payload.kind === 'checkout_exec') {
-          if (!(await isUserAdmin(ctx))) {
-            await ctx.answerCallbackQuery({
-              text: '⛔ אישור וחיוב הזמנה מותר למנהלי הקבוצה בלבד!',
-              show_alert: true,
-            });
-            return;
-          }
-
           await ctx.answerCallbackQuery('מבצע הזמנה בשופרסל אונליין...');
           await ctx.editMessageText(
             '⏳ <b>מבצע הזמנה מול שופרסל אונליין...</b> אנא המתן כ-10–20 שניות (אל תלחץ שוב).',
@@ -1452,7 +1420,7 @@ export async function registerBotCommands(bot: Bot): Promise<void> {
     { command: 'cart', description: 'הצגת עגלת שופרסל הנוכחית וסה"כ לתשלום' },
     { command: 'remove', description: 'הסרה או עריכת כמות של פריטים בעגלה / בהזמנה' },
     { command: 'slots', description: 'בחירת יום ושעת משלוח בשופרסל' },
-    { command: 'checkout', description: '(מנהל) אישור וסגירת הזמנה בשופרסל' },
+    { command: 'checkout', description: 'אישור וסגירת הזמנה בשופרסל' },
     { command: 'orders', description: 'צפייה בהזמנות פעילות וטעינת הזמנה לעדכון' },
     { command: 'search', description: 'חיפוש ידני בקטלוג שופרסל' },
     { command: 'clear', description: '(מנהל) ריקון כל העגלה' },
