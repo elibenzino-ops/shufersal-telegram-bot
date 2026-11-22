@@ -68,3 +68,22 @@ export function normalizeHebrewQuery(query: string): string {
     .replace(/["'״׳]/g, '')
     .replace(/\s+/g, ' ');
 }
+
+export function normalizeIsraeliPhone(raw: string): string | null {
+  let digits = raw.replace(/[^\d+]/g, '');
+  if (digits.startsWith('+972')) {
+    digits = digits.slice(4);
+  } else if (digits.startsWith('00972')) {
+    digits = digits.slice(5);
+  } else if (digits.startsWith('972') && digits.length >= 11) {
+    digits = digits.slice(3);
+  }
+  digits = digits.replace(/\D/g, '');
+  if (/^5\d{8}$/.test(digits)) {
+    digits = `0${digits}`;
+  }
+  if (/^05\d{8}$/.test(digits)) {
+    return digits;
+  }
+  return null;
+}

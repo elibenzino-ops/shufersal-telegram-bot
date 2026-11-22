@@ -1,3 +1,5 @@
+import fs from 'node:fs';
+import path from 'node:path';
 import puppeteer, {
   type Browser,
   type BrowserContext,
@@ -5,7 +7,7 @@ import puppeteer, {
   type Page,
 } from 'puppeteer-core';
 import { logger } from '../logger.js';
-import { formatCurrency } from '../utils/format.js';
+import { formatCurrency, normalizeIsraeliPhone } from '../utils/format.js';
 import {
   STORE_META,
   StoreManualVerificationRequiredError,
@@ -486,6 +488,7 @@ export class VictoryClient implements StoreClient {
   private context: BrowserContext | null = null;
   private page: Page | null = null;
   private pageInitialized = false;
+  private isGuestSession = true;
   private discoveredSearchUrlTemplate: string | null = null;
   private authFallbackReason: string | null = null;
 
@@ -504,9 +507,74 @@ export class VictoryClient implements StoreClient {
     this.fetchFn = options.fetchFn ?? fetch;
     this.deliveryFee =
       options.defaultDeliveryFee ?? STORE_META.victory.defaultDeliveryFee;
-    if (options.username && options.password) {
-      this.authFallbackReason =
-        'ויקטורי אונליין עבר לאתר חדש – ההשוואה מתבצעת במצב אורח עם מחירים חיים';
+
+    // Check if a saved SMS OTP session already exists on disk
+    if (this.readSavedSessionFile()) {
+      this.isGuestSession = false;
+    }
+  }
+
+  private readSavedSessionFile(): {
+    savedAt: string;
+    cookies?: Array<Record<string, unknown>>;
+    localStorage?: Record<string, string>;
+  } | null {
+    if (!fs.existsSync(this.options.sessionFilePath)) return null;
+    try {
+      const raw = fs.readFileSync(this.options.sessionFilePath, 'utf8');
+      const parsed = JSON.parse(raw) as {
+        savedAt?: string;
+        cookies?: Array<Record<string, unknown>>;
+        localStorage?: Record<string, string>;
+      };
+      if (
+        (Array.isArray(parsed.cookies) && parsed.cookies.length > 0) ||
+        (parsed.localStorage && Object.keys(parsed.localStorage).length > 0)
+      ) {
+        return {
+          savedAt: parsed.savedAt ?? new Date().toISOString(),
+          cookies: parsed.cookies,
+          localStorage: parsed.localStorage,
+        };
+      }
+      return null;
+    } catch {
+      return null;
+    }
+  }
+
+  private async saveVictorySession(): Promise<void> {
+    if (!this.page || this.page.isClosed()) return;
+    try {
+      const cookies = (await this.context?.cookies().catch(() => [])) ?? [];
+      const localStorageData = await this.page
+        .evaluate(() => {
+          const out: Record<string, string> = {};
+          for (let i = 0; i < window.localStorage.length; i++) {
+            const k = window.localStorage.key(i);
+            if (!k) continue;
+            const v = window.localStorage.getItem(k);
+            if (v !== null) out[k] = v;
+          }
+          return out;
+        })
+        .catch(() => ({} as Record<string, string>));
+
+      fs.writeFileSync(
+        this.options.sessionFilePath,
+        JSON.stringify(
+          {
+            savedAt: new Date().toISOString(),
+            cookies,
+            localStorage: localStorageData,
+          },
+          null,
+          2,
+        ),
+        'utf8',
+      );
+    } catch (err) {
+      logger.warn('Failed saving Victory session', err);
     }
   }
 
@@ -594,11 +662,39 @@ export class VictoryClient implements StoreClient {
       await this.page.setViewport({ width: 1366, height: 900 });
     }
 
+    const saved = this.readSavedSessionFile();
+    if (saved?.cookies && saved.cookies.length > 0) {
+      await this.context
+        .setCookie(
+          ...(saved.cookies as unknown as Parameters<
+            BrowserContext['setCookie']
+          >),
+        )
+        .catch(() => {});
+    }
+
     logger.info('Opening Victory Online Next.js storefront in Chromium...');
     await this.page.goto(`${this.baseUrl}/`, {
       waitUntil: 'domcontentloaded',
       timeout: NAVIGATION_TIMEOUT,
     });
+
+    if (saved?.localStorage && Object.keys(saved.localStorage).length > 0) {
+      await this.page
+        .evaluate((entries: Record<string, string>) => {
+          for (const [k, v] of Object.entries(entries)) {
+            try {
+              window.localStorage.setItem(k, v);
+            } catch {
+              // ignore storage quota errors
+            }
+          }
+        }, saved.localStorage)
+        .catch(() => {});
+      await this.page
+        .reload({ waitUntil: 'domcontentloaded', timeout: NAVIGATION_TIMEOUT })
+        .catch(() => {});
+    }
 
     await new Promise((r) => setTimeout(r, 1500));
 
@@ -637,6 +733,12 @@ export class VictoryClient implements StoreClient {
         }
       })
       .catch(() => {});
+
+    // Check if the restored session is genuinely logged in
+    const stillGuest = await this.page
+      .evaluate(() => (document.body?.innerText ?? '').includes('שלום אורח'))
+      .catch(() => true);
+    this.isGuestSession = stillGuest;
 
     this.pageInitialized = true;
     return this.page;
@@ -968,7 +1070,7 @@ export class VictoryClient implements StoreClient {
       totalPrice: Number(totalPrice.toFixed(2)),
       deliveryFee: this.selectedSlot?.deliveryFee ?? this.deliveryFee,
       orderInUpdateMode: null,
-      isGuestSession: true,
+      isGuestSession: this.isGuestSession,
     };
   }
 
@@ -1061,12 +1163,317 @@ export class VictoryClient implements StoreClient {
         ? `\n⚠️ שימו לב: מינימום הזמנה בויקטורי הוא ${formatCurrency(minAmount)}.`
         : '';
 
+    const previewItems = cart.items.slice(0, 25);
+    const checklist = previewItems
+      .map(
+        (i, idx) =>
+          `${idx + 1}. ${i.productName ?? i.productCode} × ${i.quantity} (${formatCurrency(i.itemPrice)})`,
+      )
+      .join('\n');
+    const moreNote =
+      cart.items.length > previewItems.length
+        ? `\n...ועוד ${cart.items.length - previewItems.length} פריטים`
+        : '';
+    const loginHint = this.isGuestSession
+      ? `\nℹ️ להתחברות לחשבון ויקטורי באמצעות SMS שלחו: /login_victory 05XXXXXXXX`
+      : `\n✅ מחובר לחשבון ויקטורי אונליין.`;
+
     throw new StoreManualVerificationRequiredError(
       'victory',
       'MANUAL_CHECKOUT',
-      `עגלת ויקטורי אונליין חושבה עם ${cart.items.length} פריטים בסך ${total} (מחירים חיים מאתר ויקטורי).${minNote}\nלהשלמת ההזמנה היכנסו לאתר ויקטורי אונליין:`,
+      `📋 סיכום סל ויקטורי אונליין: ${cart.items.length} פריטים בסך ${total}.${minNote}${loginHint}\n\nרשימת הפריטים להזמנה:\n${checklist}${moreNote}`,
       this.meta.baseUrl,
     );
+  }
+
+  private async captureLoginDiagnosticScreenshot(tag: string): Promise<void> {
+    if (!this.page || this.page.isClosed()) return;
+    try {
+      fs.mkdirSync(this.options.screenshotsDir, { recursive: true });
+      const file = path.join(
+        this.options.screenshotsDir,
+        `victory-${tag}-${Date.now()}.png`,
+      );
+      await this.page.screenshot({ path: file });
+      logger.info(`Saved Victory diagnostic screenshot: ${file}`);
+    } catch {
+      // ignore screenshot errors
+    }
+  }
+
+  async startSmsOtpLogin(phoneNumber: string): Promise<{ message: string }> {
+    const cleanPhone = normalizeIsraeliPhone(phoneNumber);
+    if (!cleanPhone) {
+      throw new Error(
+        'מספר הטלפון אינו תקין. אנא הזינו מספר ישראלי בן 10 ספרות המתחיל ב-05 (למשל 0501234567).',
+      );
+    }
+
+    const page = await this.ensureBrowserPage();
+    if (!page) {
+      throw new Error(
+        'Chromium אינו מוגדר בשרת – לא ניתן להריץ התחברות SMS עבור ויקטורי אונליין.',
+      );
+    }
+
+    logger.info('Starting SMS OTP login flow for Victory Online...');
+
+    // Ensure we are on homepage and click the login trigger ("להתחברות" / "שלום אורח")
+    await page.goto(`${this.baseUrl}/`, {
+      waitUntil: 'domcontentloaded',
+      timeout: NAVIGATION_TIMEOUT,
+    });
+    await new Promise((r) => setTimeout(r, 1500));
+
+    // Dismiss CookieYes / legal popup if shown
+    await page
+      .evaluate(() => {
+        for (const btn of Array.from(document.querySelectorAll('button'))) {
+          const t = (btn.textContent ?? '').trim();
+          if (
+            t === 'הבנתי' ||
+            t.includes('מאשר/ת הכול') ||
+            t.includes('דחה הכול')
+          ) {
+            btn.click();
+          }
+        }
+      })
+      .catch(() => {});
+
+    const opened = await page.evaluate(() => {
+      const findPhoneInput = () =>
+        document.querySelector(
+          'input[type="tel"], input[name*="phone" i], input[placeholder*="טלפון"], input[placeholder*="נייד"], input[inputmode="tel"]',
+        ) as HTMLInputElement | null;
+
+      if (findPhoneInput()) return 'already_open';
+
+      const els = Array.from(
+        document.querySelectorAll('button, a, [role="button"], span, div'),
+      );
+      const loginTrigger = els.find((el) => {
+        const t = (el.textContent ?? '').trim();
+        return (
+          t.length <= 35 &&
+          (t.includes('להתחברות') ||
+            t === 'התחברות' ||
+            t === 'כניסה' ||
+            t.includes('שלום אורח'))
+        );
+      }) as HTMLElement | undefined;
+
+      if (loginTrigger) {
+        loginTrigger.click();
+        return 'clicked_login';
+      }
+      return 'not_found';
+    });
+
+    if (opened !== 'already_open') {
+      await new Promise((r) => setTimeout(r, 2000));
+    }
+
+    await page
+      .waitForSelector(
+        'input[type="tel"], input[name*="phone" i], input[placeholder*="טלפון"], input[placeholder*="נייד"], input[inputmode="tel"]',
+        { timeout: 10_000 },
+      )
+      .catch(() => null);
+
+    const gateDetected = await page.evaluate(() => {
+      const html = document.documentElement?.innerHTML?.toLowerCase() ?? '';
+      return (
+        html.includes('cf-turnstile') ||
+        html.includes('g-recaptcha') ||
+        html.includes('hcaptcha')
+      );
+    });
+    if (gateDetected) {
+      throw new StoreManualVerificationRequiredError(
+        'victory',
+        'SECURITY_GATE',
+        'אתר ויקטורי אונליין מציג בדיקת אבטחה/CAPTCHA. המערכת אינה עוקפת בדיקות אבטחה.',
+      );
+    }
+
+    const submitted = await page.evaluate((phone: string) => {
+      const inp = document.querySelector(
+        'input[type="tel"], input[name*="phone" i], input[placeholder*="טלפון"], input[placeholder*="נייד"], input[inputmode="tel"]',
+      ) as HTMLInputElement | null;
+      if (!inp) return { ok: false, reason: 'no_phone_input' };
+
+      inp.focus();
+      const setter = Object.getOwnPropertyDescriptor(
+        HTMLInputElement.prototype,
+        'value',
+      )?.set;
+      if (setter) setter.call(inp, phone);
+      else inp.value = phone;
+      inp.dispatchEvent(new Event('input', { bubbles: true }));
+      inp.dispatchEvent(new Event('change', { bubbles: true }));
+
+      const scope =
+        inp.closest('form') ?? inp.closest('[role="dialog"]') ?? document;
+      const sendBtn =
+        (Array.from(scope.querySelectorAll('button')).find((b) => {
+          const t = (b.textContent ?? '').trim();
+          return (
+            t.length <= 30 &&
+            (t.includes('שלח') ||
+              t.includes('קבל קוד') ||
+              t.includes('המשך') ||
+              t.includes('התחברות') ||
+              t.includes('כניסה'))
+          );
+        }) as HTMLElement | undefined) ??
+        (scope.querySelector('button[type="submit"]') as HTMLElement | null);
+
+      if (sendBtn) {
+        sendBtn.click();
+        return { ok: true, reason: 'clicked_send' };
+      }
+      return { ok: true, reason: 'enter_fallback' };
+    }, cleanPhone);
+
+    if (!submitted.ok) {
+      await this.captureLoginDiagnosticScreenshot('otp-no-phone-input');
+      throw new Error(
+        'לא נמצא שדה הזנת מספר טלפון באתר ויקטורי אונליין. נסו שוב בעוד רגע.',
+      );
+    }
+
+    if (submitted.reason === 'enter_fallback') {
+      await page.keyboard.press('Enter').catch(() => {});
+    }
+
+    await new Promise((r) => setTimeout(r, 2500));
+
+    return {
+      message:
+        '📱 נשלח קוד SMS מ-ויקטורי אונליין לטלפון שלך!\nשלחו כאן את הקוד שקיבלתם (למשל <code>123456</code> או <code>/otp 123456</code>).',
+    };
+  }
+
+  async completeSmsOtpLogin(
+    otpCode: string,
+  ): Promise<{ message: string; isAuthenticated: boolean }> {
+    const cleanCode = otpCode.replace(/\D/g, '').trim();
+    if (cleanCode.length < 4 || cleanCode.length > 8) {
+      throw new Error('קוד האימות חייב להכיל 4 עד 8 ספרות.');
+    }
+
+    if (!this.page || this.page.isClosed()) {
+      throw new Error(
+        'סשן ההתחברות של ויקטורי פג או נסגר. הריצו שוב /login_victory עם מספר הטלפון.',
+      );
+    }
+
+    logger.info('Submitting SMS OTP verification for Victory Online...');
+
+    const fillResult = await this.page.evaluate((code: string) => {
+      const dialog =
+        document.querySelector('[role="dialog"], [class*="modal" i]') ??
+        document;
+      const setter = Object.getOwnPropertyDescriptor(
+        HTMLInputElement.prototype,
+        'value',
+      )?.set;
+
+      const setVal = (inp: HTMLInputElement, val: string) => {
+        inp.focus();
+        if (setter) setter.call(inp, val);
+        else inp.value = val;
+        inp.dispatchEvent(new Event('input', { bubbles: true }));
+        inp.dispatchEvent(new Event('change', { bubbles: true }));
+      };
+
+      // 1. Multi-box OTP inputs (one digit per box)
+      const digitBoxes = Array.from(
+        dialog.querySelectorAll(
+          'input[maxlength="1"], [class*="otp" i] input, [data-testid*="otp" i] input',
+        ),
+      ).filter((el) => {
+        const inp = el as HTMLInputElement;
+        return inp.offsetParent !== null && !inp.disabled;
+      }) as HTMLInputElement[];
+
+      if (digitBoxes.length >= code.length && digitBoxes.length <= 8) {
+        digitBoxes.forEach((inp, idx) => {
+          setVal(inp, code[idx] ?? '');
+        });
+      } else {
+        // 2. Single OTP input
+        const inp = dialog.querySelector(
+          'input[placeholder*="קוד"], input[name*="otp" i], input[name*="code" i], input[autocomplete="one-time-code"], input[inputmode="numeric"], input[type="tel"]',
+        ) as HTMLInputElement | null;
+        if (!inp) return { ok: false, reason: 'no_otp_input' };
+        setVal(inp, code);
+      }
+
+      const verifyBtn =
+        (Array.from(dialog.querySelectorAll('button')).find((b) => {
+          const t = (b.textContent ?? '').trim();
+          return (
+            t.length <= 30 &&
+            (t.includes('אמת') ||
+              t.includes('אימות') ||
+              t.includes('התחברות') ||
+              t === 'כניסה' ||
+              t === 'אישור' ||
+              t === 'המשך')
+          );
+        }) as HTMLElement | undefined) ??
+        (dialog.querySelector('button[type="submit"]') as HTMLElement | null);
+
+      if (verifyBtn) {
+        verifyBtn.click();
+        return { ok: true, reason: 'clicked_verify' };
+      }
+      return { ok: true, reason: 'enter_fallback' };
+    }, cleanCode);
+
+    if (!fillResult.ok) {
+      await this.captureLoginDiagnosticScreenshot('otp-no-code-input');
+      throw new Error(
+        'לא נמצא שדה הזנת קוד SMS באתר ויקטורי אונליין. נסו להתחיל שוב עם /login_victory.',
+      );
+    }
+
+    if (fillResult.reason === 'enter_fallback') {
+      await this.page.keyboard.press('Enter').catch(() => {});
+    }
+
+    await new Promise((r) => setTimeout(r, 4500));
+
+    const verifyState = await this.page.evaluate(() => {
+      const bodyText = document.body?.innerText ?? '';
+      const stillGuest = bodyText.includes('שלום אורח');
+      const dialogStillOpen = Boolean(
+        document.querySelector(
+          '[role="dialog"] input[placeholder*="קוד"], [role="dialog"] input[autocomplete="one-time-code"]',
+        ),
+      );
+      return { stillGuest, dialogStillOpen };
+    });
+
+    if (verifyState.stillGuest && verifyState.dialogStillOpen) {
+      await this.captureLoginDiagnosticScreenshot('otp-verify-failed');
+      throw new Error(
+        'אימות קוד ה-SMS בוויקטורי אונליין לא הושלם (ייתכן שהקוד שגוי או פג תוקפו). נסו שוב עם /login_victory.',
+      );
+    }
+
+    this.isGuestSession = false;
+    this.authFallbackReason = null;
+    await this.saveVictorySession();
+    logger.info('SMS OTP login succeeded for Victory Online; session saved');
+
+    return {
+      isAuthenticated: true,
+      message:
+        '✅ <b>התחברתם בהצלחה ל-ויקטורי אונליין!</b>\nהסשן נשמר אוטומטית ב-<code>data/victory-session.json</code>.',
+    };
   }
 
   async shutdown(): Promise<void> {

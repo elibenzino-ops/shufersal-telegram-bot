@@ -1,11 +1,12 @@
 import fs from 'node:fs';
+import path from 'node:path';
 import puppeteer, {
   type Browser,
   type BrowserContext,
   type Page,
 } from 'puppeteer-core';
 import { logger } from '../logger.js';
-import { formatCurrency } from '../utils/format.js';
+import { formatCurrency, normalizeIsraeliPhone } from '../utils/format.js';
 import {
   STORE_META,
   StoreAuthError,
@@ -1402,7 +1403,7 @@ export class SelfPointClient implements StoreClient {
         ? `\n...ועוד ${cart.items.length - previewItems.length} פריטים`
         : '';
     const authHint = this.isGuestSession
-      ? `הבוט רץ כרגע במצב אורח (לא מוגדרים ${this.options.envPrefix}_USERNAME / ${this.options.envPrefix}_PASSWORD ב-.env), ולכן העגלה באתר עצמו נפתחת ריקה.\nכדי שהבוט ימלא אוטומטית את העגלה האמיתית בחשבון שלכם, הגדירו פרטי התחברות ב-.env.`
+      ? `הבוט רץ כרגע במצב אורח ב-${this.meta.shortName}, ולכן העגלה באתר עצמו נפתחת ריקה.\nלהתחברות מהירה באמצעות SMS (ללא סיסמה) כך שהבוט ימלא אוטומטית את העגלה האמיתית שלכם, שלחו: /login_haviv 05XXXXXXXX`
       : `לא ניתן היה לסנכרן את העגלה ישירות לחשבון ${this.meta.shortName} (${this.authFallbackReason ?? 'נדרשת התחברות באתר'}).`;
 
     throw new StoreManualVerificationRequiredError(
@@ -1411,6 +1412,478 @@ export class SelfPointClient implements StoreClient {
       `📋 סיכום סל ${this.meta.shortName}: ${cart.items.length} פריטים בסך ${total}.${minNote}\n\nℹ️ ${authHint}\n\nרשימת הפריטים להזמנה:\n${checklist}${moreNote}`,
       this.meta.baseUrl,
     );
+  }
+
+  private async ensureOtpBrowserPage(): Promise<Page> {
+    if (!this.options.chromePath && !this.options.browserWsEndpoint) {
+      throw new Error(
+        `Chromium אינו מוגדר בשרת – לא ניתן להריץ התחברות SMS עבור ${this.meta.shortName}.`,
+      );
+    }
+    if (!this.browser || !this.browser.connected) {
+      if (this.options.browserWsEndpoint) {
+        this.browser = await puppeteer.connect({
+          browserWSEndpoint: this.options.browserWsEndpoint,
+        });
+      } else {
+        const args = [
+          '--no-sandbox',
+          '--disable-setuid-sandbox',
+          '--disable-dev-shm-usage',
+          '--disable-gpu',
+          '--lang=he-IL',
+          '--window-size=1366,900',
+        ];
+        if (this.options.proxyUrl) {
+          args.push(`--proxy-server=${this.options.proxyUrl}`);
+        }
+        this.browser = await puppeteer.launch({
+          executablePath: this.options.chromePath,
+          headless: this.options.headless,
+          args,
+        });
+      }
+    }
+    if (this.context) {
+      await this.context.close().catch(() => {});
+    }
+    this.context = await this.browser.createBrowserContext();
+    this.page = await this.context.newPage();
+    await this.page.setUserAgent(DEFAULT_USER_AGENT);
+    await this.page.setViewport({ width: 1366, height: 900 });
+    return this.page;
+  }
+
+  private async captureLoginDiagnosticScreenshot(tag: string): Promise<void> {
+    if (!this.page || this.page.isClosed()) return;
+    try {
+      fs.mkdirSync(this.options.screenshotsDir, { recursive: true });
+      const file = path.join(
+        this.options.screenshotsDir,
+        `${this.storeId}-${tag}-${Date.now()}.png`,
+      );
+      await this.page.screenshot({ path: file });
+      logger.info(`Saved ${this.storeId} diagnostic screenshot: ${file}`);
+    } catch {
+      // ignore screenshot errors
+    }
+  }
+
+  async startSmsOtpLogin(phoneNumber: string): Promise<{ message: string }> {
+    const cleanPhone = normalizeIsraeliPhone(phoneNumber);
+    if (!cleanPhone) {
+      throw new Error(
+        'מספר הטלפון אינו תקין. אנא הזינו מספר ישראלי בן 10 ספרות המתחיל ב-05 (למשל 0501234567).',
+      );
+    }
+
+    const page = await this.ensureOtpBrowserPage();
+    logger.info(`Starting SMS OTP login flow for ${this.meta.displayName}...`);
+
+    await page.goto(`${this.baseUrl}/?loginOrRegister=1`, {
+      waitUntil: 'domcontentloaded',
+      timeout: NAVIGATION_TIMEOUT,
+    });
+    await new Promise((r) => setTimeout(r, 2000));
+
+    const gateDetected = await page.evaluate(() => {
+      const html = document.documentElement?.innerHTML?.toLowerCase() ?? '';
+      const title = document.title?.toLowerCase() ?? '';
+      return (
+        title.includes('just a moment') ||
+        html.includes('cf-turnstile') ||
+        html.includes('g-recaptcha') ||
+        html.includes('hcaptcha') ||
+        html.includes('perfdrive.com')
+      );
+    });
+    if (gateDetected) {
+      throw new StoreManualVerificationRequiredError(
+        this.storeId,
+        'SECURITY_GATE',
+        `אתר ${this.meta.shortName} מציג בדיקת אבטחה/CAPTCHA. המערכת אינה עוקפת בדיקות אבטחה.`,
+      );
+    }
+
+    // Open verification/login modal if phone input isn't visible yet
+    const openResult = await page.evaluate(() => {
+      const findPhoneInput = () =>
+        document.querySelector(
+          '[ng-model*="phone" i], input[type="tel"], input[name*="phone" i], input[placeholder*="טלפון"], input[placeholder*="נייד"]',
+        ) as HTMLInputElement | null;
+
+      if (findPhoneInput()) return 'already_open';
+
+      const directTrigger = document.querySelector(
+        '.user-verification-btn, [ng-click*="openVerification"], [ng-click*="login"], .login-btn',
+      ) as HTMLElement | null;
+      if (directTrigger) {
+        directTrigger.click();
+        return 'clicked_selector';
+      }
+
+      const candidates = Array.from(
+        document.querySelectorAll('button, a, [role="button"], span, div'),
+      );
+      const loginEl = candidates.find((el) => {
+        const t = (el.textContent ?? '').trim();
+        return (
+          t.length <= 30 &&
+          (t === 'התחברות' ||
+            t === 'כניסה' ||
+            t.includes('התחברות') ||
+            t.includes('כניסת משתמש') ||
+            t.includes('להתחברות'))
+        );
+      }) as HTMLElement | undefined;
+      if (loginEl) {
+        loginEl.click();
+        return 'clicked_text';
+      }
+      return 'not_found';
+    });
+
+    if (openResult !== 'already_open') {
+      await new Promise((r) => setTimeout(r, 2000));
+    }
+
+    // If modal opened on email/password tab, switch to SMS/OTP tab if present
+    await page.evaluate(() => {
+      const tabEls = Array.from(
+        document.querySelectorAll('button, a, [role="tab"], span, div'),
+      );
+      const otpTab = tabEls.find((el) => {
+        const t = (el.textContent ?? '').trim();
+        return (
+          t.length <= 40 &&
+          (t.includes('קוד חד פעמי') ||
+            t.includes('הודעת SMS') ||
+            t.includes('באמצעות SMS') ||
+            t.includes('טלפון נייד'))
+        );
+      }) as HTMLElement | undefined;
+      otpTab?.click();
+    });
+
+    await page
+      .waitForSelector(
+        '[ng-model*="phone" i], input[type="tel"], input[name*="phone" i], input[placeholder*="טלפון"], input[placeholder*="נייד"]',
+        { timeout: 10_000 },
+      )
+      .catch(() => null);
+
+    const submitted = await page.evaluate((phone: string) => {
+      const inp = document.querySelector(
+        '[ng-model*="phone" i], input[type="tel"], input[name*="phone" i], input[placeholder*="טלפון"], input[placeholder*="נייד"]',
+      ) as HTMLInputElement | null;
+      if (!inp) return { ok: false, reason: 'no_phone_input' };
+
+      inp.focus();
+      inp.value = phone;
+      inp.dispatchEvent(new Event('input', { bubbles: true }));
+      inp.dispatchEvent(new Event('change', { bubbles: true }));
+
+      // Also update AngularJS scope model if present (Prutah / ZuZ platform)
+      try {
+        const angularObj = (
+          window as unknown as {
+            angular?: {
+              element: (el: Element) => {
+                scope: () => Record<string, unknown>;
+              };
+            };
+          }
+        ).angular;
+        if (angularObj) {
+          const scope = angularObj.element(inp).scope() as Record<
+            string,
+            unknown
+          >;
+          const ngModel = inp.getAttribute('ng-model') ?? '';
+          if (ngModel && scope) {
+            const parts = ngModel.split('.');
+            let target: Record<string, unknown> = scope;
+            for (let i = 0; i < parts.length - 1; i++) {
+              const p = parts[i]!;
+              if (target[p] && typeof target[p] === 'object') {
+                target = target[p] as Record<string, unknown>;
+              }
+            }
+            const lastKey = parts[parts.length - 1];
+            if (lastKey) {
+              target[lastKey] = phone;
+            }
+            if (typeof scope['$apply'] === 'function') {
+              (scope['$apply'] as () => void)();
+            }
+          }
+        }
+      } catch {
+        // DOM events already dispatched
+      }
+
+      const form = inp.closest('form') ?? inp.closest('.modal, [role="dialog"]') ?? document;
+      const buttons = Array.from(form.querySelectorAll('button, input[type="submit"]'));
+      const sendBtn =
+        (buttons.find((b) => {
+          const t = (b.textContent ?? '').trim();
+          return (
+            t.includes('שלח') ||
+            t.includes('קבל קוד') ||
+            t.includes('המשך') ||
+            t.includes('כניסה') ||
+            t.includes('התחבר')
+          );
+        }) as HTMLElement | undefined) ??
+        (form.querySelector('button[type="submit"], [ng-click*="send"]') as HTMLElement | null);
+
+      if (sendBtn) {
+        sendBtn.click();
+        return { ok: true, reason: 'clicked_send' };
+      }
+      return { ok: true, reason: 'enter_fallback' };
+    }, cleanPhone);
+
+    if (!submitted.ok) {
+      await this.captureLoginDiagnosticScreenshot('otp-no-phone-input');
+      throw new Error(
+        `לא נמצא שדה הזנת מספר טלפון באתר ${this.meta.shortName}. נסו שוב בעוד רגע.`,
+      );
+    }
+
+    if (submitted.reason === 'enter_fallback') {
+      await page.keyboard.press('Enter').catch(() => {});
+    }
+
+    await new Promise((r) => setTimeout(r, 2500));
+
+    return {
+      message: `📱 נשלח קוד SMS מ-${this.meta.displayName} לטלפון שלך!\nשלחו כאן את הקוד שקיבלתם (למשל <code>123456</code> או <code>/otp 123456</code>).`,
+    };
+  }
+
+  async completeSmsOtpLogin(
+    otpCode: string,
+  ): Promise<{ message: string; isAuthenticated: boolean }> {
+    const cleanCode = otpCode.replace(/\D/g, '').trim();
+    if (cleanCode.length < 4 || cleanCode.length > 8) {
+      throw new Error('קוד האימות חייב להכיל 4 עד 8 ספרות.');
+    }
+
+    if (!this.page || this.page.isClosed()) {
+      throw new Error(
+        `סשן ההתחברות של ${this.meta.shortName} פג או נסגר. הריצו שוב /login_haviv עם מספר הטלפון.`,
+      );
+    }
+
+    logger.info(`Submitting SMS OTP verification for ${this.meta.displayName}...`);
+
+    const fillResult = await this.page.evaluate((code: string) => {
+      // 1. Multi-box OTP inputs (one digit per input)
+      const singleDigitInputs = Array.from(
+        document.querySelectorAll(
+          '.otp-input input, input[maxlength="1"], [class*="otp" i] input[type="tel"], [class*="otp" i] input[type="text"]',
+        ),
+      ).filter((el) => {
+        const inp = el as HTMLInputElement;
+        return inp.offsetParent !== null && !inp.disabled;
+      }) as HTMLInputElement[];
+
+      if (singleDigitInputs.length >= code.length && singleDigitInputs.length <= 8) {
+        singleDigitInputs.forEach((inp, idx) => {
+          const ch = code[idx] ?? '';
+          inp.focus();
+          inp.value = ch;
+          inp.dispatchEvent(new Event('input', { bubbles: true }));
+          inp.dispatchEvent(new Event('change', { bubbles: true }));
+        });
+      } else {
+        // 2. Single OTP code input
+        const inp = document.querySelector(
+          '[ng-model*="otp" i], [ng-model*="code" i], input[placeholder*="קוד"], input[name*="otp" i], input[name*="code" i], input[inputmode="numeric"], .modal input[type="tel"]',
+        ) as HTMLInputElement | null;
+        if (!inp) return { ok: false, reason: 'no_otp_input' };
+        inp.focus();
+        inp.value = code;
+        inp.dispatchEvent(new Event('input', { bubbles: true }));
+        inp.dispatchEvent(new Event('change', { bubbles: true }));
+
+        try {
+          const angularObj = (
+            window as unknown as {
+              angular?: {
+                element: (el: Element) => {
+                  scope: () => Record<string, unknown>;
+                };
+              };
+            }
+          ).angular;
+          if (angularObj) {
+            const scope = angularObj.element(inp).scope() as Record<
+              string,
+              unknown
+            >;
+            const ngModel = inp.getAttribute('ng-model') ?? '';
+            if (ngModel && scope) {
+              const parts = ngModel.split('.');
+              let target: Record<string, unknown> = scope;
+              for (let i = 0; i < parts.length - 1; i++) {
+                const p = parts[i]!;
+                if (target[p] && typeof target[p] === 'object') {
+                  target = target[p] as Record<string, unknown>;
+                }
+              }
+              const lastKey = parts[parts.length - 1];
+              if (lastKey) target[lastKey] = code;
+              if (typeof scope['$apply'] === 'function') {
+                (scope['$apply'] as () => void)();
+              }
+            }
+          }
+        } catch {
+          // ignore scope error
+        }
+      }
+
+      const verifyBtn =
+        (document.querySelector(
+          '.verify-btn, [ng-click*="verify" i], .modal button[type="submit"], [role="dialog"] button[type="submit"]',
+        ) as HTMLElement | null) ??
+        (Array.from(document.querySelectorAll('button')).find((b) => {
+          const t = (b.textContent ?? '').trim();
+          return (
+            t.length <= 25 &&
+            (t.includes('אמת') ||
+              t.includes('אימות') ||
+              t === 'כניסה' ||
+              t === 'התחברות' ||
+              t === 'אישור' ||
+              t === 'המשך')
+          );
+        }) as HTMLElement | undefined) ??
+        null;
+
+      if (verifyBtn) {
+        verifyBtn.click();
+        return { ok: true, reason: 'clicked_verify' };
+      }
+      return { ok: true, reason: 'enter_fallback' };
+    }, cleanCode);
+
+    if (!fillResult.ok) {
+      await this.captureLoginDiagnosticScreenshot('otp-no-code-input');
+      throw new Error(
+        `לא נמצא שדה הזנת קוד SMS באתר ${this.meta.shortName}. נסו להתחיל שוב עם /login_haviv.`,
+      );
+    }
+
+    if (fillResult.reason === 'enter_fallback') {
+      await this.page.keyboard.press('Enter').catch(() => {});
+    }
+
+    await new Promise((r) => setTimeout(r, 4500));
+
+    // Dismiss any post-login popup
+    await this.page
+      .evaluate(() => {
+        const okBtn = Array.from(document.querySelectorAll('button')).find(
+          (b) => (b.textContent ?? '').trim() === 'אישור',
+        );
+        okBtn?.click();
+      })
+      .catch(() => {});
+
+    const authResult = await this.page.evaluate(() => {
+      try {
+        const angularObj = (
+          window as unknown as {
+            angular?: {
+              element: (el: Element) => {
+                injector: () => { get: (name: string) => Record<string, unknown> };
+              };
+            };
+          }
+        ).angular;
+        if (!angularObj) return null;
+        const injector = angularObj.element(document.body).injector();
+        const User = injector.get('User') as {
+          session?: {
+            token?: string;
+            userId?: string | number;
+            branchId?: number;
+            cartId?: string;
+          };
+          isVerified?: () => boolean;
+        };
+        const Cart = injector.get('Cart') as {
+          serverCartId?: string;
+          id?: string;
+        };
+        let activeBranchId: number | null = null;
+        try {
+          const Branch = injector.get('Branch') as {
+            current?: { id?: number };
+          };
+          if (Branch?.current?.id) activeBranchId = Number(Branch.current.id);
+        } catch {
+          // optional
+        }
+        return {
+          token: User?.session?.token ?? null,
+          userId: User?.session?.userId ?? null,
+          verified:
+            typeof User?.isVerified === 'function' ? User.isVerified() : false,
+          cartId:
+            Cart?.serverCartId ?? Cart?.id ?? User?.session?.cartId ?? null,
+          branchId: activeBranchId ?? User?.session?.branchId ?? null,
+        };
+      } catch {
+        return null;
+      }
+    });
+
+    if (!authResult?.token) {
+      await this.captureLoginDiagnosticScreenshot('otp-verify-failed');
+      throw new Error(
+        `אימות קוד ה-SMS ב-${this.meta.shortName} לא הושלם (ייתכן שהקוד שגוי או פג תוקפו). נסו שוב עם /login_haviv.`,
+      );
+    }
+
+    this.token = authResult.token;
+    this.userId = authResult.userId ? String(authResult.userId) : null;
+    if (authResult.branchId && authResult.branchId > 0) {
+      this.branchId = Number(authResult.branchId);
+    }
+    if (authResult.cartId) {
+      this.cartId = String(authResult.cartId);
+    }
+    this.isGuestSession = false;
+    this.authFallbackReason = null;
+    this.guestCartApiUnsupported = false;
+
+    if (!this.cartId && this.userId) {
+      await this.discoverAuthenticatedCartId().catch(() => {});
+    }
+
+    const cookies = (await this.context?.cookies().catch(() => [])) ?? [];
+    this.saveSession(cookies);
+    logger.info(
+      `SMS OTP login succeeded for ${this.meta.displayName} (branch=${this.branchId}, cartId=${this.cartId ?? 'pending'})`,
+    );
+
+    // If items were already mirrored/tracked in memory, sync them immediately to the real server cart!
+    let syncNote = '';
+    if (this.trackedCart.size > 0) {
+      await this.syncCartToServer().catch(() => {});
+      if (this.serverCartSynced) {
+        syncNote = `\n🛒 סונכרנו ${this.trackedCart.size} פריטים מהעגלה הנוכחית ישירות לחשבון שלכם באתר!`;
+      }
+    }
+
+    return {
+      isAuthenticated: true,
+      message: `✅ <b>התחברתם בהצלחה ל-${this.meta.displayName}!</b>\nהסשן נשמר אוטומטית – מעכשיו הבוט ימלא ישירות את העגלה האמיתית בחשבון שלכם.${syncNote}`,
+    };
   }
 
   async shutdown(): Promise<void> {

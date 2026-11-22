@@ -459,6 +459,26 @@ export class StoreManager {
     });
   }
 
+  async startSmsOtpLogin(phoneNumber: string): Promise<{ message: string }> {
+    if (!this.client.startSmsOtpLogin) {
+      throw new Error(`התחברות SMS אינה נתמכת עבור ${this.meta.displayName}`);
+    }
+    return this.mutex.runExclusive(async () => {
+      return this.client.startSmsOtpLogin!(phoneNumber);
+    });
+  }
+
+  async completeSmsOtpLogin(
+    otpCode: string,
+  ): Promise<{ message: string; isAuthenticated: boolean }> {
+    if (!this.client.completeSmsOtpLogin) {
+      throw new Error(`התחברות SMS אינה נתמכת עבור ${this.meta.displayName}`);
+    }
+    return this.mutex.runExclusive(async () => {
+      return this.client.completeSmsOtpLogin!(otpCode);
+    });
+  }
+
   async shutdown(): Promise<void> {
     await this.client.shutdown();
   }

@@ -828,6 +828,28 @@ export class MultiStoreManager {
     };
   }
 
+  async startSmsOtpLogin(
+    storeId: StoreId,
+    phoneNumber: string,
+  ): Promise<{ message: string }> {
+    const mgr = this.managers.get(storeId);
+    if (!mgr) {
+      throw new Error(`החנות ${storeId} אינה מופעלת ב-.env`);
+    }
+    return mgr.startSmsOtpLogin(phoneNumber);
+  }
+
+  async completeSmsOtpLogin(
+    storeId: StoreId,
+    otpCode: string,
+  ): Promise<{ message: string; isAuthenticated: boolean }> {
+    const mgr = this.managers.get(storeId);
+    if (!mgr) {
+      throw new Error(`החנות ${storeId} אינה מופעלת ב-.env`);
+    }
+    return mgr.completeSmsOtpLogin(otpCode);
+  }
+
   async shutdown(): Promise<void> {
     await Promise.allSettled(
       [...this.managers.values()].map((m) => m.shutdown()),

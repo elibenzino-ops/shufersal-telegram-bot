@@ -42,6 +42,7 @@ import {
   parseVictoryDomCards,
   parseVictoryJsonProducts,
 } from '../src/stores/victoryClient.js';
+import { normalizeIsraeliPhone } from '../src/utils/format.js';
 
 function jsonResponse(body: unknown, status = 200): Response {
   return new Response(JSON.stringify(body), {
@@ -1293,3 +1294,134 @@ describe('rankStoreQuotes & MultiStoreManager', () => {
     }
   });
 });
+
+describe('SMS OTP login flow (Super Haviv & Victory)', () => {
+  let tmpDir: string;
+
+  beforeEach(() => {
+    tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'otp-test-'));
+  });
+
+  afterEach(() => {
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+  });
+
+  it('normalizes Israeli mobile phone numbers and rejects invalid formats', () => {
+    expect(normalizeIsraeliPhone('0501234567')).toBe('0501234567');
+    expect(normalizeIsraeliPhone('052-123-4567')).toBe('0521234567');
+    expect(normalizeIsraeliPhone('054 123 4567')).toBe('0541234567');
+    expect(normalizeIsraeliPhone('+972501234567')).toBe('0501234567');
+    expect(normalizeIsraeliPhone('+972-58-765-4321')).toBe('0587654321');
+    expect(normalizeIsraeliPhone('972531112222')).toBe('0531112222');
+    expect(normalizeIsraeliPhone('00972501234567')).toBe('0501234567');
+
+    expect(normalizeIsraeliPhone('03-1234567')).toBeNull();
+    expect(normalizeIsraeliPhone('05012345')).toBeNull();
+    expect(normalizeIsraeliPhone('abc')).toBeNull();
+    expect(normalizeIsraeliPhone('')).toBeNull();
+  });
+
+  it('validates phone numbers and pending state on SuperHavivClient and VictoryClient before browser launch', async () => {
+    const haviv = new SuperHavivClient({
+      headless: true,
+      sessionFilePath: path.join(tmpDir, 'haviv-session.json'),
+      screenshotsDir: tmpDir,
+    });
+    const victory = new VictoryClient({
+      headless: true,
+      sessionFilePath: path.join(tmpDir, 'victory-session.json'),
+      screenshotsDir: tmpDir,
+    });
+
+    await expect(haviv.startSmsOtpLogin('1234')).rejects.toThrow(
+      /מספר הטלפון אינו תקין/,
+    );
+    await expect(victory.startSmsOtpLogin('03-9999999')).rejects.toThrow(
+      /מספר הטלפון אינו תקין/,
+    );
+
+    await expect(haviv.completeSmsOtpLogin('123456')).rejects.toThrow(
+      /\/login_haviv/,
+    );
+    await expect(victory.completeSmsOtpLogin('123456')).rejects.toThrow(
+      /\/login_victory/,
+    );
+  });
+
+  it('delegates startSmsOtpLogin and completeSmsOtpLogin through MultiStoreManager and StoreManager', async () => {
+    const dbPath = path.join(tmpDir, 'bot.sqlite');
+    const db = new BotDatabase(dbPath);
+    try {
+      const startMock = vi.fn(async (phone: string) => ({
+        message: `נשלח קוד ל-${phone}`,
+      }));
+      const completeMock = vi.fn(async (code: string) => ({
+        message: `התחברת בהצלחה עם קוד באורך ${code.length}`,
+        isAuthenticated: true,
+      }));
+
+      const makeStubClient = (
+        storeId: StoreId,
+        withOtp: boolean,
+      ): StoreClient => ({
+        storeId,
+        meta: STORE_META[storeId],
+        ensureLoggedIn: async () => {},
+        searchProducts: async () => [],
+        getCartState: async (): Promise<CartState> => ({
+          items: [],
+          totalPrice: 0,
+          deliveryFee: STORE_META[storeId].defaultDeliveryFee,
+          totalItemsCount: 0,
+          orderInUpdateMode: null,
+          isGuestSession: false,
+        }),
+        setItemInCart: async () => ({
+          items: [],
+          totalPrice: 0,
+          deliveryFee: null,
+          totalItemsCount: 0,
+          orderInUpdateMode: null,
+        }),
+        clearCart: async () => {},
+        getDeliverySlots: async () => [],
+        selectDeliverySlot: async () => {},
+        getActiveOrders: async () => [],
+        loadOrderForUpdate: async () => {},
+        placeOrder: async () => ({ message: 'ok' }),
+        close: async () => {},
+        ...(withOtp
+          ? {
+              startSmsOtpLogin: startMock,
+              completeSmsOtpLogin: completeMock,
+            }
+          : {}),
+      });
+
+      const havivMgr = new StoreManager(makeStubClient('super_haviv', true), db);
+      const shufersalMgr = new StoreManager(
+        makeStubClient('shufersal', false),
+        db,
+      );
+      const multi = new MultiStoreManager([shufersalMgr, havivMgr], db);
+
+      const startRes = await multi.startSmsOtpLogin('super_haviv', '0501234567');
+      expect(startMock).toHaveBeenCalledWith('0501234567');
+      expect(startRes.message).toContain('0501234567');
+
+      const completeRes = await multi.completeSmsOtpLogin('super_haviv', '654321');
+      expect(completeMock).toHaveBeenCalledWith('654321');
+      expect(completeRes.isAuthenticated).toBe(true);
+
+      await expect(
+        multi.startSmsOtpLogin('shufersal', '0501234567'),
+      ).rejects.toThrow(/אינה נתמכת/);
+      await expect(
+        multi.startSmsOtpLogin('victory', '0501234567'),
+      ).rejects.toThrow(/אינה מופעלת/);
+    } finally {
+      db.close();
+    }
+  });
+});
+

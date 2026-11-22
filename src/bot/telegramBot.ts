@@ -27,6 +27,7 @@ import {
   formatHebrewDateTime,
   formatHebrewDayHeader,
   formatQuantity,
+  normalizeIsraeliPhone,
 } from '../utils/format.js';
 
 export interface CreateTelegramBotDeps {
@@ -512,6 +513,8 @@ export function createTelegramBot(deps: CreateTelegramBotDeps): Bot {
         `• /slots – בחירת יום ושעת משלוח\n` +
         `• /orders – צפייה בהזמנות פעילות וטעינה לעדכון\n` +
         `• /checkout – השוואת עגלות ואישור הזמנה מהסופר הזול ביותר\n` +
+        `• /login_haviv <code>&lt;טלפון&gt;</code> – התחברות לסופר חביב באמצעות קוד SMS\n` +
+        `• /login_victory <code>&lt;טלפון&gt;</code> – התחברות לויקטורי אונליין באמצעות קוד SMS\n` +
         `• /clear – <b>(מנהלים)</b> ריקון העגלות\n` +
         `• /id – הצגת מזהי הקבוצה והמשתמש`,
       { parse_mode: 'HTML' },
@@ -734,6 +737,176 @@ export function createTelegramBot(deps: CreateTelegramBotDeps): Bot {
       sourceStoreId,
       senderName: getSenderDisplayName(ctx),
     });
+  });
+
+  const OTP_PENDING_TTL_MS = 5 * 60_000;
+  const pendingOtpByChat = new Map<
+    number,
+    { storeId: StoreId; expiresAt: number }
+  >();
+  const activeOtpChats = new Set<number>();
+
+  async function handleStartSmsOtpLogin(
+    ctx: Context,
+    storeId: StoreId,
+    rawPhone: string,
+  ): Promise<void> {
+    if (!ctx.chat) return;
+    const chatId = ctx.chat.id;
+    const meta = STORE_META[storeId];
+    const cmdName =
+      storeId === 'super_haviv' ? '/login_haviv' : '/login_victory';
+
+    if (!stores.getStore(storeId)) {
+      await ctx.reply(
+        `❌ ${meta.emoji} <b>${escapeHtml(meta.displayName)}</b> אינה מופעלת כרגע ב-<code>ENABLED_STORES</code>.`,
+        { parse_mode: 'HTML' },
+      );
+      return;
+    }
+
+    const trimmedPhone = rawPhone.trim();
+    if (!trimmedPhone) {
+      await ctx.reply(
+        `📱 <b>התחברות ל-${meta.emoji} ${escapeHtml(meta.displayName)} באמצעות SMS</b>\n\n` +
+          `שלחו את הפקודה עם מספר הנייד שלכם:\n` +
+          `<code>${cmdName} 0501234567</code>\n\n` +
+          `לאחר קבלת ההודעה ב-SMS, פשוט כתבו את הקוד בצ'אט (או <code>/otp 123456</code>).`,
+        { parse_mode: 'HTML' },
+      );
+      return;
+    }
+
+    const normalizedPhone = normalizeIsraeliPhone(trimmedPhone);
+    if (!normalizedPhone) {
+      await ctx.reply(
+        `❌ מספר הטלפון לא תקין. נא להזין מספר נייד ישראלי, למשל:\n<code>${cmdName} 0501234567</code>`,
+        { parse_mode: 'HTML' },
+      );
+      return;
+    }
+
+    if (activeOtpChats.has(chatId)) {
+      await ctx.reply('⏳ כבר יש תהליך התחברות SMS פעיל בצ׳אט זה, רגע...');
+      return;
+    }
+
+    activeOtpChats.add(chatId);
+    const statusMsg = await ctx.reply(
+      `⏳ שולח בקשת קוד SMS מ-${meta.emoji} <b>${escapeHtml(meta.displayName)}</b>...`,
+      { parse_mode: 'HTML' },
+    );
+
+    try {
+      const res = await stores.startSmsOtpLogin(storeId, normalizedPhone);
+      pendingOtpByChat.set(chatId, {
+        storeId,
+        expiresAt: Date.now() + OTP_PENDING_TTL_MS,
+      });
+      await bot.api
+        .editMessageText(
+          chatId,
+          statusMsg.message_id,
+          `📲 <b>${escapeHtml(meta.displayName)}</b>\n${escapeHtml(res.message)}\n\n` +
+            `<i>פשוט שלחו את הקוד כהודעה רגילה בצ׳אט (או <code>/otp 123456</code>) בתוך 5 דקות.</i>`,
+          { parse_mode: 'HTML' },
+        )
+        .catch(() => {});
+    } catch (err) {
+      logger.warn(`SMS OTP login start failed for ${storeId}`, err);
+      await bot.api
+        .editMessageText(
+          chatId,
+          statusMsg.message_id,
+          formatUserFacingError(err),
+          { parse_mode: 'HTML' },
+        )
+        .catch(() => {});
+    } finally {
+      activeOtpChats.delete(chatId);
+    }
+  }
+
+  async function handleCompleteSmsOtpLogin(
+    ctx: Context,
+    rawCode: string,
+  ): Promise<void> {
+    if (!ctx.chat) return;
+    const chatId = ctx.chat.id;
+    const pending = pendingOtpByChat.get(chatId);
+    if (!pending || Date.now() > pending.expiresAt) {
+      pendingOtpByChat.delete(chatId);
+      await ctx.reply(
+        `ℹ️ אין כרגע בקשת קוד SMS פעילה.\nלהתחברות שלחו <code>/login_haviv 05XXXXXXXX</code> או <code>/login_victory 05XXXXXXXX</code>.`,
+        { parse_mode: 'HTML' },
+      );
+      return;
+    }
+
+    const code = rawCode.replace(/\D/g, '');
+    if (code.length < 4 || code.length > 8) {
+      await ctx.reply(
+        `❌ קוד האימות צריך להכיל 4–8 ספרות. נסו שוב או שלחו <code>/otp 123456</code>.`,
+        { parse_mode: 'HTML' },
+      );
+      return;
+    }
+
+    if (activeOtpChats.has(chatId)) {
+      await ctx.reply('⏳ כבר מאמת קוד SMS, רגע...');
+      return;
+    }
+
+    const meta = STORE_META[pending.storeId];
+    activeOtpChats.add(chatId);
+    const statusMsg = await ctx.reply(
+      `⏳ מאמת קוד SMS מול ${meta.emoji} <b>${escapeHtml(meta.displayName)}</b>...`,
+      { parse_mode: 'HTML' },
+    );
+
+    try {
+      const res = await stores.completeSmsOtpLogin(pending.storeId, code);
+      pendingOtpByChat.delete(chatId);
+      await bot.api
+        .editMessageText(
+          chatId,
+          statusMsg.message_id,
+          `✅ <b>${escapeHtml(meta.displayName)}</b>\n${escapeHtml(res.message)}`,
+          { parse_mode: 'HTML' },
+        )
+        .catch(() => {});
+    } catch (err) {
+      logger.warn(`SMS OTP login completion failed for ${pending.storeId}`, err);
+      const errMsg = err instanceof Error ? err.message : String(err);
+      if (
+        err instanceof StoreManualVerificationRequiredError ||
+        /פג תוקף|נסגר|אין חלון|אין תהליך/i.test(errMsg)
+      ) {
+        pendingOtpByChat.delete(chatId);
+      }
+      await bot.api
+        .editMessageText(
+          chatId,
+          statusMsg.message_id,
+          formatUserFacingError(err),
+          { parse_mode: 'HTML' },
+        )
+        .catch(() => {});
+    } finally {
+      activeOtpChats.delete(chatId);
+    }
+  }
+
+  bot.command('login_haviv', async (ctx) => {
+    await handleStartSmsOtpLogin(ctx, 'super_haviv', ctx.match ?? '');
+  });
+
+  bot.command('login_victory', async (ctx) => {
+    await handleStartSmsOtpLogin(ctx, 'victory', ctx.match ?? '');
+  });
+
+  bot.command('otp', async (ctx) => {
+    await handleCompleteSmsOtpLogin(ctx, ctx.match ?? '');
   });
 
   function buildStoreCartActionKeyboard(
@@ -2413,6 +2586,16 @@ export function createTelegramBot(deps: CreateTelegramBotDeps): Bot {
     const text = ctx.message.text.trim();
     if (!text || text.startsWith('/')) return;
 
+    const pendingOtp = pendingOtpByChat.get(ctx.chat.id);
+    if (pendingOtp) {
+      if (Date.now() > pendingOtp.expiresAt) {
+        pendingOtpByChat.delete(ctx.chat.id);
+      } else if (/^\d{4,8}$/.test(text.replace(/[\s\-]/g, ''))) {
+        await handleCompleteSmsOtpLogin(ctx, text);
+        return;
+      }
+    }
+
     const senderName = getSenderDisplayName(ctx);
     const parsed = await ai.parseGroupMessage(text);
     if (!parsed.isGroceryRelated || parsed.items.length === 0) {
@@ -2623,6 +2806,9 @@ export async function registerBotCommands(bot: Bot): Promise<void> {
     { command: 'slots', description: 'בחירת יום ושעת משלוח' },
     { command: 'orders', description: 'צפייה בהזמנות פעילות וטעינה לעדכון' },
     { command: 'search', description: 'חיפוש והשוואת מחיר של מוצר בכל החנויות' },
+    { command: 'login_haviv', description: 'התחברות לסופר חביב באמצעות קוד SMS' },
+    { command: 'login_victory', description: 'התחברות לויקטורי אונליין באמצעות קוד SMS' },
+    { command: 'otp', description: 'שליחת קוד אימות SMS להתחברות לחנות' },
     { command: 'clear', description: '(מנהל) ריקון העגלות' },
     { command: 'id', description: 'הצגת מזהה הקבוצה והמשתמש' },
     { command: 'help', description: 'מדריך שימוש בבוט הקניות' },
