@@ -659,8 +659,7 @@ export class MultiStoreManager {
     // Reset canonical shopping list to mirror the source cart items
     this.db.clearShoppingList(params.chatId);
 
-    for (let idx = 0; idx < sourceItems.length; idx++) {
-      const item = sourceItems[idx]!;
+    const preparedItems = sourceItems.map((item) => {
       const displayName = (item.productName ?? item.productCode).trim();
       const cached = this.db.getCachedProduct(
         item.productCode,
@@ -690,106 +689,176 @@ export class MultiStoreManager {
         senderName: params.senderName,
       });
 
-      const fallbackQueries = buildMirrorSearchQueries(displayName);
+      return {
+        displayName,
+        sourceBarcode,
+        request,
+        fallbackQueries: buildMirrorSearchQueries(displayName),
+      };
+    });
 
-      await Promise.all(
-        targetManagers.map(async (targetMgr) => {
-          if (failedStores.has(targetMgr.storeId)) return;
-          const summary = summaryByStore.get(targetMgr.storeId)!;
-          try {
-            const learned = this.db.getPreference(displayName, targetMgr.storeId);
-            const hasAvailable = (list: CatalogProduct[]) =>
-              list.some((c) => c.inStock && c.purchasable);
+    const totalWorkUnits = preparedItems.length * Math.max(1, targetManagers.length);
+    let completedWorkUnits = 0;
+    let lastReportedItems = 0;
 
-            let selection: Awaited<
-              ReturnType<GroceryAiService['selectBestProduct']>
-            > | null = null;
+    const reportProgress = async () => {
+      if (!params.onProgress) return;
+      const equivDone = Math.min(
+        preparedItems.length,
+        Math.floor(
+          (completedWorkUnits / totalWorkUnits) * preparedItems.length,
+        ),
+      );
+      if (
+        equivDone > lastReportedItems &&
+        (equivDone === preparedItems.length ||
+          equivDone === 1 ||
+          equivDone - lastReportedItems >= 3)
+      ) {
+        lastReportedItems = equivDone;
+        await params.onProgress(equivDone, preparedItems.length);
+      }
+    };
 
-            // Stage 1: exact barcode search for fast, apples-to-apples SKU matching
-            if (sourceBarcode) {
-              const barcodeCandidates = await targetMgr
-                .search(sourceBarcode, 8)
-                .catch((err) => {
-                  const errMsg = err instanceof Error ? err.message : String(err);
-                  if (errMsg.includes('CAPTCHA') || errMsg.includes('WAF')) {
-                    throw err;
-                  }
-                  return [];
-                });
-              if (hasAvailable(barcodeCandidates)) {
-                selection = await params.ai.selectBestProduct({
-                  request,
-                  candidates: barcodeCandidates,
-                  learnedProductCode: learned?.productCode ?? null,
-                  preferredBarcode: sourceBarcode,
-                  storeName: targetMgr.meta.displayName,
-                  strictMatch: true,
-                });
-              }
-            }
+    // Process each target store independently in parallel so fast REST stores (Hazi Hinam / Super Haviv)
+    // never block waiting on Chromium-backed stores (Victory)!
+    await Promise.all(
+      targetManagers.map(async (targetMgr) => {
+        if (failedStores.has(targetMgr.storeId)) {
+          completedWorkUnits += preparedItems.length;
+          await reportProgress();
+          return;
+        }
+        const summary = summaryByStore.get(targetMgr.storeId)!;
+        const hasAvailable = (list: CatalogProduct[]) =>
+          list.some((c) => c.inStock && c.purchasable);
 
-            // Stage 2+: cleaned Hebrew product name -> short core query -> broader 2-word query
-            if (!selection?.selected) {
-              for (const q of fallbackQueries) {
-                const found = await targetMgr.search(q, 12);
-                if (!hasAvailable(found)) continue;
-                const candidateSelection = await params.ai.selectBestProduct({
-                  request,
-                  candidates: found,
-                  learnedProductCode: learned?.productCode ?? null,
-                  preferredBarcode: sourceBarcode,
-                  storeName: targetMgr.meta.displayName,
-                  strictMatch: true,
-                });
-                if (candidateSelection.selected) {
-                  selection = candidateSelection;
-                  break;
+        // Browser-backed store runs 1 item at a time on its Chromium tab; REST stores run 3 concurrently
+        const concurrency = targetMgr.storeId === 'victory' ? 1 : 3;
+        let cursor = 0;
+        let processedInStore = 0;
+
+        const worker = async () => {
+          while (cursor < preparedItems.length) {
+            if (failedStores.has(targetMgr.storeId)) break;
+            const myIdx = cursor++;
+            const prep = preparedItems[myIdx]!;
+            const { displayName, sourceBarcode, request, fallbackQueries } =
+              prep;
+
+            try {
+              const learned = this.db.getPreference(
+                displayName,
+                targetMgr.storeId,
+              );
+              let selection: Awaited<
+                ReturnType<GroceryAiService['selectBestProduct']>
+              > | null = null;
+
+              // Stage 1: exact barcode search for fast, apples-to-apples SKU matching
+              if (sourceBarcode) {
+                const barcodeCandidates = await targetMgr
+                  .search(sourceBarcode, 8)
+                  .catch((err) => {
+                    const errMsg =
+                      err instanceof Error ? err.message : String(err);
+                    if (errMsg.includes('CAPTCHA') || errMsg.includes('WAF')) {
+                      throw err;
+                    }
+                    return [];
+                  });
+                if (hasAvailable(barcodeCandidates)) {
+                  selection = await params.ai.selectBestProduct({
+                    request,
+                    candidates: barcodeCandidates,
+                    learnedProductCode: learned?.productCode ?? null,
+                    preferredBarcode: sourceBarcode,
+                    storeName: targetMgr.meta.displayName,
+                    strictMatch: true,
+                  });
                 }
               }
-            }
 
-            if (!selection?.selected) {
-              summary.missingItems.push(displayName);
-              return;
-            }
+              // Stage 2+: cleaned Hebrew product name -> short core query -> broader 2-word query
+              // Cap queries on browser-backed Victory if it hasn't matched anything after initial items
+              const queriesToTry =
+                targetMgr.storeId === 'victory' &&
+                processedInStore >= 5 &&
+                summary.matchedCount === 0
+                  ? fallbackQueries.slice(0, 1)
+                  : fallbackQueries;
 
-            const storeMatches = matchedByStore.get(targetMgr.storeId)!;
-            const prev = storeMatches.get(selection.selected.code);
-            if (prev) {
-              prev.quantity = Number(
-                (prev.quantity + selection.adjustedQuantity).toFixed(2),
+              if (!selection?.selected) {
+                for (const q of queriesToTry) {
+                  const found = await targetMgr.search(q, 12);
+                  if (!hasAvailable(found)) continue;
+                  const candidateSelection = await params.ai.selectBestProduct({
+                    request,
+                    candidates: found,
+                    learnedProductCode: learned?.productCode ?? null,
+                    preferredBarcode: sourceBarcode,
+                    storeName: targetMgr.meta.displayName,
+                    strictMatch: true,
+                  });
+                  if (candidateSelection.selected) {
+                    selection = candidateSelection;
+                    break;
+                  }
+                }
+              }
+
+              if (!selection?.selected) {
+                summary.missingItems.push(displayName);
+              } else {
+                const storeMatches = matchedByStore.get(targetMgr.storeId)!;
+                const prev = storeMatches.get(selection.selected.code);
+                if (prev) {
+                  prev.quantity = Number(
+                    (prev.quantity + selection.adjustedQuantity).toFixed(2),
+                  );
+                } else {
+                  storeMatches.set(selection.selected.code, {
+                    product: selection.selected,
+                    quantity: selection.adjustedQuantity,
+                  });
+                }
+                summary.matchedCount++;
+              }
+            } catch (err) {
+              logger.warn(
+                `Mirror item "${displayName}" failed on ${targetMgr.storeId}`,
+                err,
               );
-            } else {
-              storeMatches.set(selection.selected.code, {
-                product: selection.selected,
-                quantity: selection.adjustedQuantity,
-              });
-            }
-            summary.matchedCount++;
-          } catch (err) {
-            logger.warn(
-              `Mirror item "${displayName}" failed on ${targetMgr.storeId}`,
-              err,
-            );
-            const msg = err instanceof Error ? err.message : String(err);
-            // If the store itself is blocked/auth-failed, stop hammering it for remaining items
-            if (
-              msg.includes('CAPTCHA') ||
-              msg.includes('WAF') ||
-              msg.includes('התחברות')
-            ) {
-              summary.error = msg;
-              failedStores.add(targetMgr.storeId);
-            } else {
-              summary.missingItems.push(displayName);
+              const msg = err instanceof Error ? err.message : String(err);
+              if (
+                msg.includes('CAPTCHA') ||
+                msg.includes('WAF') ||
+                msg.includes('התחברות')
+              ) {
+                summary.error = msg;
+                failedStores.add(targetMgr.storeId);
+              } else {
+                summary.missingItems.push(displayName);
+              }
+            } finally {
+              processedInStore++;
+              completedWorkUnits++;
+              await reportProgress();
             }
           }
-        }),
-      );
+        };
 
-      if (params.onProgress) {
-        await params.onProgress(idx + 1, sourceItems.length);
-      }
+        await Promise.all(
+          Array.from(
+            { length: Math.min(concurrency, preparedItems.length) },
+            () => worker(),
+          ),
+        );
+      }),
+    );
+
+    if (params.onProgress && lastReportedItems < preparedItems.length) {
+      await params.onProgress(preparedItems.length, preparedItems.length);
     }
 
     // Batch-sync all matched items to each target store in parallel (1 sync per store instead of N)

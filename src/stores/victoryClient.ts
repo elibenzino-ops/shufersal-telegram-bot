@@ -489,11 +489,19 @@ export class VictoryClient implements StoreClient {
   private page: Page | null = null;
   private pageInitialized = false;
   private isGuestSession = true;
+  private serverCartSynced = false;
   private discoveredSearchUrlTemplate: string | null = null;
+  private discoveredSearchPostTemplate: {
+    url: string;
+    bodyTemplate: string;
+    contentType: string;
+  } | null = null;
+  private searchDiagLogged = false;
   private authFallbackReason: string | null = null;
 
   private selectedSlot: DeliverySlot | null = null;
   private readonly knownProducts = new Map<string, CatalogProduct>();
+  private readonly knownProductHrefs = new Map<string, string>();
   private readonly trackedCart = new Map<string, TrackedCartEntry>();
 
   constructor(private readonly options: VictoryClientOptions) {
@@ -788,28 +796,63 @@ export class VictoryClient implements StoreClient {
     cleanQuery: string,
     limit: number,
   ): Promise<CatalogProduct[] | null> {
-    if (!this.discoveredSearchUrlTemplate) return null;
-    const url = this.discoveredSearchUrlTemplate.replace(
-      '{QUERY}',
-      encodeURIComponent(cleanQuery),
-    );
-    try {
-      const payload = await page.evaluate(async (targetUrl: string) => {
-        const res = await fetch(targetUrl, {
-          method: 'GET',
-          credentials: 'include',
-          headers: { Accept: 'application/json, */*' },
-        });
-        if (!res.ok) return null;
-        return res.json().catch(() => null);
-      }, url);
-      if (!payload) return null;
-      return this.rememberProducts(parseVictoryJsonProducts(payload, limit));
-    } catch (err) {
-      logger.debug('Victory discovered API replay failed; falling back to UI', err);
-      this.discoveredSearchUrlTemplate = null;
-      return null;
+    if (this.discoveredSearchUrlTemplate) {
+      const url = this.discoveredSearchUrlTemplate.replace(
+        '{QUERY}',
+        encodeURIComponent(cleanQuery),
+      );
+      try {
+        const payload = await page.evaluate(async (targetUrl: string) => {
+          const res = await fetch(targetUrl, {
+            method: 'GET',
+            credentials: 'include',
+            headers: { Accept: 'application/json, */*' },
+          });
+          if (!res.ok) return null;
+          return res.json().catch(() => null);
+        }, url);
+        if (!payload) return null;
+        return this.rememberProducts(parseVictoryJsonProducts(payload, limit));
+      } catch (err) {
+        logger.debug('Victory discovered GET API replay failed; falling back to UI', err);
+        this.discoveredSearchUrlTemplate = null;
+        return null;
+      }
     }
+
+    if (this.discoveredSearchPostTemplate) {
+      const { url, bodyTemplate, contentType } = this.discoveredSearchPostTemplate;
+      const body = bodyTemplate.replaceAll(
+        '{QUERY}',
+        JSON.stringify(cleanQuery).slice(1, -1),
+      );
+      try {
+        const payload = await page.evaluate(
+          async (args: { targetUrl: string; reqBody: string; ct: string }) => {
+            const res = await fetch(args.targetUrl, {
+              method: 'POST',
+              credentials: 'include',
+              headers: {
+                Accept: 'application/json, */*',
+                'Content-Type': args.ct,
+              },
+              body: args.reqBody,
+            });
+            if (!res.ok) return null;
+            return res.json().catch(() => null);
+          },
+          { targetUrl: url, reqBody: body, ct: contentType },
+        );
+        if (!payload) return null;
+        return this.rememberProducts(parseVictoryJsonProducts(payload, limit));
+      } catch (err) {
+        logger.debug('Victory discovered POST API replay failed; falling back to UI', err);
+        this.discoveredSearchPostTemplate = null;
+        return null;
+      }
+    }
+
+    return null;
   }
 
   async searchProducts(query: string, limit = 15): Promise<CatalogProduct[]> {
@@ -833,8 +876,8 @@ export class VictoryClient implements StoreClient {
       return this.tryHttpSearchFallback(cleanQuery, limit);
     }
 
-    // Fast path: if we already discovered Victory's live JSON search API, call it directly
-    if (this.discoveredSearchUrlTemplate) {
+    // Fast path: if we already discovered Victory's live JSON search API (GET or POST), replay it in <150ms
+    if (this.discoveredSearchUrlTemplate || this.discoveredSearchPostTemplate) {
       const fastResults = await this.searchViaDiscoveredApi(
         page,
         cleanQuery,
@@ -845,8 +888,9 @@ export class VictoryClient implements StoreClient {
       }
     }
 
-    // Capture any JSON search API responses fired by Victory's Next.js UI
+    // Capture any JSON search API responses fired by Victory's Next.js UI (both GET and POST!)
     const capturedJsonProducts: CatalogProduct[] = [];
+    const observedApiUrls: string[] = [];
     const encodedQuery = encodeURIComponent(cleanQuery);
 
     const onResponse = async (res: HTTPResponse) => {
@@ -857,23 +901,25 @@ export class VictoryClient implements StoreClient {
         if (!ct.includes('json')) return;
         if (res.status() < 200 || res.status() >= 300) return;
 
+        if (observedApiUrls.length < 10) {
+          observedApiUrls.push(`${res.request().method()} ${url.slice(0, 120)}`);
+        }
+
         const data = await res.json().catch(() => null);
         if (!data) return;
 
         const parsed = parseVictoryJsonProducts(data, limit);
         if (parsed.length > 0) {
           capturedJsonProducts.push(...parsed);
-          if (
-            !this.discoveredSearchUrlTemplate &&
-            res.request().method() === 'GET'
-          ) {
+          const method = res.request().method();
+          if (!this.discoveredSearchUrlTemplate && method === 'GET') {
             if (url.includes(encodedQuery)) {
               this.discoveredSearchUrlTemplate = url.replace(
                 encodedQuery,
                 '{QUERY}',
               );
               logger.info(
-                `Discovered Victory Online live search API: ${this.discoveredSearchUrlTemplate}`,
+                `Discovered Victory Online GET search API: ${this.discoveredSearchUrlTemplate}`,
               );
             } else if (url.includes(cleanQuery)) {
               this.discoveredSearchUrlTemplate = url.replace(
@@ -881,8 +927,27 @@ export class VictoryClient implements StoreClient {
                 '{QUERY}',
               );
               logger.info(
-                `Discovered Victory Online live search API: ${this.discoveredSearchUrlTemplate}`,
+                `Discovered Victory Online GET search API: ${this.discoveredSearchUrlTemplate}`,
               );
+            }
+          } else if (
+            !this.discoveredSearchPostTemplate &&
+            !this.discoveredSearchUrlTemplate &&
+            method === 'POST'
+          ) {
+            const postData = res.request().postData() ?? '';
+            const jsonEscapedQuery = JSON.stringify(cleanQuery).slice(1, -1);
+            if (postData && (postData.includes(cleanQuery) || postData.includes(jsonEscapedQuery))) {
+              const bodyTemplate = postData.includes(jsonEscapedQuery)
+                ? postData.replaceAll(jsonEscapedQuery, '{QUERY}')
+                : postData.replaceAll(cleanQuery, '{QUERY}');
+              this.discoveredSearchPostTemplate = {
+                url,
+                bodyTemplate,
+                contentType:
+                  res.request().headers()['content-type'] ?? 'application/json',
+              };
+              logger.info(`Discovered Victory Online POST search API: ${url}`);
             }
           }
         }
@@ -893,59 +958,71 @@ export class VictoryClient implements StoreClient {
 
     page.on('response', onResponse);
     try {
-      // Ensure search input is visible (click mobile/header search trigger if needed)
-      const inputFound = await page.evaluate((searchText: string) => {
-        const findInput = (): HTMLInputElement | null =>
-          (document.querySelector(
-            'input[placeholder*="חיפוש"], input[type="search"], input[aria-label*="חיפוש"], input[name*="search"]',
-          ) as HTMLInputElement | null);
+      // Find the VISIBLE non-CookieYes search input (avoiding hidden mobile search inputs!)
+      const taggedInput = await page.evaluate(() => {
+        const isCookieYes = (el: Element): boolean =>
+          Boolean(el.closest('[class*="cky-"], #cky-consent, .cky-modal'));
+        const isVis = (el: Element): boolean => {
+          if (isCookieYes(el)) return false;
+          const r = el.getBoundingClientRect();
+          if (r.width <= 0 || r.height <= 0) return false;
+          const s = window.getComputedStyle(el);
+          return s.display !== 'none' && s.visibility !== 'hidden' && Number(s.opacity) > 0;
+        };
 
-        let inp = findInput();
+        for (const old of Array.from(document.querySelectorAll('[data-bot-victory-search]'))) {
+          old.removeAttribute('data-bot-victory-search');
+        }
+
+        const findVisibleSearchInput = (): HTMLInputElement | null => {
+          const all = Array.from(
+            document.querySelectorAll(
+              'input[placeholder*="חיפוש"], input[placeholder*="חפש"], input[type="search"], input[aria-label*="חיפוש"], input[name*="search" i]',
+            ),
+          ).filter((el) => isVis(el) && !(el as HTMLInputElement).disabled) as HTMLInputElement[];
+          return all[0] ?? null;
+        };
+
+        let inp = findVisibleSearchInput();
         if (!inp) {
           const triggers = Array.from(
             document.querySelectorAll('button, a, [role="button"]'),
-          );
-          const searchTrigger = triggers.find((el) => {
+          ).filter((el) => {
+            if (!isVis(el)) return false;
             const t = (el.textContent ?? '').trim();
             const aria = el.getAttribute('aria-label') ?? '';
-            return t.includes('חיפוש') || aria.includes('חיפוש');
-          }) as HTMLElement | undefined;
-          searchTrigger?.click();
-          inp = findInput();
+            return (t.length <= 25 && t.includes('חיפוש')) || aria.includes('חיפוש');
+          }) as HTMLElement[];
+          triggers[0]?.click();
+          inp = findVisibleSearchInput();
         }
         if (!inp) return false;
-
+        inp.setAttribute('data-bot-victory-search', '1');
         inp.focus();
-        const setter = Object.getOwnPropertyDescriptor(
-          HTMLInputElement.prototype,
-          'value',
-        )?.set;
-        if (setter) {
-          setter.call(inp, searchText);
-        } else {
-          inp.value = searchText;
-        }
-        inp.dispatchEvent(new Event('input', { bubbles: true }));
-        inp.dispatchEvent(new Event('change', { bubbles: true }));
         return true;
-      }, cleanQuery);
+      });
 
-      if (inputFound) {
-        await page.keyboard.press('Enter').catch(() => {});
+      if (taggedInput) {
+        const searchEl = await page.$('input[data-bot-victory-search="1"]');
+        if (searchEl) {
+          await searchEl.click({ count: 3 }).catch(() => {});
+          await page.keyboard.press('Backspace').catch(() => {});
+          await page.keyboard.type(cleanQuery, { delay: 25 });
+          await page.keyboard.press('Enter').catch(() => {});
+        }
       } else {
-        // Fallback: navigate directly to Victory's search route
         await page
           .goto(`${this.baseUrl}/search?q=${encodedQuery}`, {
             waitUntil: 'domcontentloaded',
-            timeout: 15_000,
+            timeout: 12_000,
           })
           .catch(() => {});
       }
 
-      // Wait briefly for API response or DOM search results to render
-      const deadline = Date.now() + 3_500;
+      // Wait briefly (up to 2.2s) for JSON API response; exit immediately once captured
+      const deadline = Date.now() + 2_200;
       while (Date.now() < deadline && capturedJsonProducts.length === 0) {
-        await new Promise((r) => setTimeout(r, 300));
+        await new Promise((r) => setTimeout(r, 200));
       }
 
       if (capturedJsonProducts.length > 0) {
@@ -961,24 +1038,36 @@ export class VictoryClient implements StoreClient {
         return this.rememberProducts(deduped);
       }
 
-      // Extract rendered product cards from the DOM (preferring search dropdown/results container)
+      // Extract rendered product cards from the DOM (preferring visible non-CookieYes search dropdown/results container)
       const domExtraction = await page.evaluate((): {
         cards: VictoryDomCardInput[];
         isHomepageFallback: boolean;
       } => {
+        const isCookieYes = (el: Element): boolean =>
+          Boolean(el.closest('[class*="cky-"], #cky-consent, .cky-modal'));
+        const isVis = (el: Element): boolean => {
+          if (isCookieYes(el)) return false;
+          const r = el.getBoundingClientRect();
+          if (r.width <= 0 || r.height <= 0) return false;
+          const s = window.getComputedStyle(el);
+          return s.display !== 'none' && s.visibility !== 'hidden' && Number(s.opacity) > 0;
+        };
+
         const dedicatedSelectors = [
-          '[role="dialog"]',
           '[role="listbox"]',
           '[class*="searchResult" i]',
           '[class*="search-result" i]',
           '[class*="autocomplete" i]',
+          '[role="dialog"]',
         ];
         let searchRoot: Element | null = null;
         let isDedicated = false;
         for (const sel of dedicatedSelectors) {
-          const el = document.querySelector(sel);
-          if (el && el.querySelector('a[href*="/product/"]')) {
-            searchRoot = el;
+          const matches = Array.from(document.querySelectorAll(sel)).filter(
+            (el) => isVis(el) && el.querySelector('a[href*="/product/"]'),
+          );
+          if (matches.length > 0) {
+            searchRoot = matches[matches.length - 1]!;
             isDedicated = true;
             break;
           }
@@ -995,7 +1084,7 @@ export class VictoryClient implements StoreClient {
 
         const links = Array.from(
           searchRoot.querySelectorAll('a[href*="/product/"]'),
-        );
+        ).filter((a) => isVis(a));
         const cards: VictoryDomCardInput[] = [];
         const seenHref = new Set<string>();
 
@@ -1004,7 +1093,6 @@ export class VictoryClient implements StoreClient {
           if (!href || seenHref.has(href)) continue;
           seenHref.add(href);
 
-          // Walk up to the enclosing product card container that holds price (₪)
           let container: HTMLElement | null = a as HTMLElement;
           for (let depth = 0; depth < 4 && container?.parentElement; depth++) {
             if ((container.textContent ?? '').includes('₪')) break;
@@ -1032,6 +1120,13 @@ export class VictoryClient implements StoreClient {
       });
 
       let parsedDom = parseVictoryDomCards(domExtraction.cards, limit);
+      for (let i = 0; i < domExtraction.cards.length; i++) {
+        const card = domExtraction.cards[i];
+        const parsed = parsedDom[i];
+        if (card?.href && parsed?.code) {
+          this.knownProductHrefs.set(parsed.code, card.href);
+        }
+      }
       if (domExtraction.isHomepageFallback && parsedDom.length > 0) {
         const queryTokens = cleanQuery
           .toLowerCase()
@@ -1044,6 +1139,14 @@ export class VictoryClient implements StoreClient {
       }
       if (parsedDom.length > 0) {
         return this.rememberProducts(parsedDom);
+      }
+
+      if (!this.searchDiagLogged) {
+        this.searchDiagLogged = true;
+        logger.info(
+          `Victory search returned 0 items for "${cleanQuery}" (taggedInput=${taggedInput}, observedApis=${JSON.stringify(observedApiUrls)})`,
+        );
+        await this.logDomDiagnostics('search-empty');
       }
       return [];
     } finally {
@@ -1085,6 +1188,66 @@ export class VictoryClient implements StoreClient {
     return this.buildTrackedCartState();
   }
 
+  private async trySyncItemsToVictorySite(
+    items: AddCartItemInput[],
+  ): Promise<void> {
+    if (
+      this.isGuestSession ||
+      items.length === 0 ||
+      (!this.options.chromePath && !this.options.browserWsEndpoint)
+    ) {
+      return;
+    }
+    const page = await this.ensureBrowserPage().catch(() => null);
+    if (!page || page.isClosed()) return;
+
+    // Best-effort UI sync for items whose product URL we know (bounded to 12s total so it never stalls the bot)
+    const deadline = Date.now() + 12_000;
+    let syncedAny = false;
+    for (const item of items) {
+      if (Date.now() > deadline) break;
+      const href = this.knownProductHrefs.get(item.productCode);
+      if (!href) continue;
+      const targetUrl = href.startsWith('http')
+        ? href
+        : `${this.baseUrl}${href.startsWith('/') ? '' : '/'}${href}`;
+      try {
+        await page.goto(targetUrl, {
+          waitUntil: 'domcontentloaded',
+          timeout: 8_000,
+        });
+        await new Promise((r) => setTimeout(r, 700));
+        const clicked = await page.evaluate(() => {
+          const btns = Array.from(document.querySelectorAll('button')).filter(
+            (b) => {
+              const r = b.getBoundingClientRect();
+              return r.width > 0 && r.height > 0 && !b.disabled;
+            },
+          );
+          const addBtn = btns.find((b) => {
+            const t = (b.textContent ?? '').trim();
+            return t.includes('הוספה לסל') || t.includes('הוסף לסל') || t === 'הוספה';
+          });
+          if (addBtn) {
+            addBtn.click();
+            return true;
+          }
+          return false;
+        });
+        if (clicked) {
+          syncedAny = true;
+          await new Promise((r) => setTimeout(r, 400));
+        }
+      } catch {
+        // continue with remaining items
+      }
+    }
+    if (syncedAny) {
+      this.serverCartSynced = true;
+      await this.saveVictorySession().catch(() => {});
+    }
+  }
+
   async setItemsInCart(items: AddCartItemInput[]): Promise<CartState> {
     for (const item of items) {
       const cleanQty =
@@ -1103,6 +1266,9 @@ export class VictoryClient implements StoreClient {
         sellingMethod: item.sellingMethod,
         inStock: known?.inStock ?? true,
       });
+    }
+    if (!this.isGuestSession) {
+      await this.trySyncItemsToVictorySite(items).catch(() => {});
     }
     return this.buildTrackedCartState();
   }
@@ -1133,6 +1299,7 @@ export class VictoryClient implements StoreClient {
 
   async clearCart(): Promise<void> {
     this.trackedCart.clear();
+    this.serverCartSynced = false;
   }
 
   async getAvailableTimeSlots(): Promise<DeliverySlot[]> {
@@ -1183,7 +1350,9 @@ export class VictoryClient implements StoreClient {
         : '';
     const loginHint = this.isGuestSession
       ? `\nℹ️ להתחברות לחשבון ויקטורי באמצעות SMS שלחו: /login_victory 05XXXXXXXX`
-      : `\n✅ מחובר לחשבון ויקטורי אונליין.`;
+      : this.serverCartSynced
+        ? `\n✅ מחובר לחשבון ויקטורי אונליין והעגלה סונכרנה לאתר.`
+        : `\nℹ️ מחובר לחשבון ויקטורי אונליין (סל מוצג למטה להשלמה מהירה באתר).`;
 
     throw new StoreManualVerificationRequiredError(
       'victory',

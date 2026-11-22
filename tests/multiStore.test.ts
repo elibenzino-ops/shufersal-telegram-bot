@@ -6,6 +6,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import {
   GroceryAiService,
   extractRecommendedGeminiModel,
+  extractRetryDelayMs,
   type ParsedGroceryItem,
 } from '../src/ai/groceryAi.js';
 import { renderComparisonHtml } from '../src/bot/telegramBot.js';
@@ -1504,6 +1505,90 @@ describe('SMS OTP login flow (Super Haviv & Victory)', () => {
     } finally {
       db.close();
     }
+  });
+
+  it('uses fast local Hebrew matching without burning Gemini quota and activates 429 quota cooldown', async () => {
+    expect(extractRetryDelayMs('"retryDelay":"44540s"')).toBe(44_540_000);
+    expect(extractRetryDelayMs('Please retry in 12h22m20s.')).toBe(
+      (12 * 3600 + 22 * 60 + 20) * 1000,
+    );
+
+    const ai = new GroceryAiService('dummy-key', 'gemini-3.8-flash');
+    const mockGenerate = vi.fn(async () => {
+      throw new Error(
+        '429 RESOURCE_EXHAUSTED quota exceeded. "retryDelay":"44540s"',
+      );
+    });
+    (
+      ai as unknown as {
+        ai: { models: { generateContent: typeof mockGenerate } };
+      }
+    ).ai = {
+      models: { generateContent: mockGenerate },
+    };
+
+    // High-confidence exact Hebrew match resolves locally in 0ms with 0 Gemini calls
+    const localRes = await ai.selectBestProduct({
+      request: {
+        rawText: "קוטג' 5% תנובה",
+        searchQuery: "קוטג' 5% תנובה",
+        action: 'set',
+        quantity: 2,
+        unitPreference: 'UNIT',
+      },
+      candidates: [
+        {
+          code: '100',
+          storeId: 'super_haviv',
+          barcode: null,
+          name: "קוטג' 5% תנובה 250 גרם",
+          brandName: 'תנובה',
+          unitDescription: '250 גרם',
+          sellingMethod: 'BY_UNIT',
+          price: 6.5,
+          formattedPrice: '₪6.50',
+          pricePerUnitText: null,
+          promotionMsg: null,
+          inStock: true,
+          purchasable: true,
+          categoryName: null,
+          imageUrl: null,
+        },
+        {
+          code: '101',
+          storeId: 'super_haviv',
+          barcode: null,
+          name: 'גבינה לבנה 9% שטראוס',
+          brandName: 'שטראוס',
+          unitDescription: '250 גרם',
+          sellingMethod: 'BY_UNIT',
+          price: 7.2,
+          formattedPrice: '₪7.20',
+          pricePerUnitText: null,
+          promotionMsg: null,
+          inStock: true,
+          purchasable: true,
+          categoryName: null,
+          imageUrl: null,
+        },
+      ],
+      strictMatch: true,
+    });
+    expect(localRes.selected?.code).toBe('100');
+    expect(mockGenerate).not.toHaveBeenCalled();
+
+    // First 429 triggers quota cooldown; subsequent calls skip Gemini completely
+    const parsed1 = await ai.parseGroupMessage('תוסיפו 2 חלב תנובה, תורידו קוטג');
+    expect(ai.isQuotaExhausted()).toBe(true);
+    expect(parsed1.isGroceryRelated).toBe(true);
+    expect(parsed1.items[0]?.quantity).toBe(2);
+    expect(parsed1.items[0]?.searchQuery).toBe('חלב תנובה');
+    expect(parsed1.items[1]?.action).toBe('remove');
+
+    const callsAfterFirst429 = mockGenerate.mock.calls.length;
+    const greeting = await ai.parseGroupMessage('בוקר טוב');
+    expect(greeting.isGroceryRelated).toBe(false);
+    expect(mockGenerate.mock.calls.length).toBe(callsAfterFirst429);
   });
 });
 
