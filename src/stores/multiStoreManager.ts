@@ -54,6 +54,22 @@ export interface StoreAdjustOutcome {
   error?: string;
 }
 
+export interface MirrorStoreSummary {
+  storeId: StoreId;
+  meta: StoreMeta;
+  matchedCount: number;
+  missingItems: string[];
+  error?: string;
+}
+
+export interface MirrorCartResult {
+  sourceStoreId: StoreId;
+  sourceOrderInUpdateMode: string | null;
+  totalSourceItems: number;
+  storeSummaries: MirrorStoreSummary[];
+  comparison: CartComparisonResult;
+}
+
 export function rankStoreQuotes(quotes: StoreCartQuote[]): CartComparisonResult {
   const valid = quotes.filter((q) => !q.error && q.inStockCount > 0);
   const maxCoverage = valid.reduce((m, q) => Math.max(m, q.inStockCount), 0);
@@ -562,6 +578,181 @@ export class MultiStoreManager {
     const mgr = this.managers.get(storeId);
     if (!mgr) return [];
     return mgr.getAvailableSlots();
+  }
+
+  async mirrorCartToOtherStores(params: {
+    chatId: number;
+    sourceStoreId: StoreId;
+    senderName: string;
+    ai: GroceryAiService;
+    clearTargetFirst?: boolean;
+    onProgress?: (done: number, total: number) => Promise<void> | void;
+  }): Promise<MirrorCartResult> {
+    const sourceMgr = this.managers.get(params.sourceStoreId);
+    if (!sourceMgr) {
+      throw new Error(`החנות ${params.sourceStoreId} אינה מופעלת`);
+    }
+
+    const sourceCart = await sourceMgr.getEnrichedCart(params.chatId);
+    const sourceItems = sourceCart.items.filter(
+      (i) => i.inStock && i.quantity > 0,
+    );
+    const targetManagers = this.orderedStoreIds
+      .filter((id) => id !== params.sourceStoreId)
+      .map((id) => this.managers.get(id)!);
+
+    if (sourceItems.length === 0 || targetManagers.length === 0) {
+      const comparison = await this.compareCarts(params.chatId);
+      return {
+        sourceStoreId: params.sourceStoreId,
+        sourceOrderInUpdateMode: sourceCart.orderInUpdateMode,
+        totalSourceItems: sourceItems.length,
+        storeSummaries: targetManagers.map((m) => ({
+          storeId: m.storeId,
+          meta: m.meta,
+          matchedCount: 0,
+          missingItems: [],
+        })),
+        comparison,
+      };
+    }
+
+    const summaryByStore = new Map<StoreId, MirrorStoreSummary>();
+    const failedStores = new Set<StoreId>();
+
+    for (const mgr of targetManagers) {
+      summaryByStore.set(mgr.storeId, {
+        storeId: mgr.storeId,
+        meta: mgr.meta,
+        matchedCount: 0,
+        missingItems: [],
+      });
+    }
+
+    // Clear target carts first so the comparison matches the source cart 1:1
+    if (params.clearTargetFirst !== false) {
+      await Promise.all(
+        targetManagers.map(async (mgr) => {
+          try {
+            await mgr.clearCart(params.chatId);
+          } catch (err) {
+            logger.warn(`Failed clearing ${mgr.storeId} before mirror`, err);
+            const msg = err instanceof Error ? err.message : String(err);
+            const entry = summaryByStore.get(mgr.storeId)!;
+            entry.error = msg;
+            failedStores.add(mgr.storeId);
+          }
+        }),
+      );
+    }
+
+    // Reset canonical shopping list to mirror the source cart items
+    this.db.clearShoppingList(params.chatId);
+
+    for (let idx = 0; idx < sourceItems.length; idx++) {
+      const item = sourceItems[idx]!;
+      const displayName = (item.productName ?? item.productCode).trim();
+      const cached = this.db.getCachedProduct(
+        item.productCode,
+        params.sourceStoreId,
+      );
+      const strippedCode = item.productCode.replace(/^P_/i, '').trim();
+      const sourceBarcode =
+        cached?.barcode ??
+        (/^\d{6,14}$/.test(strippedCode) ? strippedCode : null);
+
+      const sellingMethod =
+        item.sellingMethod ?? cached?.sellingMethod ?? 'BY_UNIT';
+      const request: ParsedGroceryItem = {
+        rawText: displayName,
+        searchQuery: displayName,
+        action: 'set',
+        quantity: item.quantity,
+        unitPreference: sellingMethod === 'BY_WEIGHT' ? 'WEIGHT' : 'UNIT',
+      };
+
+      this.db.upsertShoppingListItem({
+        chatId: params.chatId,
+        query: displayName,
+        quantity: item.quantity,
+        mode: 'set',
+        unitPreference: request.unitPreference,
+        senderName: params.senderName,
+      });
+
+      await Promise.all(
+        targetManagers.map(async (targetMgr) => {
+          if (failedStores.has(targetMgr.storeId)) return;
+          const summary = summaryByStore.get(targetMgr.storeId)!;
+          try {
+            let candidates: CatalogProduct[] = [];
+            // Try exact barcode search first for fast, apples-to-apples SKU matching
+            if (sourceBarcode) {
+              candidates = await targetMgr.search(sourceBarcode, 8).catch(() => []);
+            }
+            const hasInStockBarcode = candidates.some(
+              (c) => c.inStock && c.purchasable,
+            );
+            if (!hasInStockBarcode && displayName) {
+              candidates = await targetMgr.search(displayName, 12);
+            }
+
+            const learned = this.db.getPreference(displayName, targetMgr.storeId);
+            const selection = await params.ai.selectBestProduct({
+              request,
+              candidates,
+              learnedProductCode: learned?.productCode ?? null,
+              preferredBarcode: sourceBarcode,
+              storeName: targetMgr.meta.displayName,
+            });
+
+            if (!selection.selected) {
+              summary.missingItems.push(displayName);
+              return;
+            }
+
+            await targetMgr.addOrIncrementProduct({
+              chatId: params.chatId,
+              senderName: params.senderName,
+              product: selection.selected,
+              quantity: selection.adjustedQuantity,
+              mode: 'increment',
+            });
+            summary.matchedCount++;
+          } catch (err) {
+            logger.warn(
+              `Mirror item "${displayName}" failed on ${targetMgr.storeId}`,
+              err,
+            );
+            const msg = err instanceof Error ? err.message : String(err);
+            // If the store itself is blocked/auth-failed, stop hammering it for remaining items
+            if (
+              msg.includes('CAPTCHA') ||
+              msg.includes('WAF') ||
+              msg.includes('התחברות')
+            ) {
+              summary.error = msg;
+              failedStores.add(targetMgr.storeId);
+            } else {
+              summary.missingItems.push(displayName);
+            }
+          }
+        }),
+      );
+
+      if (params.onProgress) {
+        await params.onProgress(idx + 1, sourceItems.length);
+      }
+    }
+
+    const comparison = await this.compareCarts(params.chatId);
+    return {
+      sourceStoreId: params.sourceStoreId,
+      sourceOrderInUpdateMode: sourceCart.orderInUpdateMode,
+      totalSourceItems: sourceItems.length,
+      storeSummaries: targetManagers.map((m) => summaryByStore.get(m.storeId)!),
+      comparison,
+    };
   }
 
   async shutdown(): Promise<void> {

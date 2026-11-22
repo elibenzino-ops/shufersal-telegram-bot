@@ -609,6 +609,18 @@ export function createTelegramBot(deps: CreateTelegramBotDeps): Bot {
     if (storeId === 'shufersal' && !orderInUpdateMode) {
       kb.text('🚚 בחר חלון משלוח', 'nav:slots');
     }
+    if (hasItems && stores.isMultiStore()) {
+      const mirrorTok = db.saveCallbackPayload({
+        kind: 'mirror_cart',
+        sourceStoreId: storeId,
+      });
+      kb.row().text(
+        orderInUpdateMode
+          ? '📋 העתק והשווה את ההזמנה בשאר הרשתות'
+          : `📋 העתק והשווה מ-${meta.shortName} בשאר הרשתות`,
+        `a:${mirrorTok}`,
+      );
+    }
     if (stores.isMultiStore()) {
       kb.row().text('⚖️ השוואת כל הרשתות', 'nav:compare');
     }
@@ -2019,6 +2031,9 @@ export function createTelegramBot(deps: CreateTelegramBotDeps): Bot {
             `✏️ <b>הזמנה #${escapeHtml(payload.orderCode)} נטענה לעגלה במצב עדכון!</b>\n\n` +
               `• להוספת מוצרים – כתבו כרגיל בקבוצה.\n` +
               `• להסרת מוצרים – לחצו <b>🗑 הסר / ערוך פריטים בהזמנה</b> למטה, הקלידו <code>/remove</code>, או כתבו <i>"תורידו את..."</i>.\n` +
+              (stores.isMultiStore()
+                ? `• להשוואת כל ההזמנה מול שאר הרשתות – לחצו <b>📋 העתק והשווה את ההזמנה בשאר הרשתות</b> למטה.\n`
+                : '') +
               `⚠️ <b>חשוב:</b> בסיום העריכה, יש להריץ /checkout (או ללחוץ שמור עדכון) כדי לשמור את השינויים!\n\n` +
               renderCartSummaryHtml(mgr.meta, cart),
             {
@@ -2092,6 +2107,97 @@ export function createTelegramBot(deps: CreateTelegramBotDeps): Bot {
             );
             return;
           }
+        }
+
+        if (payload.kind === 'mirror_cart') {
+          const sourceMeta = STORE_META[payload.sourceStoreId];
+          await ctx.answerCallbackQuery(
+            `מעתיק פריטים מ-${sourceMeta.shortName} ומשווה...`,
+          );
+
+          if (!stores.isMultiStore()) {
+            await ctx.editMessageText(
+              'ℹ️ נדרשות לפחות שתי רשתות פעילות כדי להשוות סלים.',
+              { parse_mode: 'HTML' },
+            );
+            return;
+          }
+
+          await ctx.editMessageText(
+            `⏳ <b>מעתיק את כל הפריטים מ-${escapeHtml(sourceMeta.displayName)} לשאר הרשתות ומשווה מחירים...</b>\n` +
+              `<i>מרוקן עגלות קודמות בשאר הרשתות כדי שההשוואה תהיה מדויקת (1:1).</i>`,
+            { parse_mode: 'HTML' },
+          );
+
+          let lastReported = 0;
+          const result = await stores.mirrorCartToOtherStores({
+            chatId,
+            sourceStoreId: payload.sourceStoreId,
+            senderName: getSenderDisplayName(ctx),
+            ai,
+            clearTargetFirst: true,
+            onProgress: async (done, total) => {
+              if (done === total || done === 1 || done - lastReported >= 3) {
+                lastReported = done;
+                try {
+                  await ctx.api.editMessageText(
+                    chatId,
+                    messageId,
+                    `⏳ <b>מעתיק ומשווה פריטים מ-${escapeHtml(sourceMeta.displayName)}...</b>\n` +
+                      `📦 התקדמות: <b>${done}/${total}</b> פריטים`,
+                    { parse_mode: 'HTML' },
+                  );
+                } catch {
+                  // Ignore transient rate-limit or unchanged-message edit errors
+                }
+              }
+            },
+          });
+
+          if (result.totalSourceItems === 0) {
+            await ctx.editMessageText(
+              `🛒 אין פריטים במלאי בעגלת ${escapeHtml(sourceMeta.displayName)} להעתקה והשוואה.`,
+              { parse_mode: 'HTML' },
+            );
+            return;
+          }
+
+          const summaryLines: string[] = [
+            `📋 <b>הועתקו ${result.totalSourceItems} פריטים מ-${escapeHtml(sourceMeta.displayName)} לשאר הרשתות:</b>`,
+          ];
+          for (const s of result.storeSummaries) {
+            if (s.error) {
+              summaryLines.push(
+                `${s.meta.emoji} <b>${escapeHtml(s.meta.shortName)}</b>: ⚠️ ${escapeHtml(s.error)}`,
+              );
+            } else {
+              const missingNote =
+                s.missingItems.length > 0
+                  ? ` (חסרים ${s.missingItems.length}: ${s.missingItems
+                      .slice(0, 3)
+                      .map((n) => escapeHtml(n))
+                      .join(', ')}${s.missingItems.length > 3 ? ` +${s.missingItems.length - 3}` : ''})`
+                  : ' ✅';
+              summaryLines.push(
+                `${s.meta.emoji} <b>${escapeHtml(s.meta.shortName)}</b>: הותאמו <b>${s.matchedCount}/${result.totalSourceItems}</b>${missingNote}`,
+              );
+            }
+          }
+
+          const cancelReminder = result.sourceOrderInUpdateMode
+            ? `\n\n💡 <i>שימו לב: אם תבחרו להזמין מרשת אחרת, זכרו לבטל את ההזמנה הפתוחה #${escapeHtml(result.sourceOrderInUpdateMode)} ב-${escapeHtml(sourceMeta.shortName)}.</i>`
+            : '';
+
+          const fullHtml =
+            `${summaryLines.join('\n')}\n\n` +
+            renderComparisonHtml(result.comparison) +
+            cancelReminder;
+
+          await ctx.api.editMessageText(chatId, messageId, fullHtml, {
+            parse_mode: 'HTML',
+            reply_markup: buildComparisonKeyboard(result.comparison, true),
+          });
+          return;
         }
 
         if (payload.kind === 'checkout_store') {

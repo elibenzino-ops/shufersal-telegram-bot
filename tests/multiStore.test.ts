@@ -829,4 +829,182 @@ describe('rankStoreQuotes & MultiStoreManager', () => {
       migrated.close();
     }
   });
+
+  it('mirrors a loaded Shufersal order to all other stores via barcode-first search and compares totals', async () => {
+    const cottageBarcode = '7290004127329';
+    const milkBarcode = '7290000000111';
+
+    const shufersalClient = makeMockStoreClient('shufersal', [], 29.9);
+    // Simulate an existing Shufersal order already loaded into update mode
+    vi.mocked(shufersalClient.getCartState).mockImplementation(async () => ({
+      storeId: 'shufersal',
+      items: [
+        {
+          entryNumber: 0,
+          productCode: `P_${cottageBarcode}`,
+          productName: "קוטג' תנובה 5%",
+          quantity: 3,
+          itemPrice: 21.6,
+          inStock: true,
+          sellingMethod: 'BY_UNIT',
+        },
+        {
+          entryNumber: 1,
+          productCode: `P_${milkBarcode}`,
+          productName: 'חלב תנובה 3%',
+          quantity: 2,
+          itemPrice: 13.6,
+          inStock: true,
+          sellingMethod: 'BY_UNIT',
+        },
+      ],
+      totalPrice: 35.2,
+      deliveryFee: 29.9,
+      orderInUpdateMode: '900123',
+    }));
+
+    const haziCatalog: CatalogProduct[] = [
+      {
+        code: 'HH_COTTAGE',
+        storeId: 'hazi_hinam',
+        barcode: cottageBarcode,
+        name: "קוטג' תנובה 5%",
+        brandName: 'תנובה',
+        unitDescription: '250 גרם',
+        sellingMethod: 'BY_UNIT',
+        price: 5.9,
+        formattedPrice: '₪5.90',
+        pricePerUnitText: null,
+        promotionMsg: null,
+        inStock: true,
+        purchasable: true,
+        categoryName: 'גבינות',
+        imageUrl: null,
+      },
+      {
+        code: 'HH_MILK',
+        storeId: 'hazi_hinam',
+        barcode: milkBarcode,
+        name: 'חלב תנובה 3%',
+        brandName: 'תנובה',
+        unitDescription: '1 ליטר',
+        sellingMethod: 'BY_UNIT',
+        price: 6.2,
+        formattedPrice: '₪6.20',
+        pricePerUnitText: null,
+        promotionMsg: null,
+        inStock: true,
+        purchasable: true,
+        categoryName: 'חלב',
+        imageUrl: null,
+      },
+    ];
+    const haziClient = makeMockStoreClient('hazi_hinam', haziCatalog, 29.9);
+    // Pre-populate stale item that must be cleared before mirroring
+    await haziClient.setItemsInCart([
+      { productCode: 'HH_COTTAGE', quantity: 9, sellingMethod: 'BY_UNIT' },
+    ]);
+    vi.mocked(haziClient.searchProducts).mockImplementation(async (q) =>
+      haziCatalog.filter((p) => p.barcode === q || p.name.includes(q)),
+    );
+
+    const victoryCatalog: CatalogProduct[] = [
+      {
+        code: 'VIC_COTTAGE',
+        storeId: 'victory',
+        barcode: cottageBarcode,
+        name: "קוטג' תנובה 5%",
+        brandName: 'תנובה',
+        unitDescription: '250 גרם',
+        sellingMethod: 'BY_UNIT',
+        price: 5.5,
+        formattedPrice: '₪5.50',
+        pricePerUnitText: null,
+        promotionMsg: null,
+        inStock: true,
+        purchasable: true,
+        categoryName: 'גבינות',
+        imageUrl: null,
+      },
+      // Milk intentionally absent in Victory to verify missingItems tracking
+    ];
+    const victoryClient = makeMockStoreClient('victory', victoryCatalog, 35.9);
+    vi.mocked(victoryClient.searchProducts).mockImplementation(async (q) =>
+      victoryCatalog.filter((p) => p.barcode === q || p.name.includes(q)),
+    );
+
+    const multi = new MultiStoreManager(
+      [
+        new StoreManager(shufersalClient, db),
+        new StoreManager(haziClient, db),
+        new StoreManager(victoryClient, db),
+      ],
+      db,
+    );
+
+    const mockAi = {
+      selectBestProduct: vi.fn(
+        async (params: {
+          request: ParsedGroceryItem;
+          candidates: CatalogProduct[];
+          preferredBarcode?: string | null;
+        }) => {
+          const match =
+            (params.preferredBarcode
+              ? params.candidates.find((c) => c.barcode === params.preferredBarcode)
+              : undefined) ?? params.candidates[0]!;
+          return {
+            selected: match,
+            adjustedQuantity: params.request.quantity,
+            alternatives: params.candidates.filter((c) => c.code !== match.code),
+          };
+        },
+      ),
+    } as unknown as GroceryAiService;
+
+    const progressSteps: Array<[number, number]> = [];
+    const res = await multi.mirrorCartToOtherStores({
+      chatId: -100777,
+      sourceStoreId: 'shufersal',
+      senderName: 'אלי',
+      ai: mockAi,
+      onProgress: (done, total) => {
+        progressSteps.push([done, total]);
+      },
+    });
+
+    expect(res.sourceOrderInUpdateMode).toBe('900123');
+    expect(res.totalSourceItems).toBe(2);
+    expect(progressSteps).toEqual([
+      [1, 2],
+      [2, 2],
+    ]);
+
+    // Target carts were cleared before mirroring (source store was NOT cleared)
+    expect(shufersalClient.clearCart).not.toHaveBeenCalled();
+    expect(haziClient.clearCart).toHaveBeenCalledTimes(1);
+    expect(victoryClient.clearCart).toHaveBeenCalledTimes(1);
+
+    // Barcode extracted from P_<barcode> was searched first
+    expect(haziClient.searchProducts).toHaveBeenCalledWith(
+      cottageBarcode,
+      expect.any(Number),
+    );
+    expect(haziClient.searchProducts).toHaveBeenCalledWith(
+      milkBarcode,
+      expect.any(Number),
+    );
+
+    const haziSummary = res.storeSummaries.find((s) => s.storeId === 'hazi_hinam');
+    expect(haziSummary?.matchedCount).toBe(2);
+    expect(haziSummary?.missingItems).toEqual([]);
+
+    const victorySummary = res.storeSummaries.find((s) => s.storeId === 'victory');
+    expect(victorySummary?.matchedCount).toBe(1);
+    expect(victorySummary?.missingItems).toEqual(['חלב תנובה 3%']);
+
+    // Hazi Hinam matched both items cheaply (3*5.90 + 2*6.20 = 30.10 + 29.90 = 60.00 vs Shufersal 35.20 + 29.90 = 65.10)
+    expect(res.comparison.cheapestStoreId).toBe('hazi_hinam');
+    expect(res.comparison.savingsVsSecondCheapest).toBe(5.1);
+  });
 });

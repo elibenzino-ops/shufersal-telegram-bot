@@ -81,6 +81,10 @@ export type CallbackPayload =
       page: number;
     }
   | {
+      kind: 'mirror_cart';
+      sourceStoreId: StoreId;
+    }
+  | {
       kind: 'checkout_store';
       storeId: StoreId;
     }
