@@ -2,33 +2,21 @@ import { GroceryAiService } from './ai/groceryAi.js';
 import { createTelegramBot, registerBotCommands } from './bot/telegramBot.js';
 import { loadConfig } from './config.js';
 import { logger } from './logger.js';
-import { ShufersalClient } from './shufersal/client.js';
-import { ShufersalManager } from './shufersal/manager.js';
 import { BotDatabase } from './store/database.js';
+import { createMultiStoreManager } from './stores/factory.js';
 
 async function main(): Promise<void> {
-  logger.info('Starting Shufersal Online Telegram Group Bot...');
+  logger.info('Starting Multi-Store Israeli Grocery Telegram Bot...');
   const config = loadConfig();
 
   const db = new BotDatabase(config.dbPath);
-  const shufersalClient = new ShufersalClient({
-    username: config.shufersalUsername,
-    password: config.shufersalPassword,
-    chromePath: config.chromePath,
-    browserWsEndpoint: config.browserWsEndpoint,
-    proxyUrl: config.proxyUrl,
-    headless: config.headless,
-    sessionFilePath: config.sessionFilePath,
-    screenshotsDir: config.screenshotsDir,
-  });
-
-  const shufersal = new ShufersalManager(shufersalClient, db);
+  const stores = createMultiStoreManager(config, db);
   const ai = new GroceryAiService(config.geminiApiKey, config.geminiModel);
 
   const bot = createTelegramBot({
     config,
     db,
-    shufersal,
+    stores,
     ai,
   });
 
@@ -43,9 +31,9 @@ async function main(): Promise<void> {
       logger.warn('Error stopping Telegram bot', err);
     }
     try {
-      await shufersal.shutdown();
+      await stores.shutdown();
     } catch (err) {
-      logger.warn('Error closing Shufersal browser', err);
+      logger.warn('Error shutting down store clients', err);
     }
     try {
       db.close();
@@ -66,10 +54,15 @@ async function main(): Promise<void> {
     );
   }
 
+  const enabledSummary = stores
+    .getEnabledStores()
+    .map((s) => `${s.emoji} ${s.shortName}`)
+    .join(', ');
+
   await bot.start({
     onStart: (botInfo) => {
       logger.info(
-        `Telegram bot @${botInfo.username} is live and listening 24/7!`,
+        `Telegram bot @${botInfo.username} is live 24/7! Enabled stores: ${enabledSummary}`,
       );
     },
   });

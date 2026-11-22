@@ -39,11 +39,11 @@ export class GroceryAiService {
       return { isGroceryRelated: false, items: [] };
     }
 
-    const systemInstruction = `אתה עוזר קניות חכם בקבוצת טלגרם משפחתית המחוברת לשופרסל אונליין.
+    const systemInstruction = `אתה עוזר קניות חכם בקבוצת טלגרם משפחתית המחוברת לרשתות הסופרמרקטים בישראל (שופרסל, חצי חינם, סופר חביב וויקטורי).
 תפקידך לנתח הודעות בעברית של משתתפי הקבוצה ולהחליט:
 1. האם ההודעה היא בקשה להוסיף, לעדכן או להסיר מצרכים מרשימת הקניות (isGroceryRelated = true), או סתם שיחה כללית בקבוצה כמו "בוקר טוב", "תודה", "מתי המשלוח מגיע?" (isGroceryRelated = false).
 2. עבור כל מצרך שמוזכר בהודעה:
-   - searchQuery: שאילתת חיפוש נקייה ומדויקת לקטלוג שופרסל בעברית (למשל: "חלב תנובה 3%", "קוטג 5%", "עגבניות", "לחם פרוס אחיד"). אל תכלול בשאילתה מילות בקשה כמו "תביא", "צריך", "עוד" או את הכמות של מספר היחידות.
+   - searchQuery: שאילתת חיפוש נקייה ומדויקת לקטלוג סופרמרקט בעברית (למשל: "חלב תנובה 3%", "קוטג 5%", "עגבניות", "לחם פרוס אחיד"). אל תכלול בשאילתה מילות בקשה כמו "תביא", "צריך", "עוד" או את הכמות של מספר היחידות.
    - הבחנה חשובה בין גודל אריזה לבין משקל שקילה:
      • מוצר ארוז שמצוין משקל האריזה שלו (למשל "גבינה לבנה 500 גרם" או "חומוס אחלה 400 גרם"): השאר את המשקל כחלק מ-searchQuery, קבע unitPreference="UNIT" ו-quantity=1 (או מספר האריזות המבוקש).
      • ירקות/פירות/בשר במשקל (למשל "חצי קילו עגבניות", "1.5 קילו תפוחי אדמה", "300 גרם גבינה צהובה במעדנייה"): קבע searchQuery לשם המוצר בלבד ("עגבניות"), unitPreference="WEIGHT", ו-quantity בקילוגרמים (למשל 0.5 עבור חצי קילו / 500 גרם).
@@ -127,6 +127,8 @@ export class GroceryAiService {
     request: ParsedGroceryItem;
     candidates: CatalogProduct[];
     learnedProductCode?: string | null;
+    preferredBarcode?: string | null;
+    storeName?: string;
   }): Promise<ProductSelectionResult> {
     const available = params.candidates.filter(
       (c) => c.inStock && c.purchasable,
@@ -138,6 +140,27 @@ export class GroceryAiService {
         adjustedQuantity: params.request.quantity,
         alternatives: [],
       };
+    }
+
+    // If a store already matched a specific SKU barcode, prefer the exact same barcode across stores
+    // (unless the user explicitly trained a different learned preference for this store)
+    if (params.preferredBarcode && !params.learnedProductCode) {
+      const exactBarcodeMatch = available.find(
+        (c) => c.barcode && c.barcode === params.preferredBarcode,
+      );
+      if (exactBarcodeMatch) {
+        return {
+          selected: exactBarcodeMatch,
+          adjustedQuantity: this.normalizeQuantityForProduct(
+            params.request,
+            exactBarcodeMatch,
+          ),
+          alternatives: available
+            .filter((c) => c.code !== exactBarcodeMatch.code)
+            .slice(0, 4),
+          reason: `התאמת ברקוד זהה (${params.preferredBarcode}) להשוואה מדויקת בין הרשתות`,
+        };
+      }
     }
 
     if (available.length === 1) {
@@ -155,6 +178,7 @@ export class GroceryAiService {
     const compactCandidates = available.slice(0, 12).map((c, idx) => ({
       historyRank: idx + 1,
       code: c.code,
+      barcode: c.barcode ?? null,
       name: c.name,
       brand: c.brandName,
       unitDescription: c.unitDescription,
@@ -162,26 +186,30 @@ export class GroceryAiService {
       price: c.price,
       category: c.categoryName,
       isLearnedHouseholdFavorite: c.code === params.learnedProductCode,
+      matchesCrossStoreBarcode:
+        Boolean(params.preferredBarcode && c.barcode === params.preferredBarcode),
     }));
 
     const prompt = JSON.stringify(
       {
+        store: params.storeName ?? 'סופרמרקט אונליין',
         userRequest: {
           rawText: params.request.rawText,
           searchQuery: params.request.searchQuery,
           requestedQuantity: params.request.quantity,
           unitPreference: params.request.unitPreference,
         },
-        candidatesSortedByPurchaseHistory: compactCandidates,
+        candidatesSortedByRelevance: compactCandidates,
       },
       null,
       2,
     );
 
-    const systemInstruction = `אתה בוחר את המוצר המדויק ביותר מתוך תוצאות החיפוש של שופרסל אונליין.
+    const storeLabel = params.storeName ?? 'הסופרמרקט';
+    const systemInstruction = `אתה בוחר את המוצר המדויק ביותר מתוך תוצאות החיפוש של ${storeLabel}.
 כללים:
-1. הרשימה מסודרת כבר לפי היסטוריית הרכישות של המשפחה בשופרסל (historyRank=1 נקנה הכי הרבה בעבר).
-2. אם מוצר מסומן ב-isLearnedHouseholdFavorite=true והוא מתאים לבקשה (למשל המשפחה לא ביקשה מותג אחר במפורש), העדף אותו!
+1. אם מוצר מסומן ב-isLearnedHouseholdFavorite=true והוא מתאים לבקשה (למשל המשפחה לא ביקשה מותג אחר במפורש), העדף אותו!
+2. אם מוצר מסומן ב-matchesCrossStoreBarcode=true והוא תואם לבקשה, העדף אותו כדי שההשוואה בין הרשתות תהיה על מוצר זהה לחלוטין.
 3. אחרת, העדף את המוצר בעל historyRank נמוך שבאמת תואם למה שהמשתמש ביקש (למשל אם ביקשו "חלב", בחר חלב רגיל 3% ולא משקה שוקו או חלב שקדים, אלא אם כן זה מה שביקשו).
 4. התאמת כמות (adjustedQuantity):
    - אם המשתמש ביקש משקל (למשל 0.5 ק"ג עגבניות שרי, unitPreference="WEIGHT"), אבל המוצר הנבחר נמכר לפי יחידה/מארז ארוז של ~500 גרם (sellingMethod="BY_UNIT"), המר את הכמות למספר שלם של יחידות מתאים (למשל 1).
