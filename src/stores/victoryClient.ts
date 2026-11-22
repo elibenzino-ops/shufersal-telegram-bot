@@ -1208,6 +1208,51 @@ export class VictoryClient implements StoreClient {
     }
   }
 
+  private async logDomDiagnostics(tag: string): Promise<void> {
+    if (!this.page || this.page.isClosed()) return;
+    try {
+      const diag = await this.page.evaluate(() => {
+        const isCookieYes = (el: Element): boolean =>
+          Boolean(el.closest('[class*="cky-"], #cky-consent, .cky-modal'));
+        const isVis = (el: Element): boolean => {
+          if (isCookieYes(el)) return false;
+          const r = el.getBoundingClientRect();
+          if (r.width <= 0 || r.height <= 0) return false;
+          const s = window.getComputedStyle(el);
+          return s.display !== 'none' && s.visibility !== 'hidden' && Number(s.opacity) > 0;
+        };
+        const inputs = Array.from(document.querySelectorAll('input'))
+          .filter((i) => isVis(i))
+          .slice(0, 15)
+          .map((i) => ({
+            type: i.type,
+            inputMode: i.inputMode || undefined,
+            name: i.name || undefined,
+            id: i.id || undefined,
+            placeholder: i.placeholder || undefined,
+            autoComplete: i.autocomplete || undefined,
+            maxLength: i.maxLength > 0 && i.maxLength < 100 ? i.maxLength : undefined,
+            w: Math.round(i.getBoundingClientRect().width),
+          }));
+        const buttons = Array.from(document.querySelectorAll('button'))
+          .filter((b) => isVis(b))
+          .map((b) => (b.textContent ?? '').trim())
+          .filter((t) => t.length > 0 && t.length <= 35)
+          .slice(0, 15);
+        return {
+          url: window.location.href,
+          title: document.title,
+          stillGuest: (document.body?.innerText ?? '').includes('שלום אורח'),
+          visibleInputs: inputs,
+          visibleButtons: buttons,
+        };
+      });
+      logger.info(`victory DOM diagnostics (${tag}): ${JSON.stringify(diag)}`);
+    } catch {
+      // ignore diagnostic errors
+    }
+  }
+
   async startSmsOtpLogin(phoneNumber: string): Promise<{ message: string }> {
     const cleanPhone = normalizeIsraeliPhone(phoneNumber);
     if (!cleanPhone) {
@@ -1249,29 +1294,44 @@ export class VictoryClient implements StoreClient {
       .catch(() => {});
 
     const opened = await page.evaluate(() => {
-      const findPhoneInput = () =>
-        document.querySelector(
-          'input[type="tel"], input[name*="phone" i], input[placeholder*="טלפון"], input[placeholder*="נייד"], input[inputmode="tel"]',
-        ) as HTMLInputElement | null;
+      const isCookieYes = (el: Element): boolean =>
+        Boolean(el.closest('[class*="cky-"], #cky-consent, .cky-modal'));
+      const isVis = (el: Element): boolean => {
+        if (isCookieYes(el)) return false;
+        const r = el.getBoundingClientRect();
+        if (r.width <= 0 || r.height <= 0) return false;
+        const s = window.getComputedStyle(el);
+        return s.display !== 'none' && s.visibility !== 'hidden' && Number(s.opacity) > 0;
+      };
 
-      if (findPhoneInput()) return 'already_open';
+      const findVisiblePhoneInput = () =>
+        Array.from(
+          document.querySelectorAll(
+            'input[type="tel"], input[name*="phone" i], input[placeholder*="טלפון"], input[placeholder*="נייד"], input[inputmode="tel"]',
+          ),
+        ).find((el) => isVis(el)) as HTMLInputElement | undefined;
+
+      if (findVisiblePhoneInput()) return 'already_open';
 
       const els = Array.from(
         document.querySelectorAll('button, a, [role="button"], span, div'),
-      );
-      const loginTrigger = els.find((el) => {
-        const t = (el.textContent ?? '').trim();
-        return (
-          t.length <= 35 &&
-          (t.includes('להתחברות') ||
-            t === 'התחברות' ||
-            t === 'כניסה' ||
-            t.includes('שלום אורח'))
-        );
-      }) as HTMLElement | undefined;
+      )
+        .filter((el) => {
+          if (!isVis(el)) return false;
+          const t = (el.textContent ?? '').trim();
+          return (
+            t.length > 0 &&
+            t.length <= 35 &&
+            (t.includes('להתחברות') ||
+              t === 'התחברות' ||
+              t === 'כניסה' ||
+              t.includes('שלום אורח'))
+          );
+        })
+        .sort((a, b) => a.querySelectorAll('*').length - b.querySelectorAll('*').length) as HTMLElement[];
 
-      if (loginTrigger) {
-        loginTrigger.click();
+      if (els.length > 0) {
+        els[0]!.click();
         return 'clicked_login';
       }
       return 'not_found';
@@ -1304,37 +1364,94 @@ export class VictoryClient implements StoreClient {
       );
     }
 
+    // Tag the visible phone input so we can type with real Puppeteer keyboard events
+    const taggedPhone = await page.evaluate(() => {
+      const isCookieYes = (el: Element): boolean =>
+        Boolean(el.closest('[class*="cky-"], #cky-consent, .cky-modal'));
+      const isVis = (el: Element): boolean => {
+        if (isCookieYes(el)) return false;
+        const r = el.getBoundingClientRect();
+        if (r.width <= 0 || r.height <= 0) return false;
+        const s = window.getComputedStyle(el);
+        return s.display !== 'none' && s.visibility !== 'hidden' && Number(s.opacity) > 0;
+      };
+      const inp = Array.from(
+        document.querySelectorAll(
+          'input[type="tel"], input[name*="phone" i], input[placeholder*="טלפון"], input[placeholder*="נייד"], input[inputmode="tel"]',
+        ),
+      ).find((el) => isVis(el)) as HTMLInputElement | undefined;
+      if (!inp) return false;
+      inp.setAttribute('data-bot-victory-phone', '1');
+      inp.focus();
+      return true;
+    });
+
+    if (!taggedPhone) {
+      await this.logDomDiagnostics('otp-no-phone-input');
+      await this.captureLoginDiagnosticScreenshot('otp-no-phone-input');
+      throw new Error(
+        'לא נמצא שדה הזנת מספר טלפון באתר ויקטורי אונליין. נסו שוב בעוד רגע.',
+      );
+    }
+
+    const phoneEl = await page.$('input[data-bot-victory-phone="1"]');
+    if (phoneEl) {
+      await phoneEl.click({ count: 3 }).catch(() => {});
+      await page.keyboard.press('Backspace').catch(() => {});
+      await page.keyboard.type(cleanPhone, { delay: 45 });
+    }
+
     const submitted = await page.evaluate((phone: string) => {
+      const isCookieYes = (el: Element): boolean =>
+        Boolean(el.closest('[class*="cky-"], #cky-consent, .cky-modal'));
+      const isVis = (el: Element): boolean => {
+        if (isCookieYes(el)) return false;
+        const r = el.getBoundingClientRect();
+        if (r.width <= 0 || r.height <= 0) return false;
+        const s = window.getComputedStyle(el);
+        return s.display !== 'none' && s.visibility !== 'hidden' && Number(s.opacity) > 0;
+      };
+
       const inp = document.querySelector(
-        'input[type="tel"], input[name*="phone" i], input[placeholder*="טלפון"], input[placeholder*="נייד"], input[inputmode="tel"]',
+        'input[data-bot-victory-phone="1"]',
       ) as HTMLInputElement | null;
       if (!inp) return { ok: false, reason: 'no_phone_input' };
+      inp.removeAttribute('data-bot-victory-phone');
 
-      inp.focus();
-      const setter = Object.getOwnPropertyDescriptor(
-        HTMLInputElement.prototype,
-        'value',
-      )?.set;
-      if (setter) setter.call(inp, phone);
-      else inp.value = phone;
-      inp.dispatchEvent(new Event('input', { bubbles: true }));
-      inp.dispatchEvent(new Event('change', { bubbles: true }));
+      if (inp.value.replace(/\D/g, '') !== phone) {
+        const setter = Object.getOwnPropertyDescriptor(
+          HTMLInputElement.prototype,
+          'value',
+        )?.set;
+        if (setter) setter.call(inp, phone);
+        else inp.value = phone;
+        inp.dispatchEvent(new Event('input', { bubbles: true }));
+        inp.dispatchEvent(new Event('change', { bubbles: true }));
+      }
 
       const scope =
-        inp.closest('form') ?? inp.closest('[role="dialog"]') ?? document;
+        inp.closest('form') ??
+        inp.closest('[role="dialog"], [aria-modal="true"]') ??
+        inp.parentElement?.parentElement?.parentElement ??
+        document;
+      const buttons = Array.from(scope.querySelectorAll('button')).filter(
+        (b) => isVis(b) && !b.disabled,
+      );
       const sendBtn =
-        (Array.from(scope.querySelectorAll('button')).find((b) => {
+        (buttons.find((b) => {
           const t = (b.textContent ?? '').trim();
           return (
+            t.length > 0 &&
             t.length <= 30 &&
             (t.includes('שלח') ||
               t.includes('קבל קוד') ||
               t.includes('המשך') ||
               t.includes('התחברות') ||
-              t.includes('כניסה'))
+              t.includes('כניסה') ||
+              t.includes('אישור'))
           );
         }) as HTMLElement | undefined) ??
-        (scope.querySelector('button[type="submit"]') as HTMLElement | null);
+        (buttons.find((b) => b.type === 'submit') as HTMLElement | undefined);
 
       if (sendBtn) {
         sendBtn.click();
@@ -1344,6 +1461,7 @@ export class VictoryClient implements StoreClient {
     }, cleanPhone);
 
     if (!submitted.ok) {
+      await this.logDomDiagnostics('otp-submit-failed');
       await this.captureLoginDiagnosticScreenshot('otp-no-phone-input');
       throw new Error(
         'לא נמצא שדה הזנת מספר טלפון באתר ויקטורי אונליין. נסו שוב בעוד רגע.',
@@ -1378,93 +1496,289 @@ export class VictoryClient implements StoreClient {
 
     logger.info('Submitting SMS OTP verification for Victory Online...');
 
-    const fillResult = await this.page.evaluate((code: string) => {
-      const dialog =
-        document.querySelector('[role="dialog"], [class*="modal" i]') ??
-        document;
-      const setter = Object.getOwnPropertyDescriptor(
-        HTMLInputElement.prototype,
-        'value',
-      )?.set;
-
-      const setVal = (inp: HTMLInputElement, val: string) => {
-        inp.focus();
-        if (setter) setter.call(inp, val);
-        else inp.value = val;
-        inp.dispatchEvent(new Event('input', { bubbles: true }));
-        inp.dispatchEvent(new Event('change', { bubbles: true }));
-      };
-
-      // 1. Multi-box OTP inputs (one digit per box)
-      const digitBoxes = Array.from(
-        dialog.querySelectorAll(
-          'input[maxlength="1"], [class*="otp" i] input, [data-testid*="otp" i] input',
-        ),
-      ).filter((el) => {
-        const inp = el as HTMLInputElement;
-        return inp.offsetParent !== null && !inp.disabled;
-      }) as HTMLInputElement[];
-
-      if (digitBoxes.length >= code.length && digitBoxes.length <= 8) {
-        digitBoxes.forEach((inp, idx) => {
-          setVal(inp, code[idx] ?? '');
-        });
-      } else {
-        // 2. Single OTP input
-        const inp = dialog.querySelector(
-          'input[placeholder*="קוד"], input[name*="otp" i], input[name*="code" i], input[autocomplete="one-time-code"], input[inputmode="numeric"], input[type="tel"]',
-        ) as HTMLInputElement | null;
-        if (!inp) return { ok: false, reason: 'no_otp_input' };
-        setVal(inp, code);
-      }
-
-      const verifyBtn =
-        (Array.from(dialog.querySelectorAll('button')).find((b) => {
-          const t = (b.textContent ?? '').trim();
+    // Locate visible OTP input(s) while explicitly ignoring hidden CookieYes .cky-modal and product search bar!
+    const locateOtpInputs = async () =>
+      this.page!.evaluate((codeLen: number) => {
+        const isCookieYes = (el: Element): boolean =>
+          Boolean(el.closest('[class*="cky-"], #cky-consent, .cky-modal'));
+        const isVis = (el: Element): boolean => {
+          if (isCookieYes(el)) return false;
+          const r = el.getBoundingClientRect();
+          if (r.width <= 0 || r.height <= 0) return false;
+          const s = window.getComputedStyle(el);
           return (
-            t.length <= 30 &&
-            (t.includes('אמת') ||
-              t.includes('אימות') ||
-              t.includes('התחברות') ||
-              t === 'כניסה' ||
-              t === 'אישור' ||
-              t === 'המשך')
+            s.display !== 'none' &&
+            s.visibility !== 'hidden' &&
+            Number(s.opacity) > 0
           );
-        }) as HTMLElement | undefined) ??
-        (dialog.querySelector('button[type="submit"]') as HTMLElement | null);
+        };
+        const isSearchInput = (i: HTMLInputElement): boolean => {
+          const p = (i.placeholder ?? '').toLowerCase();
+          const a = (i.getAttribute('aria-label') ?? '').toLowerCase();
+          return (
+            i.type === 'search' ||
+            p.includes('חיפוש') ||
+            p.includes('חפש') ||
+            p.includes('search') ||
+            a.includes('חיפוש') ||
+            a.includes('search')
+          );
+        };
 
-      if (verifyBtn) {
-        verifyBtn.click();
-        return { ok: true, reason: 'clicked_verify' };
-      }
-      return { ok: true, reason: 'enter_fallback' };
-    }, cleanCode);
+        // Clean previous markers
+        for (const el of Array.from(
+          document.querySelectorAll('[data-bot-victory-otp]'),
+        )) {
+          el.removeAttribute('data-bot-victory-otp');
+        }
 
-    if (!fillResult.ok) {
+        // Find the topmost actually visible non-CookieYes dialog/modal if one exists
+        const visibleDialogs = Array.from(
+          document.querySelectorAll(
+            '[role="dialog"], [aria-modal="true"], [class*="modal" i], [class*="dialog" i], [class*="popup" i], [class*="drawer" i]',
+          ),
+        ).filter((d) => {
+          if (!isVis(d)) return false;
+          const r = d.getBoundingClientRect();
+          return r.width > 180 && r.height > 100;
+        });
+
+        const collectInputs = (root: ParentNode) =>
+          Array.from(root.querySelectorAll('input')).filter(
+            (i) =>
+              isVis(i) &&
+              !i.disabled &&
+              !['hidden', 'checkbox', 'radio', 'submit', 'button', 'file'].includes(
+                i.type,
+              ) &&
+              !isSearchInput(i),
+          );
+
+        let inputs: HTMLInputElement[] = [];
+        for (let idx = visibleDialogs.length - 1; idx >= 0; idx--) {
+          const found = collectInputs(visibleDialogs[idx]!);
+          if (found.length > 0) {
+            inputs = found;
+            break;
+          }
+        }
+        if (inputs.length === 0) {
+          inputs = collectInputs(document);
+        }
+
+        if (inputs.length === 0) {
+          return { mode: 'none' as const, count: 0 };
+        }
+
+        // 1. Multi-box OTP inputs (one digit per box — Tailwind boxes often omit maxlength or class="otp"!)
+        const digitBoxes = inputs.filter((i) => {
+          const w = i.getBoundingClientRect().width;
+          const cls = (i.className ?? '').toLowerCase();
+          const parentCls = (i.parentElement?.className ?? '').toLowerCase();
+          return (
+            i.maxLength === 1 ||
+            w <= 95 ||
+            cls.includes('otp') ||
+            parentCls.includes('otp') ||
+            i.autocomplete === 'one-time-code'
+          );
+        });
+
+        // Also detect N identical sibling inputs inside the same parent (typical React OTP boxes)
+        let boxGroup: HTMLInputElement[] | null = null;
+        if (digitBoxes.length >= codeLen && digitBoxes.length <= 8) {
+          boxGroup = digitBoxes.slice(0, codeLen);
+        } else if (inputs.length >= codeLen && inputs.length <= 8) {
+          boxGroup = inputs.slice(0, codeLen);
+        }
+
+        if (boxGroup && boxGroup.length === codeLen) {
+          boxGroup.forEach((b, idx) => {
+            b.setAttribute('data-bot-victory-otp', String(idx));
+          });
+          return { mode: 'multi' as const, count: codeLen };
+        }
+
+        // 2. Single OTP input
+        const scored = inputs
+          .map((i) => {
+            const sig = `${i.type} ${i.inputMode} ${i.name} ${i.id} ${i.placeholder} ${i.autocomplete} ${i.getAttribute('aria-label') ?? ''}`.toLowerCase();
+            let score = 0;
+            if (/one-time-code|otp|code|verify|sms|pin|קוד|אימות|ספרות/.test(sig)) {
+              score += 10;
+            }
+            if (i.inputMode === 'numeric' || i.type === 'tel' || i.type === 'number') {
+              score += 5;
+            }
+            return { i, score };
+          })
+          .sort((a, b) => b.score - a.score);
+
+        const single = scored[0]?.i;
+        if (!single) return { mode: 'none' as const, count: 0 };
+        single.setAttribute('data-bot-victory-otp', 'single');
+        return { mode: 'single' as const, count: 1 };
+      }, cleanCode.length);
+
+    // Retry briefly in case the OTP modal is still animating in
+    let locateResult = await locateOtpInputs();
+    for (let retry = 0; retry < 6 && locateResult.mode === 'none'; retry++) {
+      await new Promise((r) => setTimeout(r, 500));
+      locateResult = await locateOtpInputs();
+    }
+
+    if (locateResult.mode === 'none') {
+      await this.logDomDiagnostics('otp-no-code-input');
       await this.captureLoginDiagnosticScreenshot('otp-no-code-input');
       throw new Error(
         'לא נמצא שדה הזנת קוד SMS באתר ויקטורי אונליין. נסו להתחיל שוב עם /login_victory.',
       );
     }
 
-    if (fillResult.reason === 'enter_fallback') {
+    if (locateResult.mode === 'multi') {
+      const firstBox = await this.page.$('input[data-bot-victory-otp="0"]');
+      if (firstBox) {
+        await firstBox.click().catch(() => {});
+        await this.page.keyboard.type(cleanCode, { delay: 80 });
+      }
+      // Verify every box got its digit (in case the React component doesn't auto-advance focus)
+      for (let i = 0; i < cleanCode.length; i++) {
+        const ch = cleanCode[i]!;
+        const box = await this.page.$(`input[data-bot-victory-otp="${i}"]`);
+        if (!box) continue;
+        const currentVal = await box
+          .evaluate((el) => (el as HTMLInputElement).value)
+          .catch(() => '');
+        if (currentVal !== ch) {
+          await box.click({ count: 3 }).catch(() => {});
+          await this.page.keyboard.type(ch, { delay: 45 });
+          await box.evaluate((el, digit) => {
+            const inp = el as HTMLInputElement;
+            if (inp.value !== digit) {
+              const setter = Object.getOwnPropertyDescriptor(
+                HTMLInputElement.prototype,
+                'value',
+              )?.set;
+              if (setter) setter.call(inp, digit);
+              else inp.value = digit;
+              inp.dispatchEvent(new Event('input', { bubbles: true }));
+              inp.dispatchEvent(new Event('change', { bubbles: true }));
+            }
+          }, ch);
+        }
+      }
+    } else {
+      const singleEl = await this.page.$(
+        'input[data-bot-victory-otp="single"]',
+      );
+      if (singleEl) {
+        await singleEl.click({ count: 3 }).catch(() => {});
+        await this.page.keyboard.press('Backspace').catch(() => {});
+        await this.page.keyboard.type(cleanCode, { delay: 50 });
+        await singleEl.evaluate((el, code) => {
+          const inp = el as HTMLInputElement;
+          if (inp.value !== code) {
+            const setter = Object.getOwnPropertyDescriptor(
+              HTMLInputElement.prototype,
+              'value',
+            )?.set;
+            if (setter) setter.call(inp, code);
+            else inp.value = code;
+            inp.dispatchEvent(new Event('input', { bubbles: true }));
+            inp.dispatchEvent(new Event('change', { bubbles: true }));
+          }
+        }, cleanCode);
+      }
+    }
+
+    // Wait briefly in case React auto-submits once the final digit is typed
+    await new Promise((r) => setTimeout(r, 800));
+
+    const clickedVerify = await this.page.evaluate(() => {
+      const isCookieYes = (el: Element): boolean =>
+        Boolean(el.closest('[class*="cky-"], #cky-consent, .cky-modal'));
+      const isVis = (el: Element): boolean => {
+        if (isCookieYes(el)) return false;
+        const r = el.getBoundingClientRect();
+        if (r.width <= 0 || r.height <= 0) return false;
+        const s = window.getComputedStyle(el);
+        return (
+          s.display !== 'none' &&
+          s.visibility !== 'hidden' &&
+          Number(s.opacity) > 0
+        );
+      };
+
+      const otpInput = document.querySelector('[data-bot-victory-otp]');
+      const scope =
+        otpInput?.closest('form') ??
+        otpInput?.closest('[role="dialog"], [aria-modal="true"]') ??
+        otpInput?.parentElement?.parentElement?.parentElement ??
+        document;
+
+      const btns = Array.from(scope.querySelectorAll('button')).filter(
+        (b) => isVis(b) && !b.disabled,
+      );
+      const verifyBtn =
+        (btns.find((b) => {
+          const t = (b.textContent ?? '').trim();
+          if (t.includes('שלח שוב') || t.includes('קוד חדש') || t.includes('שנה מספר')) {
+            return false;
+          }
+          return (
+            t.length > 0 &&
+            t.length <= 30 &&
+            (t.includes('אמת') ||
+              t.includes('אימות') ||
+              t.includes('התחברות') ||
+              t.includes('התחבר') ||
+              t === 'כניסה' ||
+              t === 'אישור' ||
+              t === 'המשך' ||
+              t === 'שלח')
+          );
+        }) as HTMLElement | undefined) ??
+        (btns.find((b) => b.type === 'submit') as HTMLElement | undefined);
+
+      if (verifyBtn) {
+        verifyBtn.click();
+        return true;
+      }
+      return false;
+    });
+
+    if (!clickedVerify) {
       await this.page.keyboard.press('Enter').catch(() => {});
     }
 
-    await new Promise((r) => setTimeout(r, 4500));
+    // Poll up to 7 seconds for login to finish ("שלום אורח" disappears or OTP inputs disappear)
+    let verifyState = { stillGuest: true, otpStillVisible: true };
+    for (let attempt = 0; attempt < 14; attempt++) {
+      await new Promise((r) => setTimeout(r, 500));
+      verifyState = await this.page.evaluate(() => {
+        const isCookieYes = (el: Element): boolean =>
+          Boolean(el.closest('[class*="cky-"], #cky-consent, .cky-modal'));
+        const isVis = (el: Element): boolean => {
+          if (isCookieYes(el)) return false;
+          const r = el.getBoundingClientRect();
+          if (r.width <= 0 || r.height <= 0) return false;
+          const s = window.getComputedStyle(el);
+          return s.display !== 'none' && s.visibility !== 'hidden' && Number(s.opacity) > 0;
+        };
+        const bodyText = document.body?.innerText ?? '';
+        const stillGuest = bodyText.includes('שלום אורח');
+        const otpStillVisible = Array.from(
+          document.querySelectorAll('[data-bot-victory-otp]'),
+        ).some((el) => isVis(el));
+        return { stillGuest, otpStillVisible };
+      });
+      if (!verifyState.stillGuest || !verifyState.otpStillVisible) {
+        break;
+      }
+    }
 
-    const verifyState = await this.page.evaluate(() => {
-      const bodyText = document.body?.innerText ?? '';
-      const stillGuest = bodyText.includes('שלום אורח');
-      const dialogStillOpen = Boolean(
-        document.querySelector(
-          '[role="dialog"] input[placeholder*="קוד"], [role="dialog"] input[autocomplete="one-time-code"]',
-        ),
-      );
-      return { stillGuest, dialogStillOpen };
-    });
-
-    if (verifyState.stillGuest && verifyState.dialogStillOpen) {
+    if (verifyState.stillGuest && verifyState.otpStillVisible) {
+      await this.logDomDiagnostics('otp-verify-failed');
       await this.captureLoginDiagnosticScreenshot('otp-verify-failed');
       throw new Error(
         'אימות קוד ה-SMS בוויקטורי אונליין לא הושלם (ייתכן שהקוד שגוי או פג תוקפו). נסו שוב עם /login_victory.',

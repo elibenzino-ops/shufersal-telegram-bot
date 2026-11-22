@@ -1491,6 +1491,64 @@ export class SelfPointClient implements StoreClient {
     }
   }
 
+  private async logDomDiagnostics(tag: string): Promise<void> {
+    if (!this.page || this.page.isClosed()) return;
+    try {
+      const diag = await this.page.evaluate(() => {
+        const isVis = (el: Element): boolean => {
+          const r = el.getBoundingClientRect();
+          if (r.width <= 0 || r.height <= 0) return false;
+          const s = window.getComputedStyle(el);
+          return s.display !== 'none' && s.visibility !== 'hidden' && Number(s.opacity) > 0;
+        };
+        const inputs = Array.from(document.querySelectorAll('input'))
+          .filter((i) => isVis(i))
+          .slice(0, 12)
+          .map((i) => ({
+            type: i.type,
+            name: i.name || undefined,
+            id: i.id || undefined,
+            placeholder: i.placeholder || undefined,
+            ngModel: i.getAttribute('ng-model') || undefined,
+            ariaLabel: i.getAttribute('aria-label') || undefined,
+            maxLength: i.maxLength > 0 && i.maxLength < 100 ? i.maxLength : undefined,
+            w: Math.round(i.getBoundingClientRect().width),
+          }));
+        const loginLike = Array.from(
+          document.querySelectorAll('button, a, [role="button"], [ng-click]'),
+        )
+          .filter((el) => {
+            const t = (el.textContent ?? '').trim();
+            const ng = el.getAttribute('ng-click') ?? '';
+            return (
+              /כניס|התחבר|תפריט|שלח|אמת|קוד|אישור|המשך/.test(t) ||
+              /login|verif|auth|menu|otp|send/i.test(ng)
+            );
+          })
+          .slice(0, 15)
+          .map((el) => ({
+            tag: el.tagName,
+            text: (el.textContent ?? '').trim().slice(0, 35),
+            ngClick: el.getAttribute('ng-click')?.slice(0, 50) || undefined,
+            vis: isVis(el),
+          }));
+        const hasAngular = Boolean(
+          (window as unknown as { angular?: unknown }).angular,
+        );
+        return {
+          url: window.location.href,
+          title: document.title,
+          hasAngular,
+          visibleInputs: inputs,
+          loginLike,
+        };
+      });
+      logger.info(`${this.storeId} DOM diagnostics (${tag}): ${JSON.stringify(diag)}`);
+    } catch {
+      // ignore diagnostic errors
+    }
+  }
+
   async startSmsOtpLogin(phoneNumber: string): Promise<{ message: string }> {
     const cleanPhone = normalizeIsraeliPhone(phoneNumber);
     if (!cleanPhone) {
@@ -1502,11 +1560,22 @@ export class SelfPointClient implements StoreClient {
     const page = await this.ensureOtpBrowserPage();
     logger.info(`Starting SMS OTP login flow for ${this.meta.displayName}...`);
 
-    await page.goto(`${this.baseUrl}/?loginOrRegister=1`, {
+    await page.goto(`${this.baseUrl}/`, {
       waitUntil: 'domcontentloaded',
       timeout: NAVIGATION_TIMEOUT,
     });
-    await new Promise((r) => setTimeout(r, 2000));
+
+    // Wait for Prutah AngularJS SPA to bootstrap
+    await page
+      .waitForFunction(
+        () => {
+          const ang = (window as unknown as { angular?: { element: (el: Element) => { injector?: () => unknown } } }).angular;
+          return Boolean(ang && ang.element(document.body)?.injector?.());
+        },
+        { timeout: 12_000 },
+      )
+      .catch(() => null);
+    await new Promise((r) => setTimeout(r, 1500));
 
     const gateDetected = await page.evaluate(() => {
       const html = document.documentElement?.innerHTML?.toLowerCase() ?? '';
@@ -1527,85 +1596,366 @@ export class SelfPointClient implements StoreClient {
       );
     }
 
-    // Open verification/login modal if phone input isn't visible yet
-    const openResult = await page.evaluate(() => {
-      const findPhoneInput = () =>
-        document.querySelector(
-          '[ng-model*="phone" i], input[type="tel"], input[name*="phone" i], input[placeholder*="טלפון"], input[placeholder*="נייד"]',
-        ) as HTMLInputElement | null;
+    // Helper: check if a visible login/phone input is already on screen
+    const hasVisiblePhoneInput = async (): Promise<boolean> =>
+      page.evaluate(() => {
+        const isVis = (el: Element): boolean => {
+          const r = el.getBoundingClientRect();
+          if (r.width <= 0 || r.height <= 0) return false;
+          const s = window.getComputedStyle(el);
+          return s.display !== 'none' && s.visibility !== 'hidden' && Number(s.opacity) > 0;
+        };
+        const isSearch = (i: HTMLInputElement): boolean => {
+          const p = (i.placeholder ?? '').toLowerCase();
+          const n = (i.name ?? '').toLowerCase();
+          const ng = (i.getAttribute('ng-model') ?? '').toLowerCase();
+          return (
+            i.type === 'search' ||
+            p.includes('חיפוש') ||
+            p.includes('חפש') ||
+            p.includes('search') ||
+            n.includes('search') ||
+            ng.includes('search') ||
+            ng.includes('query')
+          );
+        };
+        const modal = Array.from(
+          document.querySelectorAll(
+            '.modal, [role="dialog"], [aria-modal="true"], [ng-controller*="Verification" i], [ng-controller*="Login" i], [class*="modal" i], [class*="popup" i], [class*="dialog" i]',
+          ),
+        ).find((m) => isVis(m) && m.getBoundingClientRect().width > 180);
 
-      if (findPhoneInput()) return 'already_open';
-
-      const directTrigger = document.querySelector(
-        '.user-verification-btn, [ng-click*="openVerification"], [ng-click*="login"], .login-btn',
-      ) as HTMLElement | null;
-      if (directTrigger) {
-        directTrigger.click();
-        return 'clicked_selector';
-      }
-
-      const candidates = Array.from(
-        document.querySelectorAll('button, a, [role="button"], span, div'),
-      );
-      const loginEl = candidates.find((el) => {
-        const t = (el.textContent ?? '').trim();
-        return (
-          t.length <= 30 &&
-          (t === 'התחברות' ||
-            t === 'כניסה' ||
-            t.includes('התחברות') ||
-            t.includes('כניסת משתמש') ||
-            t.includes('להתחברות'))
+        const scope: ParentNode = modal ?? document;
+        const inputs = Array.from(scope.querySelectorAll('input')).filter(
+          (i) =>
+            isVis(i) &&
+            !i.disabled &&
+            !['hidden', 'checkbox', 'radio', 'submit', 'button', 'file', 'password'].includes(i.type) &&
+            !isSearch(i),
         );
-      }) as HTMLElement | undefined;
-      if (loginEl) {
-        loginEl.click();
-        return 'clicked_text';
-      }
-      return 'not_found';
-    });
+        if (modal && inputs.length > 0) return true;
+        return inputs.some((i) => {
+          const sig = `${i.type} ${i.name} ${i.id} ${i.placeholder} ${i.getAttribute('ng-model') ?? ''} ${i.getAttribute('aria-label') ?? ''}`.toLowerCase();
+          return /phone|mobile|cell|tel|טלפון|נייד|פלאפון|סלולר|05/.test(sig);
+        });
+      });
 
-    if (openResult !== 'already_open') {
-      await new Promise((r) => setTimeout(r, 2000));
+    // Try opening the verification/login modal across multiple Prutah UI variants
+    if (!(await hasVisiblePhoneInput())) {
+      // Strategy A: Click visible direct login button ("כניסת משתמש" / "התחברות" / openVerification)
+      const stepA = await page.evaluate(() => {
+        const isVis = (el: Element): boolean => {
+          const r = el.getBoundingClientRect();
+          if (r.width <= 0 || r.height <= 0) return false;
+          const s = window.getComputedStyle(el);
+          return s.display !== 'none' && s.visibility !== 'hidden' && Number(s.opacity) > 0;
+        };
+
+        const directEls = Array.from(
+          document.querySelectorAll(
+            '.user-verification-btn, [ng-click*="openVerification" i], [ng-click*="openLogin" i], [ng-click*="login" i], .login-btn',
+          ),
+        ).filter((el) => isVis(el)) as HTMLElement[];
+        if (directEls.length > 0) {
+          directEls[0]!.click();
+          return 'clicked_direct_visible';
+        }
+
+        // Deepest visible clickable matching Hebrew login label
+        const clickables = Array.from(
+          document.querySelectorAll('button, a, [role="button"], [ng-click], li, span'),
+        ).filter((el) => {
+          if (!isVis(el)) return false;
+          const t = (el.textContent ?? '').trim();
+          return (
+            t.length > 0 &&
+            t.length <= 28 &&
+            (t === 'כניסת משתמש' ||
+              t === 'התחברות' ||
+              t === 'כניסה' ||
+              t === 'להתחברות' ||
+              t.includes('כניסת משתמש') ||
+              t.includes('התחברות'))
+          );
+        }) as HTMLElement[];
+        if (clickables.length > 0) {
+          // Pick innermost (fewest children) to avoid clicking a wrapper container
+          clickables.sort((a, b) => a.querySelectorAll('*').length - b.querySelectorAll('*').length);
+          clickables[0]!.click();
+          return 'clicked_text_visible';
+        }
+        return 'not_visible';
+      });
+
+      if (stepA !== 'not_visible') {
+        await new Promise((r) => setTimeout(r, 2000));
+      }
+    }
+
+    // Strategy B: On Super Haviv Prutah skin, "כניסת משתמש" lives inside the "תפריט" side menu!
+    if (!(await hasVisiblePhoneInput())) {
+      const openedMenu = await page.evaluate(() => {
+        const isVis = (el: Element): boolean => {
+          const r = el.getBoundingClientRect();
+          if (r.width <= 0 || r.height <= 0) return false;
+          const s = window.getComputedStyle(el);
+          return s.display !== 'none' && s.visibility !== 'hidden' && Number(s.opacity) > 0;
+        };
+
+        const menuBtn =
+          (Array.from(
+            document.querySelectorAll(
+              'button, a, [role="button"], [ng-click], span, div',
+            ),
+          )
+            .filter((el) => {
+              if (!isVis(el)) return false;
+              const t = (el.textContent ?? '').trim();
+              const aria = (el.getAttribute('aria-label') ?? '').trim();
+              const cls = (el.className?.toString() ?? '').toLowerCase();
+              const ng = (el.getAttribute('ng-click') ?? '').toLowerCase();
+              return (
+                t === 'תפריט' ||
+                t === 'תפריט צד' ||
+                aria.includes('תפריט') ||
+                cls.includes('hamburger') ||
+                cls.includes('menu-btn') ||
+                ng.includes('togglemenu') ||
+                ng.includes('openmenu') ||
+                ng.includes('sidenav')
+              );
+            })
+            .sort(
+              (a, b) =>
+                a.querySelectorAll('*').length - b.querySelectorAll('*').length,
+            )[0] as HTMLElement | undefined) ?? null;
+
+        if (menuBtn) {
+          menuBtn.click();
+          return true;
+        }
+        return false;
+      });
+
+      if (openedMenu) {
+        await new Promise((r) => setTimeout(r, 1200));
+        await page.evaluate(() => {
+          const isVis = (el: Element): boolean => {
+            const r = el.getBoundingClientRect();
+            if (r.width <= 0 || r.height <= 0) return false;
+            const s = window.getComputedStyle(el);
+            return s.display !== 'none' && s.visibility !== 'hidden' && Number(s.opacity) > 0;
+          };
+          const loginEls = Array.from(
+            document.querySelectorAll('button, a, [role="button"], [ng-click], li, span, div'),
+          )
+            .filter((el) => {
+              if (!isVis(el)) return false;
+              const t = (el.textContent ?? '').trim();
+              return (
+                t.length > 0 &&
+                t.length <= 28 &&
+                (t.includes('כניסת משתמש') ||
+                  t.includes('התחברות') ||
+                  t === 'כניסה')
+              );
+            })
+            .sort(
+              (a, b) =>
+                a.querySelectorAll('*').length - b.querySelectorAll('*').length,
+            ) as HTMLElement[];
+          loginEls[0]?.click();
+        });
+        await new Promise((r) => setTimeout(r, 2000));
+      }
+    }
+
+    // Strategy C: Trigger hidden DOM login button directly via AngularJS click / triggerHandler, or navigate to ?loginOrRegister=1
+    if (!(await hasVisiblePhoneInput())) {
+      const triggeredHidden = await page.evaluate(() => {
+        const candidates = Array.from(
+          document.querySelectorAll(
+            '.user-verification-btn, [ng-click*="openVerification" i], [ng-click*="openLogin" i], [ng-click*="login" i], button, a, li, span, div',
+          ),
+        );
+        const match = candidates
+          .filter((el) => {
+            const t = (el.textContent ?? '').trim();
+            const ng = el.getAttribute('ng-click') ?? '';
+            return (
+              /openVerification|openLogin|loginModal/i.test(ng) ||
+              (t.length > 0 &&
+                t.length <= 25 &&
+                (t === 'כניסת משתמש' || t === 'התחברות'))
+            );
+          })
+          .sort(
+            (a, b) =>
+              a.querySelectorAll('*').length - b.querySelectorAll('*').length,
+          )[0] as HTMLElement | undefined;
+
+        if (match) {
+          match.click();
+          try {
+            const ang = (window as unknown as {
+              angular?: {
+                element: (el: Element) => {
+                  triggerHandler: (ev: string) => void;
+                  scope: () => { $apply?: () => void };
+                };
+              };
+            }).angular;
+            if (ang) {
+              const aEl = ang.element(match);
+              aEl.triggerHandler('click');
+              aEl.scope()?.$apply?.();
+            }
+          } catch {
+            // ignore
+          }
+          return true;
+        }
+        return false;
+      });
+
+      if (triggeredHidden) {
+        await new Promise((r) => setTimeout(r, 2000));
+      }
+    }
+
+    if (!(await hasVisiblePhoneInput())) {
+      await page
+        .goto(`${this.baseUrl}/?loginOrRegister=1`, {
+          waitUntil: 'domcontentloaded',
+          timeout: NAVIGATION_TIMEOUT,
+        })
+        .catch(() => {});
+      await new Promise((r) => setTimeout(r, 3000));
     }
 
     // If modal opened on email/password tab, switch to SMS/OTP tab if present
     await page.evaluate(() => {
+      const isVis = (el: Element): boolean => {
+        const r = el.getBoundingClientRect();
+        if (r.width <= 0 || r.height <= 0) return false;
+        const s = window.getComputedStyle(el);
+        return s.display !== 'none' && s.visibility !== 'hidden' && Number(s.opacity) > 0;
+      };
       const tabEls = Array.from(
-        document.querySelectorAll('button, a, [role="tab"], span, div'),
-      );
-      const otpTab = tabEls.find((el) => {
+        document.querySelectorAll('button, a, [role="tab"], [ng-click], span'),
+      ).filter((el) => {
+        if (!isVis(el)) return false;
         const t = (el.textContent ?? '').trim();
         return (
+          t.length > 0 &&
           t.length <= 40 &&
           (t.includes('קוד חד פעמי') ||
             t.includes('הודעת SMS') ||
             t.includes('באמצעות SMS') ||
+            t.includes('SMS') ||
             t.includes('טלפון נייד'))
         );
-      }) as HTMLElement | undefined;
-      otpTab?.click();
+      }) as HTMLElement[];
+      if (tabEls.length > 0) {
+        tabEls.sort((a, b) => a.querySelectorAll('*').length - b.querySelectorAll('*').length);
+        tabEls[0]!.click();
+      }
+    });
+    await new Promise((r) => setTimeout(r, 800));
+
+    // Locate the visible phone input and tag it so we can type via Puppeteer + AngularJS
+    const foundPhone = await page.evaluate(() => {
+      const isVis = (el: Element): boolean => {
+        const r = el.getBoundingClientRect();
+        if (r.width <= 0 || r.height <= 0) return false;
+        const s = window.getComputedStyle(el);
+        return s.display !== 'none' && s.visibility !== 'hidden' && Number(s.opacity) > 0;
+      };
+      const isSearch = (i: HTMLInputElement): boolean => {
+        const p = (i.placeholder ?? '').toLowerCase();
+        const n = (i.name ?? '').toLowerCase();
+        const ng = (i.getAttribute('ng-model') ?? '').toLowerCase();
+        return (
+          i.type === 'search' ||
+          p.includes('חיפוש') ||
+          p.includes('חפש') ||
+          p.includes('search') ||
+          n.includes('search') ||
+          ng.includes('search') ||
+          ng.includes('query')
+        );
+      };
+
+      const modals = Array.from(
+        document.querySelectorAll(
+          '.modal, [role="dialog"], [aria-modal="true"], [ng-controller*="Verification" i], [ng-controller*="Login" i], [class*="modal" i], [class*="popup" i], [class*="dialog" i]',
+        ),
+      ).filter((m) => isVis(m) && m.getBoundingClientRect().width > 180);
+      const modal = modals[modals.length - 1] ?? null;
+
+      const collect = (root: ParentNode) =>
+        Array.from(root.querySelectorAll('input')).filter(
+          (i) =>
+            isVis(i) &&
+            !i.disabled &&
+            !['hidden', 'checkbox', 'radio', 'submit', 'button', 'file', 'password'].includes(i.type) &&
+            !isSearch(i),
+        );
+
+      const candidates = modal && collect(modal).length > 0 ? collect(modal) : collect(document);
+      const scored = candidates
+        .map((i) => {
+          const sig = `${i.type} ${i.name} ${i.id} ${i.placeholder} ${i.getAttribute('ng-model') ?? ''} ${i.getAttribute('aria-label') ?? ''}`.toLowerCase();
+          let score = 0;
+          if (/phone|mobile|cell|טלפון|נייד|פלאפון|סלולר/.test(sig)) score += 10;
+          if (i.type === 'tel' || i.inputMode === 'tel') score += 8;
+          if (/05/.test(i.placeholder ?? '')) score += 6;
+          if (modal && modal.contains(i)) score += 5;
+          if (i.type === 'number' || i.inputMode === 'numeric') score += 3;
+          return { i, score };
+        })
+        .filter((x) => x.score > 0 || (modal && modal.contains(x.i)))
+        .sort((a, b) => b.score - a.score);
+
+      const chosen = scored[0]?.i ?? null;
+      if (!chosen) return false;
+      chosen.setAttribute('data-bot-otp-phone', '1');
+      chosen.scrollIntoView({ block: 'center' });
+      chosen.focus();
+      return true;
     });
 
-    await page
-      .waitForSelector(
-        '[ng-model*="phone" i], input[type="tel"], input[name*="phone" i], input[placeholder*="טלפון"], input[placeholder*="נייד"]',
-        { timeout: 10_000 },
-      )
-      .catch(() => null);
+    if (!foundPhone) {
+      await this.logDomDiagnostics('otp-no-phone-input');
+      await this.captureLoginDiagnosticScreenshot('otp-no-phone-input');
+      throw new Error(
+        `לא נמצא שדה הזנת מספר טלפון באתר ${this.meta.shortName}. נסו שוב בעוד רגע.`,
+      );
+    }
 
+    // Type using real Puppeteer keyboard events first (works with masks/validators)
+    const phoneEl = await page.$('input[data-bot-otp-phone="1"]');
+    if (phoneEl) {
+      await phoneEl.click({ count: 3 }).catch(() => {});
+      await page.keyboard.press('Backspace').catch(() => {});
+      await page.keyboard.type(cleanPhone, { delay: 45 });
+    }
+
+    // Also sync AngularJS scope model & submit
     const submitted = await page.evaluate((phone: string) => {
       const inp = document.querySelector(
-        '[ng-model*="phone" i], input[type="tel"], input[name*="phone" i], input[placeholder*="טלפון"], input[placeholder*="נייד"]',
+        'input[data-bot-otp-phone="1"]',
       ) as HTMLInputElement | null;
       if (!inp) return { ok: false, reason: 'no_phone_input' };
+      inp.removeAttribute('data-bot-otp-phone');
 
-      inp.focus();
-      inp.value = phone;
+      if (inp.value.replace(/\D/g, '') !== phone) {
+        inp.value = phone;
+      }
       inp.dispatchEvent(new Event('input', { bubbles: true }));
       inp.dispatchEvent(new Event('change', { bubbles: true }));
 
-      // Also update AngularJS scope model if present (Prutah / ZuZ platform)
+      let angularCtrlSendCalled = false;
       try {
         const angularObj = (
           window as unknown as {
@@ -1639,25 +1989,62 @@ export class SelfPointClient implements StoreClient {
               (scope['$apply'] as () => void)();
             }
           }
+
+          // Prutah userVerificationCtrl support
+          const ctrl = scope?.['userVerificationCtrl'] as
+            | { phoneNumber?: string; send?: (p: string) => void }
+            | undefined;
+          if (ctrl && typeof ctrl.send === 'function') {
+            ctrl.phoneNumber = phone;
+            if (typeof scope['$apply'] === 'function') {
+              (scope['$apply'] as () => void)();
+            }
+            ctrl.send(phone);
+            angularCtrlSendCalled = true;
+          }
         }
       } catch {
         // DOM events already dispatched
       }
 
-      const form = inp.closest('form') ?? inp.closest('.modal, [role="dialog"]') ?? document;
-      const buttons = Array.from(form.querySelectorAll('button, input[type="submit"]'));
+      if (angularCtrlSendCalled) {
+        return { ok: true, reason: 'angular_ctrl_send' };
+      }
+
+      const isVis = (el: Element): boolean => {
+        const r = el.getBoundingClientRect();
+        if (r.width <= 0 || r.height <= 0) return false;
+        const s = window.getComputedStyle(el);
+        return s.display !== 'none' && s.visibility !== 'hidden' && Number(s.opacity) > 0;
+      };
+
+      const form =
+        inp.closest('form') ??
+        inp.closest('.modal, [role="dialog"], [class*="modal" i]') ??
+        document;
+      const buttons = Array.from(
+        form.querySelectorAll('button, input[type="submit"], [ng-click]'),
+      ).filter((b) => isVis(b) && !(b as HTMLButtonElement).disabled);
+
       const sendBtn =
         (buttons.find((b) => {
           const t = (b.textContent ?? '').trim();
           return (
-            t.includes('שלח') ||
-            t.includes('קבל קוד') ||
-            t.includes('המשך') ||
-            t.includes('כניסה') ||
-            t.includes('התחבר')
+            t.length > 0 &&
+            t.length <= 30 &&
+            (t.includes('שלח') ||
+              t.includes('קבל קוד') ||
+              t.includes('המשך') ||
+              t.includes('כניסה') ||
+              t.includes('התחבר') ||
+              t.includes('אישור'))
           );
         }) as HTMLElement | undefined) ??
-        (form.querySelector('button[type="submit"], [ng-click*="send"]') as HTMLElement | null);
+        (buttons.find(
+          (b) =>
+            (b as HTMLButtonElement).type === 'submit' ||
+            /send|submit|login|next/i.test(b.getAttribute('ng-click') ?? ''),
+        ) as HTMLElement | undefined);
 
       if (sendBtn) {
         sendBtn.click();
@@ -1667,6 +2054,7 @@ export class SelfPointClient implements StoreClient {
     }, cleanPhone);
 
     if (!submitted.ok) {
+      await this.logDomDiagnostics('otp-submit-failed');
       await this.captureLoginDiagnosticScreenshot('otp-no-phone-input');
       throw new Error(
         `לא נמצא שדה הזנת מספר טלפון באתר ${this.meta.shortName}. נסו שוב בעוד רגע.`,
@@ -1700,171 +2088,297 @@ export class SelfPointClient implements StoreClient {
 
     logger.info(`Submitting SMS OTP verification for ${this.meta.displayName}...`);
 
-    const fillResult = await this.page.evaluate((code: string) => {
-      // 1. Multi-box OTP inputs (one digit per input)
-      const singleDigitInputs = Array.from(
+    // Locate visible OTP input(s) (multi-box or single input)
+    const locateResult = await this.page.evaluate((codeLen: number) => {
+      const isVis = (el: Element): boolean => {
+        const r = el.getBoundingClientRect();
+        if (r.width <= 0 || r.height <= 0) return false;
+        const s = window.getComputedStyle(el);
+        return s.display !== 'none' && s.visibility !== 'hidden' && Number(s.opacity) > 0;
+      };
+      const isSearch = (i: HTMLInputElement): boolean => {
+        const p = (i.placeholder ?? '').toLowerCase();
+        const ng = (i.getAttribute('ng-model') ?? '').toLowerCase();
+        return i.type === 'search' || p.includes('חיפוש') || ng.includes('search');
+      };
+
+      const modals = Array.from(
         document.querySelectorAll(
-          '.otp-input input, input[maxlength="1"], [class*="otp" i] input[type="tel"], [class*="otp" i] input[type="text"]',
+          '.modal, [role="dialog"], [aria-modal="true"], [ng-controller*="Verification" i], [ng-controller*="Login" i], [class*="modal" i], [class*="popup" i], [class*="dialog" i]',
         ),
-      ).filter((el) => {
-        const inp = el as HTMLInputElement;
-        return inp.offsetParent !== null && !inp.disabled;
-      }) as HTMLInputElement[];
+      ).filter((m) => isVis(m) && m.getBoundingClientRect().width > 180);
+      const root: ParentNode = modals[modals.length - 1] ?? document;
 
-      if (singleDigitInputs.length >= code.length && singleDigitInputs.length <= 8) {
-        singleDigitInputs.forEach((inp, idx) => {
-          const ch = code[idx] ?? '';
-          inp.focus();
-          inp.value = ch;
-          inp.dispatchEvent(new Event('input', { bubbles: true }));
-          inp.dispatchEvent(new Event('change', { bubbles: true }));
+      const visibleInputs = Array.from(root.querySelectorAll('input')).filter(
+        (i) =>
+          isVis(i) &&
+          !i.disabled &&
+          !['hidden', 'checkbox', 'radio', 'submit', 'button', 'file'].includes(i.type) &&
+          !isSearch(i),
+      );
+
+      // Clean old markers
+      for (const el of Array.from(document.querySelectorAll('[data-bot-otp-box]'))) {
+        el.removeAttribute('data-bot-otp-box');
+      }
+
+      // 1. Multi-box OTP inputs (one digit per input)
+      const digitBoxes = visibleInputs.filter((i) => {
+        const w = i.getBoundingClientRect().width;
+        const cls = (i.className ?? '').toLowerCase();
+        const parentCls = (i.parentElement?.className ?? '').toLowerCase();
+        return (
+          i.maxLength === 1 ||
+          w <= 90 ||
+          cls.includes('otp') ||
+          parentCls.includes('otp')
+        );
+      });
+      if (digitBoxes.length >= codeLen && digitBoxes.length <= 8) {
+        digitBoxes.slice(0, codeLen).forEach((b, idx) => {
+          b.setAttribute('data-bot-otp-box', String(idx));
         });
-      } else {
-        // 2. Single OTP code input
-        const inp = document.querySelector(
-          '[ng-model*="otp" i], [ng-model*="code" i], input[placeholder*="קוד"], input[name*="otp" i], input[name*="code" i], input[inputmode="numeric"], .modal input[type="tel"]',
-        ) as HTMLInputElement | null;
-        if (!inp) return { ok: false, reason: 'no_otp_input' };
-        inp.focus();
-        inp.value = code;
-        inp.dispatchEvent(new Event('input', { bubbles: true }));
-        inp.dispatchEvent(new Event('change', { bubbles: true }));
-
-        try {
-          const angularObj = (
-            window as unknown as {
-              angular?: {
-                element: (el: Element) => {
-                  scope: () => Record<string, unknown>;
-                };
-              };
-            }
-          ).angular;
-          if (angularObj) {
-            const scope = angularObj.element(inp).scope() as Record<
-              string,
-              unknown
-            >;
-            const ngModel = inp.getAttribute('ng-model') ?? '';
-            if (ngModel && scope) {
-              const parts = ngModel.split('.');
-              let target: Record<string, unknown> = scope;
-              for (let i = 0; i < parts.length - 1; i++) {
-                const p = parts[i]!;
-                if (target[p] && typeof target[p] === 'object') {
-                  target = target[p] as Record<string, unknown>;
-                }
-              }
-              const lastKey = parts[parts.length - 1];
-              if (lastKey) target[lastKey] = code;
-              if (typeof scope['$apply'] === 'function') {
-                (scope['$apply'] as () => void)();
-              }
-            }
-          }
-        } catch {
-          // ignore scope error
-        }
+        return { mode: 'multi' as const, count: codeLen };
       }
 
-      const verifyBtn =
-        (document.querySelector(
-          '.verify-btn, [ng-click*="verify" i], .modal button[type="submit"], [role="dialog"] button[type="submit"]',
-        ) as HTMLElement | null) ??
-        (Array.from(document.querySelectorAll('button')).find((b) => {
-          const t = (b.textContent ?? '').trim();
-          return (
-            t.length <= 25 &&
-            (t.includes('אמת') ||
-              t.includes('אימות') ||
-              t === 'כניסה' ||
-              t === 'התחברות' ||
-              t === 'אישור' ||
-              t === 'המשך')
-          );
-        }) as HTMLElement | undefined) ??
-        null;
+      // 2. Single OTP input
+      const scored = visibleInputs
+        .map((i) => {
+          const sig = `${i.type} ${i.name} ${i.id} ${i.placeholder} ${i.autocomplete} ${i.getAttribute('ng-model') ?? ''} ${i.getAttribute('aria-label') ?? ''}`.toLowerCase();
+          let score = 0;
+          if (/otp|code|verify|sms|one-time|קוד|אימות|ספרות/.test(sig)) score += 10;
+          if (i.inputMode === 'numeric' || i.type === 'tel' || i.type === 'number') score += 5;
+          if (modals.length > 0) score += 4;
+          return { i, score };
+        })
+        .sort((a, b) => b.score - a.score);
 
-      if (verifyBtn) {
-        verifyBtn.click();
-        return { ok: true, reason: 'clicked_verify' };
-      }
-      return { ok: true, reason: 'enter_fallback' };
-    }, cleanCode);
+      const single = scored[0]?.i ?? null;
+      if (!single) return { mode: 'none' as const, count: 0 };
+      single.setAttribute('data-bot-otp-box', 'single');
+      return { mode: 'single' as const, count: 1 };
+    }, cleanCode.length);
 
-    if (!fillResult.ok) {
+    if (locateResult.mode === 'none') {
+      await this.logDomDiagnostics('otp-no-code-input');
       await this.captureLoginDiagnosticScreenshot('otp-no-code-input');
       throw new Error(
         `לא נמצא שדה הזנת קוד SMS באתר ${this.meta.shortName}. נסו להתחיל שוב עם /login_haviv.`,
       );
     }
 
-    if (fillResult.reason === 'enter_fallback') {
+    if (locateResult.mode === 'multi') {
+      const firstBox = await this.page.$('input[data-bot-otp-box="0"]');
+      if (firstBox) {
+        await firstBox.click().catch(() => {});
+        await this.page.keyboard.type(cleanCode, { delay: 75 });
+      }
+      // Verify every box got its digit; fill individually if focus didn't auto-advance
+      for (let i = 0; i < cleanCode.length; i++) {
+        const ch = cleanCode[i]!;
+        const box = await this.page.$(`input[data-bot-otp-box="${i}"]`);
+        if (!box) continue;
+        const currentVal = await box
+          .evaluate((el) => (el as HTMLInputElement).value)
+          .catch(() => '');
+        if (currentVal !== ch) {
+          await box.click({ count: 3 }).catch(() => {});
+          await this.page.keyboard.type(ch, { delay: 40 });
+          await box.evaluate((el, digit) => {
+            const inp = el as HTMLInputElement;
+            if (inp.value !== digit) inp.value = digit;
+            inp.dispatchEvent(new Event('input', { bubbles: true }));
+            inp.dispatchEvent(new Event('change', { bubbles: true }));
+          }, ch);
+        }
+      }
+    } else {
+      const singleEl = await this.page.$('input[data-bot-otp-box="single"]');
+      if (singleEl) {
+        await singleEl.click({ count: 3 }).catch(() => {});
+        await this.page.keyboard.press('Backspace').catch(() => {});
+        await this.page.keyboard.type(cleanCode, { delay: 50 });
+        await singleEl.evaluate((el, code) => {
+          const inp = el as HTMLInputElement;
+          if (inp.value !== code) inp.value = code;
+          inp.dispatchEvent(new Event('input', { bubbles: true }));
+          inp.dispatchEvent(new Event('change', { bubbles: true }));
+          try {
+            const angularObj = (
+              window as unknown as {
+                angular?: {
+                  element: (e: Element) => {
+                    scope: () => Record<string, unknown>;
+                  };
+                };
+              }
+            ).angular;
+            if (angularObj) {
+              const scope = angularObj.element(inp).scope() as Record<
+                string,
+                unknown
+              >;
+              const ngModel = inp.getAttribute('ng-model') ?? '';
+              if (ngModel && scope) {
+                const parts = ngModel.split('.');
+                let target: Record<string, unknown> = scope;
+                for (let i = 0; i < parts.length - 1; i++) {
+                  const p = parts[i]!;
+                  if (target[p] && typeof target[p] === 'object') {
+                    target = target[p] as Record<string, unknown>;
+                  }
+                }
+                const lastKey = parts[parts.length - 1];
+                if (lastKey) target[lastKey] = code;
+                if (typeof scope['$apply'] === 'function') {
+                  (scope['$apply'] as () => void)();
+                }
+              }
+            }
+          } catch {
+            // ignore
+          }
+        }, cleanCode);
+      }
+    }
+
+    await new Promise((r) => setTimeout(r, 600));
+
+    // Click verify button if still visible (some modals auto-submit on last digit)
+    const clickedVerify = await this.page.evaluate(() => {
+      const isVis = (el: Element): boolean => {
+        const r = el.getBoundingClientRect();
+        if (r.width <= 0 || r.height <= 0) return false;
+        const s = window.getComputedStyle(el);
+        return s.display !== 'none' && s.visibility !== 'hidden' && Number(s.opacity) > 0;
+      };
+      const modals = Array.from(
+        document.querySelectorAll(
+          '.modal, [role="dialog"], [aria-modal="true"], [class*="modal" i], [class*="popup" i], [class*="dialog" i]',
+        ),
+      ).filter((m) => isVis(m) && m.getBoundingClientRect().width > 180);
+      const root: ParentNode = modals[modals.length - 1] ?? document;
+
+      const btns = Array.from(
+        root.querySelectorAll('button, input[type="submit"], [ng-click]'),
+      ).filter((b) => isVis(b) && !(b as HTMLButtonElement).disabled);
+
+      const verifyBtn =
+        (btns.find((b) => {
+          const aria = (b.getAttribute('aria-label') ?? '').trim();
+          const cls = (b.className?.toString() ?? '').toLowerCase();
+          const ng = (b.getAttribute('ng-click') ?? '').toLowerCase();
+          return (
+            cls.includes('verify-btn') ||
+            ng.includes('verify') ||
+            aria.includes('אמת')
+          );
+        }) as HTMLElement | undefined) ??
+        (btns.find((b) => {
+          const t = (b.textContent ?? '').trim();
+          if (t.includes('שלח שוב') || t.includes('קוד חדש')) return false;
+          return (
+            t.length > 0 &&
+            t.length <= 28 &&
+            (t.includes('אמת') ||
+              t.includes('אימות') ||
+              t === 'כניסה' ||
+              t === 'התחברות' ||
+              t === 'אישור' ||
+              t === 'המשך' ||
+              t === 'שלח')
+          );
+        }) as HTMLElement | undefined) ??
+        (btns.find((b) => (b as HTMLButtonElement).type === 'submit') as
+          | HTMLElement
+          | undefined);
+
+      if (verifyBtn) {
+        verifyBtn.click();
+        return true;
+      }
+      return false;
+    });
+
+    if (!clickedVerify) {
       await this.page.keyboard.press('Enter').catch(() => {});
     }
 
-    await new Promise((r) => setTimeout(r, 4500));
+    // Poll up to 7 seconds for AngularJS User.session.token to populate
+    let authResult: {
+      token: string | null;
+      userId: string | number | null;
+      verified: boolean;
+      cartId: string | null;
+      branchId: number | null;
+    } | null = null;
 
-    // Dismiss any post-login popup
-    await this.page
-      .evaluate(() => {
-        const okBtn = Array.from(document.querySelectorAll('button')).find(
-          (b) => (b.textContent ?? '').trim() === 'אישור',
-        );
-        okBtn?.click();
-      })
-      .catch(() => {});
+    for (let attempt = 0; attempt < 14; attempt++) {
+      await new Promise((r) => setTimeout(r, 500));
+      // Dismiss any post-login popup
+      await this.page
+        .evaluate(() => {
+          const okBtn = Array.from(document.querySelectorAll('button')).find(
+            (b) => (b.textContent ?? '').trim() === 'אישור',
+          );
+          okBtn?.click();
+        })
+        .catch(() => {});
 
-    const authResult = await this.page.evaluate(() => {
-      try {
-        const angularObj = (
-          window as unknown as {
-            angular?: {
-              element: (el: Element) => {
-                injector: () => { get: (name: string) => Record<string, unknown> };
-              };
-            };
-          }
-        ).angular;
-        if (!angularObj) return null;
-        const injector = angularObj.element(document.body).injector();
-        const User = injector.get('User') as {
-          session?: {
-            token?: string;
-            userId?: string | number;
-            branchId?: number;
-            cartId?: string;
-          };
-          isVerified?: () => boolean;
-        };
-        const Cart = injector.get('Cart') as {
-          serverCartId?: string;
-          id?: string;
-        };
-        let activeBranchId: number | null = null;
+      authResult = await this.page.evaluate(() => {
         try {
-          const Branch = injector.get('Branch') as {
-            current?: { id?: number };
+          const angularObj = (
+            window as unknown as {
+              angular?: {
+                element: (el: Element) => {
+                  injector: () => { get: (name: string) => Record<string, unknown> };
+                };
+              };
+            }
+          ).angular;
+          if (!angularObj) return null;
+          const injector = angularObj.element(document.body).injector();
+          const User = injector.get('User') as {
+            session?: {
+              token?: string;
+              userId?: string | number;
+              branchId?: number;
+              cartId?: string;
+            };
+            isVerified?: () => boolean;
           };
-          if (Branch?.current?.id) activeBranchId = Number(Branch.current.id);
+          const Cart = injector.get('Cart') as {
+            serverCartId?: string;
+            id?: string;
+          };
+          let activeBranchId: number | null = null;
+          try {
+            const Branch = injector.get('Branch') as {
+              current?: { id?: number };
+            };
+            if (Branch?.current?.id) activeBranchId = Number(Branch.current.id);
+          } catch {
+            // optional
+          }
+          return {
+            token: User?.session?.token ?? null,
+            userId: User?.session?.userId ?? null,
+            verified:
+              typeof User?.isVerified === 'function' ? User.isVerified() : false,
+            cartId:
+              Cart?.serverCartId ?? Cart?.id ?? User?.session?.cartId ?? null,
+            branchId: activeBranchId ?? User?.session?.branchId ?? null,
+          };
         } catch {
-          // optional
+          return null;
         }
-        return {
-          token: User?.session?.token ?? null,
-          userId: User?.session?.userId ?? null,
-          verified:
-            typeof User?.isVerified === 'function' ? User.isVerified() : false,
-          cartId:
-            Cart?.serverCartId ?? Cart?.id ?? User?.session?.cartId ?? null,
-          branchId: activeBranchId ?? User?.session?.branchId ?? null,
-        };
-      } catch {
-        return null;
-      }
-    });
+      });
+
+      if (authResult?.token) break;
+    }
 
     if (!authResult?.token) {
+      await this.logDomDiagnostics('otp-verify-failed');
       await this.captureLoginDiagnosticScreenshot('otp-verify-failed');
       throw new Error(
         `אימות קוד ה-SMS ב-${this.meta.shortName} לא הושלם (ייתכן שהקוד שגוי או פג תוקפו). נסו שוב עם /login_haviv.`,
