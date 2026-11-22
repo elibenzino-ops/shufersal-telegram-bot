@@ -334,6 +334,7 @@ export class SelfPointClient implements StoreClient {
   private authFallbackReason: string | null = null;
   private branchDiscoveryAttempted = false;
   private guestCartApiUnsupported = false;
+  private serverCartSynced = false;
   private selectedSlot: DeliverySlot | null = null;
   private readonly knownProducts = new Map<string, CatalogProduct>();
   private readonly trackedCart = new Map<string, TrackedCartEntry>();
@@ -557,6 +558,15 @@ export class SelfPointClient implements StoreClient {
 
     await new Promise((r) => setTimeout(r, 4500));
 
+    // Dismiss any post-login notification/preferences popup (e.g. "אישור")
+    await this.page
+      .evaluate(() => {
+        const btns = Array.from(document.querySelectorAll('button'));
+        const okBtn = btns.find((b) => (b.textContent ?? '').trim() === 'אישור');
+        okBtn?.click();
+      })
+      .catch(() => {});
+
     const authResult = await this.page.evaluate(() => {
       try {
         const angularObj = (
@@ -571,18 +581,35 @@ export class SelfPointClient implements StoreClient {
         if (!angularObj) return null;
         const injector = angularObj.element(document.body).injector();
         const User = injector.get('User') as {
-          session?: { token?: string; userId?: string | number };
+          session?: {
+            token?: string;
+            userId?: string | number;
+            branchId?: number;
+            cartId?: string;
+          };
           isVerified?: () => boolean;
         };
         const Cart = injector.get('Cart') as {
           serverCartId?: string;
+          id?: string;
         };
+        let activeBranchId: number | null = null;
+        try {
+          const Branch = injector.get('Branch') as {
+            current?: { id?: number };
+          };
+          if (Branch?.current?.id) activeBranchId = Number(Branch.current.id);
+        } catch {
+          // Branch service optional
+        }
         return {
           token: User?.session?.token ?? null,
           userId: User?.session?.userId ?? null,
           verified:
             typeof User?.isVerified === 'function' ? User.isVerified() : false,
-          cartId: Cart?.serverCartId ?? null,
+          cartId:
+            Cart?.serverCartId ?? Cart?.id ?? User?.session?.cartId ?? null,
+          branchId: activeBranchId ?? User?.session?.branchId ?? null,
         };
       } catch {
         return null;
@@ -598,14 +625,23 @@ export class SelfPointClient implements StoreClient {
 
     this.token = authResult.token;
     this.userId = authResult.userId ? String(authResult.userId) : null;
+    if (authResult.branchId && authResult.branchId > 0) {
+      this.branchId = Number(authResult.branchId);
+    }
     if (authResult.cartId) {
-      this.cartId = authResult.cartId;
+      this.cartId = String(authResult.cartId);
     }
     this.isGuestSession = false;
 
+    if (!this.cartId && this.userId) {
+      await this.discoverAuthenticatedCartId().catch(() => {});
+    }
+
     const cookies = await this.context.cookies().catch(() => []);
     this.saveSession(cookies);
-    logger.info(`Authenticated to ${this.meta.displayName} successfully`);
+    logger.info(
+      `Authenticated to ${this.meta.displayName} successfully (branch=${this.branchId}, cartId=${this.cartId ?? 'pending'})`,
+    );
   }
 
   private async ensureReady(): Promise<void> {
@@ -997,7 +1033,8 @@ export class SelfPointClient implements StoreClient {
                 isCase: false,
               });
             }
-            await new Promise((r) => setTimeout(r, 1500));
+            // Self-Point Angular Cart auto-saves asynchronously to POST /v2/.../carts/{cartId}
+            await new Promise((r) => setTimeout(r, 3500));
             return {
               serverCartId: Cart.serverCartId ?? null,
               lines: Cart.lines ?? {},
@@ -1010,6 +1047,7 @@ export class SelfPointClient implements StoreClient {
         if (angularCart) {
           if (angularCart.serverCartId) {
             this.cartId = angularCart.serverCartId;
+            this.saveSession();
           }
           const parsed = parseSelfPointCart(
             angularCart as unknown as Record<string, unknown>,
@@ -1017,6 +1055,9 @@ export class SelfPointClient implements StoreClient {
             false,
             this.storeId,
           );
+          if (parsed.items.length > 0 && this.cartId) {
+            this.serverCartSynced = true;
+          }
           if (lines.length === 0 || parsed.items.length >= lines.length) {
             this.syncTrackedFromCartState(parsed);
             return parsed;
@@ -1037,6 +1078,10 @@ export class SelfPointClient implements StoreClient {
       return this.buildTrackedCartState();
     }
 
+    if (!this.isGuestSession && this.token && !this.cartId && this.userId) {
+      await this.discoverAuthenticatedCartId().catch(() => {});
+    }
+
     const targetUrl = this.cartId
       ? `${this.apiBase()}/carts/${encodeURIComponent(this.cartId)}?appId=${APP_ID}&languageId=${LANGUAGE_ID}`
       : `${this.apiBase()}/carts?appId=${APP_ID}&languageId=${LANGUAGE_ID}`;
@@ -1051,6 +1096,9 @@ export class SelfPointClient implements StoreClient {
       const returnedCartId = cartObj['id'] ?? cartObj['cartId'] ?? resp['id'];
       if (returnedCartId) {
         this.cartId = String(returnedCartId);
+        if (!this.isGuestSession) {
+          this.saveSession();
+        }
       }
 
       const parsed = parseSelfPointCart(
@@ -1059,6 +1107,9 @@ export class SelfPointClient implements StoreClient {
         this.isGuestSession,
         this.storeId,
       );
+      if (!this.isGuestSession && (parsed.items.length > 0 || lines.length === 0)) {
+        this.serverCartSynced = true;
+      }
       if (lines.length === 0 || parsed.items.length >= lines.length) {
         this.syncTrackedFromCartState(parsed);
         return parsed;
@@ -1085,11 +1136,78 @@ export class SelfPointClient implements StoreClient {
           `${this.storeId} guest REST cart creation unavailable (${msg}); tracking live cart locally`,
         );
       } else {
+        this.serverCartSynced = false;
         logger.warn(`${this.storeId} REST cart sync fallback used`, err);
       }
     }
 
     return this.buildTrackedCartState();
+  }
+
+  private async discoverAuthenticatedCartId(): Promise<void> {
+    if (!this.token || !this.userId) return;
+    const urls = [
+      `${this.baseUrl}/v2/retailers/${this.retailerId}/users/${encodeURIComponent(this.userId)}/carts?appId=${APP_ID}&languageId=${LANGUAGE_ID}`,
+      `${this.apiBase()}/carts?appId=${APP_ID}&languageId=${LANGUAGE_ID}`,
+    ];
+    for (const url of urls) {
+      try {
+        const resp = await this.httpJson<Record<string, unknown>>(url, {
+          method: 'GET',
+        });
+        const list = Array.isArray(resp['carts'])
+          ? (resp['carts'] as Array<Record<string, unknown>>)
+          : Array.isArray(resp)
+            ? (resp as unknown as Array<Record<string, unknown>>)
+            : [resp];
+        const first = list[0];
+        const id = first?.['id'] ?? first?.['cartId'] ?? first?.['serverCartId'];
+        if (id) {
+          this.cartId = String(id);
+          this.saveSession();
+          logger.info(`Discovered ${this.storeId} server cartId=${this.cartId}`);
+          return;
+        }
+      } catch {
+        // try next URL
+      }
+    }
+  }
+
+  private async tryCreateShopList(cart: CartState): Promise<string | null> {
+    if (this.isGuestSession || !this.token || !this.userId) return null;
+    const products = cart.items
+      .filter((i) => i.inStock && i.quantity > 0)
+      .map((i) => ({
+        productId: Number(i.productCode),
+        quantity: i.quantity,
+        isCase: false,
+      }))
+      .filter((p) => Number.isFinite(p.productId) && p.productId > 0);
+    if (products.length === 0) return null;
+
+    const now = new Date();
+    const dd = String(now.getDate()).padStart(2, '0');
+    const mm = String(now.getMonth() + 1).padStart(2, '0');
+    const yyyy = now.getFullYear();
+    const listName = `בוט קניות ${dd}-${mm}-${yyyy}`;
+
+    try {
+      await this.httpJson(
+        `${this.baseUrl}/retailers/${this.retailerId}/users/${encodeURIComponent(this.userId)}/shopLists?appId=${APP_ID}`,
+        {
+          method: 'POST',
+          body: JSON.stringify({ name: listName, products }),
+        },
+      );
+      logger.info(
+        `Saved ${products.length} items to ${this.storeId} shopping list "${listName}"`,
+      );
+      return listName;
+    } catch (err) {
+      logger.warn(`Failed creating ${this.storeId} shopping list fallback`, err);
+      return null;
+    }
   }
 
   async getCartState(): Promise<CartState> {
@@ -1248,20 +1366,50 @@ export class SelfPointClient implements StoreClient {
         ? `\n⚠️ שימו לב: מינימום הזמנה ב-${this.meta.shortName} הוא ${formatCurrency(minAmount)}.`
         : '';
 
-    if (this.isGuestSession) {
-      throw new StoreManualVerificationRequiredError(
-        this.storeId,
-        'MANUAL_CHECKOUT',
-        `עגלת ${this.meta.shortName} חושבה בסך ${total} (במצב אורח – לא הוגדרו פרטי התחברות ${this.options.envPrefix}_USERNAME/PASSWORD).${minNote}\nהתחברו לאתר ${this.meta.shortName} להשלמת ההזמנה או הגדירו פרטי התחברות ב-.env.`,
-        this.meta.cartUrl,
-      );
+    // If logged in, ensure cart is genuinely persisted to Self-Point server (or saved as a shopList)
+    if (!this.isGuestSession) {
+      if (!this.serverCartSynced) {
+        await this.syncCartToServer().catch(() => {});
+      }
+      if (this.serverCartSynced) {
+        throw new StoreManualVerificationRequiredError(
+          this.storeId,
+          'MANUAL_CHECKOUT',
+          `✅ העגלה שלכם ב-${this.meta.shortName} סונכרנה לחשבון שלכם באתר עם ${cart.items.length} פריטים בסך ${total}!${minNote}\nלהשלמת בחירת חלון המשלוח והתשלום המאובטח לחצו על הקישור הישיר לעגלה:`,
+          this.meta.cartUrl,
+        );
+      }
+      const listName = await this.tryCreateShopList(cart);
+      if (listName) {
+        throw new StoreManualVerificationRequiredError(
+          this.storeId,
+          'MANUAL_CHECKOUT',
+          `✅ נשמרה רשימת קניות "${listName}" עם ${cart.items.length} פריטים (${total}) בחשבון שלכם ב-${this.meta.shortName}!${minNote}\nהיכנסו ל"הרשימות שלי" באתר והוסיפו לסל בלחיצה:`,
+          this.meta.baseUrl,
+        );
+      }
     }
+
+    const previewItems = cart.items.slice(0, 25);
+    const checklist = previewItems
+      .map(
+        (i, idx) =>
+          `${idx + 1}. ${i.productName ?? i.productCode} × ${i.quantity} (${formatCurrency(i.itemPrice)})`,
+      )
+      .join('\n');
+    const moreNote =
+      cart.items.length > previewItems.length
+        ? `\n...ועוד ${cart.items.length - previewItems.length} פריטים`
+        : '';
+    const authHint = this.isGuestSession
+      ? `הבוט רץ כרגע במצב אורח (לא מוגדרים ${this.options.envPrefix}_USERNAME / ${this.options.envPrefix}_PASSWORD ב-.env), ולכן העגלה באתר עצמו נפתחת ריקה.\nכדי שהבוט ימלא אוטומטית את העגלה האמיתית בחשבון שלכם, הגדירו פרטי התחברות ב-.env.`
+      : `לא ניתן היה לסנכרן את העגלה ישירות לחשבון ${this.meta.shortName} (${this.authFallbackReason ?? 'נדרשת התחברות באתר'}).`;
 
     throw new StoreManualVerificationRequiredError(
       this.storeId,
       'MANUAL_CHECKOUT',
-      `העגלה שלכם ב-${this.meta.shortName} מוכנה עם ${cart.items.length} פריטים בסך ${total}!${minNote}\nלהשלמת בחירת חלון המשלוח והתשלום המאובטח לחצו על הקישור הישיר לעגלה:`,
-      this.meta.cartUrl,
+      `📋 סיכום סל ${this.meta.shortName}: ${cart.items.length} פריטים בסך ${total}.${minNote}\n\nℹ️ ${authHint}\n\nרשימת הפריטים להזמנה:\n${checklist}${moreNote}`,
+      this.meta.baseUrl,
     );
   }
 

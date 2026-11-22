@@ -181,6 +181,7 @@ export class GroceryAiService {
     learnedProductCode?: string | null;
     preferredBarcode?: string | null;
     storeName?: string;
+    strictMatch?: boolean;
   }): Promise<ProductSelectionResult> {
     const available = params.candidates.filter(
       (c) => c.inStock && c.purchasable,
@@ -215,7 +216,9 @@ export class GroceryAiService {
       }
     }
 
-    if (available.length === 1) {
+    // In non-strict interactive mode, a single candidate can be accepted directly;
+    // in strictMatch mode (mirroring), always verify relevance so unrelated single hits are rejected.
+    if (available.length === 1 && !params.strictMatch) {
       const only = available[0]!;
       return {
         selected: only,
@@ -245,6 +248,7 @@ export class GroceryAiService {
     const prompt = JSON.stringify(
       {
         store: params.storeName ?? 'סופרמרקט אונליין',
+        strictMatchMode: Boolean(params.strictMatch),
         userRequest: {
           rawText: params.request.rawText,
           searchQuery: params.request.searchQuery,
@@ -258,6 +262,10 @@ export class GroceryAiService {
     );
 
     const storeLabel = params.storeName ?? 'הסופרמרקט';
+    const strictRule = params.strictMatch
+      ? `5. חשוב מאוד (מצב התאמה מדויקת להשוואת סלים): אם אף אחד מהמוצרים ברשימה אינו באמת אותו סוג מוצר שביקש המשתמש (למשל תוצאה מקטגוריה אחרת, מוצר מעובד במקום ירק טרי, או תוצאת חיפוש לא קשורה), החזר selectedCode="NO_MATCH"! עדיף לסמן מוצר כחסר מאשר להוסיף מוצר לא רלוונטי לעגלה.`
+      : `5. אם אף אחד מהמוצרים ברשימה אינו קשור כלל למה שהמשתמש ביקש, החזר selectedCode="NO_MATCH".`;
+
     const systemInstruction = `אתה בוחר את המוצר המדויק ביותר מתוך תוצאות החיפוש של ${storeLabel}.
 כללים:
 1. אם מוצר מסומן ב-isLearnedHouseholdFavorite=true והוא מתאים לבקשה (למשל המשפחה לא ביקשה מותג אחר במפורש), העדף אותו!
@@ -266,7 +274,8 @@ export class GroceryAiService {
 4. התאמת כמות (adjustedQuantity):
    - אם המשתמש ביקש משקל (למשל 0.5 ק"ג עגבניות שרי, unitPreference="WEIGHT"), אבל המוצר הנבחר נמכר לפי יחידה/מארז ארוז של ~500 גרם (sellingMethod="BY_UNIT"), המר את הכמות למספר שלם של יחידות מתאים (למשל 1).
    - אם המוצר נמכר ב-BY_UNIT או BY_PACKAGE, adjustedQuantity חייב להיות מספר שלם >= 1.
-   - אם המוצר נמכר ב-BY_WEIGHT והמשתמש ביקש למשל "4 מלפפונים" (unitPreference="UNIT"), הערך משקל הגיוני בק"ג (למשל 0.5 ק"ג).`;
+   - אם המוצר נמכר ב-BY_WEIGHT והמשתמש ביקש למשל "4 מלפפונים" (unitPreference="UNIT"), הערך משקל הגיוני בק"ג (למשל 0.5 ק"ג).
+${strictRule}`;
 
     try {
       const response = await this.generateWithAutoFallback({
@@ -295,10 +304,36 @@ export class GroceryAiService {
           })
         : null;
 
+      const rawCode = (parsed?.selectedCode ?? '').trim();
+      if (
+        !rawCode ||
+        rawCode.toUpperCase() === 'NO_MATCH' ||
+        rawCode.toUpperCase() === 'NONE' ||
+        rawCode.toLowerCase() === 'null'
+      ) {
+        return {
+          selected: null,
+          adjustedQuantity: params.request.quantity,
+          alternatives: available.slice(0, 4),
+          reason: parsed?.reason ?? 'לא נמצא מוצר תואם ברשת זו',
+        };
+      }
+
       const chosen =
-        available.find((c) => c.code === parsed?.selectedCode) ??
-        available.find((c) => c.code === params.learnedProductCode) ??
-        available[0]!;
+        available.find((c) => c.code === rawCode) ??
+        (params.strictMatch
+          ? undefined
+          : available.find((c) => c.code === params.learnedProductCode) ??
+            available[0]);
+
+      if (!chosen) {
+        return {
+          selected: null,
+          adjustedQuantity: params.request.quantity,
+          alternatives: available.slice(0, 4),
+          reason: parsed?.reason ?? 'לא נמצא מוצר תואם ברשת זו',
+        };
+      }
 
       const rawAdjQty =
         parsed?.adjustedQuantity && parsed.adjustedQuantity > 0
@@ -321,10 +356,20 @@ export class GroceryAiService {
         reason: parsed?.reason,
       };
     } catch (err) {
-      logger.warn('Gemini selectBestProduct failed; using top ranked candidate', err);
-      const fallback =
-        available.find((c) => c.code === params.learnedProductCode) ??
-        available[0]!;
+      logger.warn('Gemini selectBestProduct failed; using fallback candidate check', err);
+      const fallback = this.pickFallbackCandidate(
+        params.request,
+        available,
+        params.learnedProductCode,
+        Boolean(params.strictMatch),
+      );
+      if (!fallback) {
+        return {
+          selected: null,
+          adjustedQuantity: params.request.quantity,
+          alternatives: available.slice(0, 4),
+        };
+      }
       return {
         selected: fallback,
         adjustedQuantity: this.normalizeQuantityForProduct(
@@ -334,6 +379,38 @@ export class GroceryAiService {
         alternatives: available.filter((c) => c.code !== fallback.code).slice(0, 4),
       };
     }
+  }
+
+  private pickFallbackCandidate(
+    request: ParsedGroceryItem,
+    available: CatalogProduct[],
+    learnedProductCode?: string | null,
+    strictMatch = false,
+  ): CatalogProduct | null {
+    const learned = available.find((c) => c.code === learnedProductCode);
+    if (learned) return learned;
+    if (!strictMatch) return available[0] ?? null;
+
+    // In strict fallback (when AI is unavailable), require meaningful token overlap
+    const reqTokens = request.searchQuery
+      .toLowerCase()
+      .replace(/[^\p{L}\p{N}%]+/gu, ' ')
+      .split(/\s+/)
+      .filter((t) => t.length >= 3);
+    if (reqTokens.length === 0) return available[0] ?? null;
+
+    let best: CatalogProduct | null = null;
+    let bestScore = 0;
+    for (const cand of available) {
+      const hay = `${cand.name} ${cand.brandName ?? ''}`.toLowerCase();
+      const hits = reqTokens.filter((t) => hay.includes(t)).length;
+      const ratio = hits / reqTokens.length;
+      if (hits > 0 && ratio > bestScore) {
+        bestScore = ratio;
+        best = cand;
+      }
+    }
+    return bestScore >= 0.4 ? best : null;
   }
 
   private normalizeQuantityForProduct(

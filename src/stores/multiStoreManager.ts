@@ -697,43 +697,58 @@ export class MultiStoreManager {
           if (failedStores.has(targetMgr.storeId)) return;
           const summary = summaryByStore.get(targetMgr.storeId)!;
           try {
-            let candidates: CatalogProduct[] = [];
-
-            // Stage 1: exact barcode search for fast, apples-to-apples SKU matching
-            if (sourceBarcode) {
-              candidates = await targetMgr.search(sourceBarcode, 8).catch((err) => {
-                const errMsg = err instanceof Error ? err.message : String(err);
-                if (errMsg.includes('CAPTCHA') || errMsg.includes('WAF')) {
-                  throw err;
-                }
-                return [];
-              });
-            }
-
+            const learned = this.db.getPreference(displayName, targetMgr.storeId);
             const hasAvailable = (list: CatalogProduct[]) =>
               list.some((c) => c.inStock && c.purchasable);
 
-            // Stage 2+: cleaned Hebrew product name -> short core query -> original name
-            if (!hasAvailable(candidates)) {
+            let selection: Awaited<
+              ReturnType<GroceryAiService['selectBestProduct']>
+            > | null = null;
+
+            // Stage 1: exact barcode search for fast, apples-to-apples SKU matching
+            if (sourceBarcode) {
+              const barcodeCandidates = await targetMgr
+                .search(sourceBarcode, 8)
+                .catch((err) => {
+                  const errMsg = err instanceof Error ? err.message : String(err);
+                  if (errMsg.includes('CAPTCHA') || errMsg.includes('WAF')) {
+                    throw err;
+                  }
+                  return [];
+                });
+              if (hasAvailable(barcodeCandidates)) {
+                selection = await params.ai.selectBestProduct({
+                  request,
+                  candidates: barcodeCandidates,
+                  learnedProductCode: learned?.productCode ?? null,
+                  preferredBarcode: sourceBarcode,
+                  storeName: targetMgr.meta.displayName,
+                  strictMatch: true,
+                });
+              }
+            }
+
+            // Stage 2+: cleaned Hebrew product name -> short core query -> broader 2-word query
+            if (!selection?.selected) {
               for (const q of fallbackQueries) {
                 const found = await targetMgr.search(q, 12);
-                if (hasAvailable(found)) {
-                  candidates = found;
+                if (!hasAvailable(found)) continue;
+                const candidateSelection = await params.ai.selectBestProduct({
+                  request,
+                  candidates: found,
+                  learnedProductCode: learned?.productCode ?? null,
+                  preferredBarcode: sourceBarcode,
+                  storeName: targetMgr.meta.displayName,
+                  strictMatch: true,
+                });
+                if (candidateSelection.selected) {
+                  selection = candidateSelection;
                   break;
                 }
               }
             }
 
-            const learned = this.db.getPreference(displayName, targetMgr.storeId);
-            const selection = await params.ai.selectBestProduct({
-              request,
-              candidates,
-              learnedProductCode: learned?.productCode ?? null,
-              preferredBarcode: sourceBarcode,
-              storeName: targetMgr.meta.displayName,
-            });
-
-            if (!selection.selected) {
+            if (!selection?.selected) {
               summary.missingItems.push(displayName);
               return;
             }

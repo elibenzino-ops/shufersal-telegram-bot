@@ -4,8 +4,8 @@ import path from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import {
+  GroceryAiService,
   extractRecommendedGeminiModel,
-  type GroceryAiService,
   type ParsedGroceryItem,
 } from '../src/ai/groceryAi.js';
 import { renderComparisonHtml } from '../src/bot/telegramBot.js';
@@ -1204,5 +1204,92 @@ describe('rankStoreQuotes & MultiStoreManager', () => {
     const errMsg =
       'ApiError: {"error":{"code":404,"message":"This model models/gemini-2.5-flash is no longer available to new users. Please update your code to use models/gemini-3.8-flash for the latest features and improvements.","status":"NOT_FOUND"}}';
     expect(extractRecommendedGeminiModel(errMsg)).toBe('gemini-3.8-flash');
+  });
+
+  it('rejects irrelevant single/multiple candidates in strictMatch mode when Gemini returns NO_MATCH or fails', async () => {
+    const ai = new GroceryAiService('fake-key', 'gemini-3.8-flash');
+    const unrelatedCandidate: CatalogProduct = {
+      code: '999',
+      storeId: 'super_haviv',
+      barcode: null,
+      name: 'מרק עוף אינסטנט אוסם',
+      brandName: 'אוסם',
+      unitDescription: '400 גרם',
+      sellingMethod: 'BY_UNIT',
+      price: 15.9,
+      formattedPrice: '₪15.90',
+      pricePerUnitText: null,
+      promotionMsg: null,
+      inStock: true,
+      purchasable: true,
+      categoryName: 'מרקים',
+      imageUrl: null,
+    };
+
+    // Mock Gemini returning NO_MATCH even when only 1 candidate exists
+    const mockGenerate = vi.fn(async () => ({
+      text: JSON.stringify({
+        selectedCode: 'NO_MATCH',
+        adjustedQuantity: 1,
+        reason: 'מרק עוף אינו קישוא טרי',
+      }),
+    }));
+    (ai as unknown as { ai: { models: { generateContent: typeof mockGenerate } } }).ai = {
+      models: { generateContent: mockGenerate },
+    };
+
+    const res = await ai.selectBestProduct({
+      request: {
+        rawText: 'קישוא ארוז',
+        searchQuery: 'קישוא ארוז',
+        action: 'set',
+        quantity: 1,
+        unitPreference: 'UNIT',
+      },
+      candidates: [unrelatedCandidate],
+      strictMatch: true,
+    });
+    expect(mockGenerate).toHaveBeenCalledTimes(1);
+    expect(res.selected).toBeNull();
+
+    // Even if Gemini throws an API error, strict fallback rejects unrelated candidate with 0 keyword overlap
+    mockGenerate.mockRejectedValueOnce(new Error('network error'));
+    const fallbackRes = await ai.selectBestProduct({
+      request: {
+        rawText: 'קישוא ארוז',
+        searchQuery: 'קישוא ארוז',
+        action: 'set',
+        quantity: 1,
+        unitPreference: 'UNIT',
+      },
+      candidates: [unrelatedCandidate],
+      strictMatch: true,
+    });
+    expect(fallbackRes.selected).toBeNull();
+  });
+
+  it('returns an itemized shopping checklist on guest Super Haviv checkout instead of linking to an empty /cart', async () => {
+    const mockFetch = vi.fn(async () => jsonResponse({}, 404)) as unknown as typeof fetch;
+    const client = new SuperHavivClient({
+      headless: true,
+      sessionFilePath: path.join(tmpDir, 'haviv-guest.json'),
+      screenshotsDir: tmpDir,
+      fetchFn: mockFetch,
+    });
+
+    await client.setItemsInCart([
+      { productCode: '20230801', quantity: 2, sellingMethod: 'BY_UNIT' },
+    ]);
+
+    try {
+      await client.placeOrder({ removeMissingItems: true });
+      expect.unreachable('Expected StoreManualVerificationRequiredError');
+    } catch (err) {
+      expect(err).toBeInstanceOf(StoreManualVerificationRequiredError);
+      const handoff = err as StoreManualVerificationRequiredError;
+      expect(handoff.message).toContain('מצב אורח');
+      expect(handoff.message).toContain('רשימת הפריטים להזמנה');
+      expect(handoff.actionUrl).toBe('https://www.superhaviv.co.il');
+    }
   });
 });

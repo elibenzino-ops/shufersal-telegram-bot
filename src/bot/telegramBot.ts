@@ -1471,6 +1471,7 @@ export function createTelegramBot(deps: CreateTelegramBotDeps): Bot {
       : undefined;
 
     const summaryHtml = renderCartSummaryHtml(mgr.meta, cart, selectedSlot);
+    const isGuestNoSync = Boolean(cart.isGuestSession && !mgr.meta.supportsAutoCheckout);
     const modeNote = cart.orderInUpdateMode
       ? `\n\n📌 <b>פעולה:</b> שמירת עדכון להזמנה קיימת <b>#${escapeHtml(cart.orderInUpdateMode)}</b>` +
         (updatingOrder
@@ -1478,7 +1479,9 @@ export function createTelegramBot(deps: CreateTelegramBotDeps): Bot {
           : '')
       : mgr.meta.supportsAutoCheckout
         ? `\n\n📌 <b>פעולה:</b> יצירת הזמנה חדשה וחיוב כרטיס האשראי השמור ב-${escapeHtml(mgr.meta.displayName)}`
-        : `\n\n📌 <b>פעולה:</b> וידוא שהעגלה מוכנה ב-${escapeHtml(mgr.meta.displayName)} וקבלת קישור ישיר להשלמת התשלום`;
+        : isGuestNoSync
+          ? `\n\n⚠️ <b>שים לב (מצב אורח):</b> הבוט אינו מחובר לחשבון שלכם ב-${escapeHtml(mgr.meta.shortName)}, ולכן הקישור לאתר יפתח עגלה ריקה (ההשוואה היא למחיר בלבד). כדי שהבוט ימלא אוטומטית את העגלה בחשבון שלכם, הוסיפו פרטי התחברות ל-<code>.env</code>.`
+          : `\n\n📌 <b>פעולה:</b> סנכרון העגלה לחשבון שלכם ב-${escapeHtml(mgr.meta.displayName)} וקבלת קישור ישיר להשלמת התשלום`;
 
     const confirmTok = db.saveCallbackPayload({
       kind: 'checkout_exec',
@@ -1490,7 +1493,9 @@ export function createTelegramBot(deps: CreateTelegramBotDeps): Bot {
       .text(
         cart.orderInUpdateMode
           ? `✅ אשר ושמור עדכון הזמנה #${cart.orderInUpdateMode}`
-          : `✅ אשר ובצע הזמנה ב-${mgr.meta.shortName}`,
+          : isGuestNoSync
+            ? `📋 הצג רשימת קניות וקישור ל-${mgr.meta.shortName}`
+            : `✅ אשר ובצע הזמנה ב-${mgr.meta.shortName}`,
         `a:${confirmTok}`,
       )
       .row();
