@@ -2418,7 +2418,7 @@ export function createTelegramBot(deps: CreateTelegramBotDeps): Bot {
 
 export async function registerBotCommands(bot: Bot): Promise<void> {
   await bot.api.setMyCommands([
-    { command: 'compare', description: 'השוואת מחירים בין שופרסל, חצי חינם וסופר חביב' },
+    { command: 'compare', description: 'השוואת מחירים בין שופרסל, חצי חינם, סופר חביב וויקטורי' },
     { command: 'cart', description: 'הצגת העגלות ופירוט פריטים בכל חנות' },
     { command: 'remove', description: 'הסרה או עריכת כמות של פריטים בעגלות / בהזמנה' },
     { command: 'checkout', description: 'בחירת הסל הזול ביותר ואישור הזמנה' },

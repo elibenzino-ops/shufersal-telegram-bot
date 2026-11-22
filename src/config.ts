@@ -50,6 +50,12 @@ export function parseEnabledStores(
     haviv: 'super_haviv',
     'סופר חביב': 'super_haviv',
     'חביב': 'super_haviv',
+    victory: 'victory',
+    victoryonline: 'victory',
+    victory_online: 'victory',
+    'victory-online': 'victory',
+    'ויקטורי': 'victory',
+    'ויקטורי אונליין': 'victory',
   };
 
   const result: StoreId[] = [];
@@ -113,6 +119,13 @@ const EnvSchema = z.object({
   SUPER_HAVIV_AREA_ID: z.string().optional(),
   SUPER_HAVIV_DELIVERY_FEE: z.string().optional(),
 
+  // Victory Online (ויקטורי אונליין)
+  VICTORY_USERNAME: z.string().optional(),
+  VICTORY_PASSWORD: z.string().optional(),
+  VICTORY_BRANCH_ID: z.string().optional(),
+  VICTORY_AREA_ID: z.string().optional(),
+  VICTORY_DELIVERY_FEE: z.string().optional(),
+
   GEMINI_API_KEY: z.string().min(1, 'חובה להגדיר GEMINI_API_KEY לזיהוי חכם של מצרכים'),
   GEMINI_MODEL: z.string().default('gemini-2.5-flash'),
 
@@ -151,6 +164,12 @@ export interface AppConfig {
   superHavivAreaId?: number;
   superHavivDeliveryFee?: number;
 
+  victoryUsername?: string;
+  victoryPassword?: string;
+  victoryBranchId?: number;
+  victoryAreaId?: number;
+  victoryDeliveryFee?: number;
+
   geminiApiKey: string;
   geminiModel: string;
   chromePath?: string;
@@ -162,6 +181,7 @@ export interface AppConfig {
   sessionFilePath: string;
   haziHinamSessionFilePath: string;
   superHavivSessionFilePath: string;
+  victorySessionFilePath: string;
   screenshotsDir: string;
   autoRemoveOutOfStock: boolean;
 }
@@ -186,7 +206,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
   );
   if (enabledStores.length === 0) {
     throw new Error(
-      'לא הופעלה אף חנות! הגדירו ENABLED_STORES (למשל shufersal,hazi_hinam,super_haviv) ו/או פרטי התחברות.',
+      'לא הופעלה אף חנות! הגדירו ENABLED_STORES (למשל shufersal,hazi_hinam,super_haviv,victory) ו/או פרטי התחברות.',
     );
   }
 
@@ -200,12 +220,16 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
   const haziHinamPassword = data.HAZI_HINAM_PASSWORD || undefined;
   const superHavivUsername = data.SUPER_HAVIV_USERNAME?.trim() || undefined;
   const superHavivPassword = data.SUPER_HAVIV_PASSWORD || undefined;
+  const victoryUsername = data.VICTORY_USERNAME?.trim() || undefined;
+  const victoryPassword = data.VICTORY_PASSWORD || undefined;
 
   const chromePath = detectChromeExecutable();
   const needsBrowser =
     enabledStores.includes('shufersal') ||
     (enabledStores.includes('super_haviv') &&
-      Boolean(superHavivUsername && superHavivPassword));
+      Boolean(superHavivUsername && superHavivPassword)) ||
+    (enabledStores.includes('victory') &&
+      Boolean(victoryUsername && victoryPassword));
 
   if (needsBrowser && !chromePath && !data.BROWSER_WS_ENDPOINT) {
     throw new Error(
@@ -238,6 +262,12 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
     superHavivAreaId: parseOptionalNumber(data.SUPER_HAVIV_AREA_ID),
     superHavivDeliveryFee: parseOptionalNumber(data.SUPER_HAVIV_DELIVERY_FEE),
 
+    victoryUsername,
+    victoryPassword,
+    victoryBranchId: parseOptionalNumber(data.VICTORY_BRANCH_ID),
+    victoryAreaId: parseOptionalNumber(data.VICTORY_AREA_ID),
+    victoryDeliveryFee: parseOptionalNumber(data.VICTORY_DELIVERY_FEE),
+
     geminiApiKey: data.GEMINI_API_KEY,
     geminiModel: data.GEMINI_MODEL,
     chromePath,
@@ -249,6 +279,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
     sessionFilePath: path.join(dataDir, 'shufersal-session.json'),
     haziHinamSessionFilePath: path.join(dataDir, 'hazi-hinam-session.json'),
     superHavivSessionFilePath: path.join(dataDir, 'super-haviv-session.json'),
+    victorySessionFilePath: path.join(dataDir, 'victory-session.json'),
     screenshotsDir,
     autoRemoveOutOfStock: data.AUTO_REMOVE_OUT_OF_STOCK,
   };

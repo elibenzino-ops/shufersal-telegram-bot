@@ -6,6 +6,7 @@ import { HaziHinamClient } from './haziHinamClient.js';
 import { MultiStoreManager } from './multiStoreManager.js';
 import { StoreManager } from './storeManager.js';
 import { SuperHavivClient } from './superHavivClient.js';
+import { VictoryClient } from './victoryClient.js';
 
 export function createMultiStoreManager(
   config: AppConfig,
@@ -58,6 +59,24 @@ export function createMultiStoreManager(
       managers.push(new StoreManager(client, db));
       logger.info(
         `Enabled store: Super Haviv Online (${config.superHavivUsername ? 'authenticated' : 'guest/anonymous cart mode'}, branch=${config.superHavivBranchId ?? 3507})`,
+      );
+    } else if (storeId === 'victory') {
+      const client = new VictoryClient({
+        username: config.victoryUsername,
+        password: config.victoryPassword,
+        branchId: config.victoryBranchId,
+        areaId: config.victoryAreaId,
+        chromePath: config.chromePath,
+        browserWsEndpoint: config.browserWsEndpoint,
+        proxyUrl: config.proxyUrl,
+        headless: config.headless,
+        sessionFilePath: config.victorySessionFilePath,
+        screenshotsDir: config.screenshotsDir,
+        defaultDeliveryFee: config.victoryDeliveryFee,
+      });
+      managers.push(new StoreManager(client, db));
+      logger.info(
+        `Enabled store: Victory Online (${config.victoryUsername ? 'authenticated' : 'guest/anonymous cart mode'}, branch=${config.victoryBranchId ?? 2427})`,
       );
     }
   }

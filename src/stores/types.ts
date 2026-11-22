@@ -1,9 +1,10 @@
-export type StoreId = 'shufersal' | 'hazi_hinam' | 'super_haviv';
+export type StoreId = 'shufersal' | 'hazi_hinam' | 'super_haviv' | 'victory';
 
 export const ALL_STORE_IDS: readonly StoreId[] = [
   'shufersal',
   'hazi_hinam',
   'super_haviv',
+  'victory',
 ] as const;
 
 export interface StoreMeta {
@@ -56,13 +57,26 @@ export const STORE_META: Record<StoreId, StoreMeta> = {
     supportsAutoCheckout: false,
     supportsOrderUpdate: false,
   },
+  victory: {
+    id: 'victory',
+    displayName: 'ויקטורי אונליין',
+    shortName: 'ויקטורי',
+    emoji: '🟠',
+    baseUrl: 'https://www.victoryonline.co.il',
+    cartUrl: 'https://www.victoryonline.co.il/cart',
+    defaultDeliveryFee: 35.9,
+    minimumOrderAmount: 250,
+    supportsAutoCheckout: false,
+    supportsOrderUpdate: false,
+  },
 };
 
 export function isStoreId(value: string): value is StoreId {
   return (
     value === 'shufersal' ||
     value === 'hazi_hinam' ||
-    value === 'super_haviv'
+    value === 'super_haviv' ||
+    value === 'victory'
   );
 }
 

@@ -31,6 +31,7 @@ import {
   type StoreClient,
   type StoreId,
 } from '../src/stores/types.js';
+import { VictoryClient } from '../src/stores/victoryClient.js';
 
 function jsonResponse(body: unknown, status = 200): Response {
   return new Response(JSON.stringify(body), {
@@ -40,27 +41,31 @@ function jsonResponse(body: unknown, status = 200): Response {
 }
 
 describe('parseEnabledStores', () => {
-  it('enables all 3 stores by default when Shufersal credentials exist, and omits Shufersal when absent', () => {
+  it('enables all 4 stores by default when Shufersal credentials exist, and omits Shufersal when absent', () => {
     expect(parseEnabledStores(undefined, true)).toEqual([
       'shufersal',
       'hazi_hinam',
       'super_haviv',
+      'victory',
     ]);
     expect(parseEnabledStores(undefined, false)).toEqual([
       'hazi_hinam',
       'super_haviv',
+      'victory',
     ]);
   });
 
   it('supports English and Hebrew store aliases', () => {
-    expect(parseEnabledStores('שופרסל, חצי חינם, חביב', true)).toEqual([
+    expect(parseEnabledStores('שופרסל, חצי חינם, חביב, ויקטורי', true)).toEqual([
       'shufersal',
       'hazi_hinam',
       'super_haviv',
+      'victory',
     ]);
-    expect(parseEnabledStores('hazi,haviv', false)).toEqual([
+    expect(parseEnabledStores('hazi,haviv,victoryonline', false)).toEqual([
       'hazi_hinam',
       'super_haviv',
+      'victory',
     ]);
   });
 });
@@ -340,6 +345,92 @@ describe('SuperHavivClient (Self-Point / Prutah)', () => {
     );
     expect(cart.items).toHaveLength(1);
     expect(cart.totalPrice).toBe(14.7);
+  });
+});
+
+describe('VictoryClient (Self-Point / Prutah)', () => {
+  let tmpDir: string;
+
+  beforeEach(() => {
+    tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'victory-test-'));
+  });
+
+  afterEach(() => {
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+  });
+
+  it('extracts barcode from image URL when gtin is omitted, searches retailer 1470 / branch 2427, and builds a cart', async () => {
+    const mockFetch = vi.fn(async (input: string | URL | Request, init?: RequestInit) => {
+      const url = typeof input === 'string' ? input : input.toString();
+
+      if (url.includes('/v2/retailers/1470/branches/2427/products')) {
+        return jsonResponse({
+          products: [
+            {
+              id: 30112233,
+              localName: "קוטג' 5% תנובה",
+              image: 'https://cdn.example/products/7290004127329-medium.jpg',
+              brand: { names: { '1': 'תנובה' } },
+              branch: {
+                regularPrice: 6.4,
+                salePrice: 5.5,
+                isActive: true,
+                isVisible: true,
+                isOutOfStock: false,
+              },
+            },
+          ],
+        });
+      }
+
+      if (url.includes('/v2/retailers/1470/branches/2427/carts') && init?.method === 'POST') {
+        const body = JSON.parse(String(init.body ?? '{}')) as {
+          lines: Array<{ retailerProductId: number; quantity: number }>;
+        };
+        const subtotal = body.lines.reduce((s, l) => s + l.quantity * 5.5, 0);
+        return jsonResponse({
+          id: 'victory-cart-xyz',
+          lines: body.lines.map((l) => ({
+            retailerProductId: l.retailerProductId,
+            quantity: l.quantity,
+            isActive: true,
+            totalPrice: Number((l.quantity * 5.5).toFixed(2)),
+            product: { id: l.retailerProductId, localName: "קוטג' 5% תנובה" },
+          })),
+          total: { priceForView: subtotal },
+        });
+      }
+
+      return jsonResponse({});
+    }) as unknown as typeof fetch;
+
+    const client = new VictoryClient({
+      headless: true,
+      sessionFilePath: path.join(tmpDir, 'victory-session.json'),
+      screenshotsDir: tmpDir,
+      fetchFn: mockFetch,
+    });
+
+    expect(client.storeId).toBe('victory');
+    expect(client.meta.minimumOrderAmount).toBe(250);
+
+    const found = await client.searchProducts("קוטג'");
+    expect(found).toHaveLength(1);
+    expect(found[0]?.storeId).toBe('victory');
+    expect(found[0]?.code).toBe('30112233');
+    expect(found[0]?.barcode).toBe('7290004127329');
+    expect(found[0]?.price).toBe(5.5);
+
+    const cart = await client.setItemsInCart([
+      { productCode: '30112233', quantity: 2, sellingMethod: 'BY_UNIT' },
+    ]);
+    expect(cart.storeId).toBe('victory');
+    expect(cart.totalPrice).toBe(11);
+    expect(cart.deliveryFee).toBe(35.9);
+
+    await expect(
+      client.placeOrder({ removeMissingItems: true }),
+    ).rejects.toBeInstanceOf(StoreManualVerificationRequiredError);
   });
 });
 
