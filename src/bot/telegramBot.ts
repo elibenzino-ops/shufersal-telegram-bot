@@ -27,6 +27,7 @@ import {
   formatHebrewDateTime,
   formatHebrewDayHeader,
   formatQuantity,
+  maskIsraeliPhone,
   normalizeIsraeliPhone,
 } from '../utils/format.js';
 
@@ -570,21 +571,234 @@ export function createTelegramBot(deps: CreateTelegramBotDeps): Bot {
     }
   }
 
-  bot.command(['compare', 'cheapest'], async (ctx) => {
-    const loading = await ctx.reply(
+  const OTP_PENDING_TTL_MS = 5 * 60_000;
+
+  type PendingPostOtpAction =
+    | { kind: 'compare'; chatId: number }
+    | {
+        kind: 'mirror';
+        chatId: number;
+        sourceStoreId: StoreId;
+        senderName: string;
+      };
+
+  interface PendingOtpState {
+    stage: 'awaiting_phone' | 'awaiting_code';
+    storeId: StoreId;
+    remainingStores: StoreId[];
+    expiresAt: number;
+    onComplete?: PendingPostOtpAction;
+  }
+
+  const pendingOtpByChat = new Map<number, PendingOtpState>();
+  const activeOtpChats = new Set<number>();
+
+  function getSavedSmsPhone(storeId: StoreId): string | null {
+    const envSpecific =
+      storeId === 'super_haviv'
+        ? config.superHavivPhone
+        : storeId === 'victory'
+          ? config.victoryPhone
+          : undefined;
+    if (envSpecific) return envSpecific;
+    if (config.smsLoginPhone) return config.smsLoginPhone;
+
+    const dbSpecific = db.getSetting(`sms_phone:${storeId}`);
+    if (dbSpecific) {
+      const normalized = normalizeIsraeliPhone(dbSpecific);
+      if (normalized) return normalized;
+    }
+    const dbDefault = db.getSetting('sms_phone:default');
+    if (dbDefault) {
+      const normalized = normalizeIsraeliPhone(dbDefault);
+      if (normalized) return normalized;
+    }
+    return null;
+  }
+
+  function saveSmsPhone(storeId: StoreId, phone: string): void {
+    db.setSetting(`sms_phone:${storeId}`, phone);
+    if (!db.getSetting('sms_phone:default')) {
+      db.setSetting('sms_phone:default', phone);
+    }
+  }
+
+  async function runPostOtpAction(action: PendingPostOtpAction): Promise<void> {
+    if (action.kind === 'compare') {
+      await runCompareForChat(action.chatId, true);
+      return;
+    }
+    await runMirrorForChat({
+      chatId: action.chatId,
+      sourceStoreId: action.sourceStoreId,
+      senderName: action.senderName,
+      skipAutoSmsLogin: true,
+    });
+  }
+
+  function buildOtpSkipKeyboard(): InlineKeyboard {
+    const skipTok = db.saveCallbackPayload({ kind: 'otp_skip' });
+    return new InlineKeyboard().text('⏭ דלג והמשך כאורח', `a:${skipTok}`);
+  }
+
+  async function beginAutoOtpQueue(
+    chatId: number,
+    queue: StoreId[],
+    action?: PendingPostOtpAction,
+  ): Promise<void> {
+    const unauthed = queue.filter((id) => {
+      const mgr = stores.getStore(id);
+      return Boolean(mgr && mgr.supportsSmsOtpLogin() && !mgr.isAuthenticated());
+    });
+
+    if (unauthed.length === 0) {
+      if (action) {
+        await runPostOtpAction(action);
+      }
+      return;
+    }
+
+    const [storeId, ...remainingStores] = unauthed as [StoreId, ...StoreId[]];
+    const meta = STORE_META[storeId];
+    const actionLabel =
+      action?.kind === 'mirror' ? 'העתקת הסל וההשוואה' : 'השוואת המחירים';
+    const skipKb = buildOtpSkipKeyboard();
+    const savedPhone = getSavedSmsPhone(storeId);
+
+    if (!savedPhone) {
+      pendingOtpByChat.set(chatId, {
+        stage: 'awaiting_phone',
+        storeId,
+        remainingStores,
+        expiresAt: Date.now() + OTP_PENDING_TTL_MS,
+        onComplete: action,
+      });
+      const storeNames = unauthed
+        .map(
+          (id) =>
+            `${STORE_META[id].emoji} <b>${escapeHtml(STORE_META[id].displayName)}</b>`,
+        )
+        .join(' ו-');
+      await bot.api.sendMessage(
+        chatId,
+        `📱 <b>התחברות אוטומטית לפני ${actionLabel}</b>\n\n` +
+          `כדי לחבר את ${storeNames} לחשבון שלך (כך שהעגלה תישמר באתר ולא תופיע ריקה), שלחו כאן <b>פעם אחת</b> את מספר הנייד שלכם (למשל <code>0501234567</code>).\n` +
+          `אשמור אותו אוטומטית לפעמים הבאות, אשלח קוד SMS, ומיד אמשיך ב-${actionLabel}!`,
+        { parse_mode: 'HTML', reply_markup: skipKb },
+      );
+      return;
+    }
+
+    if (activeOtpChats.has(chatId)) {
+      await bot.api.sendMessage(
+        chatId,
+        '⏳ כבר יש תהליך התחברות SMS פעיל בצ׳אט זה, רגע...',
+      );
+      return;
+    }
+
+    activeOtpChats.add(chatId);
+    const statusMsg = await bot.api.sendMessage(
+      chatId,
+      `📲 <b>מתחבר אוטומטית ל-${meta.emoji} ${escapeHtml(meta.displayName)}...</b>\n` +
+        `שולח קוד SMS למספר השמור (<code>${escapeHtml(maskIsraeliPhone(savedPhone))}</code>)...`,
+      { parse_mode: 'HTML' },
+    );
+
+    let failedAndShouldAdvance = false;
+    try {
+      const res = await stores.startSmsOtpLogin(storeId, savedPhone);
+      pendingOtpByChat.set(chatId, {
+        stage: 'awaiting_code',
+        storeId,
+        remainingStores,
+        expiresAt: Date.now() + OTP_PENDING_TTL_MS,
+        onComplete: action,
+      });
+      const nextHint =
+        remainingStores.length > 0
+          ? `לאחר מכן אחבר אוטומטית גם את ${remainingStores.map((id) => STORE_META[id].shortName).join(' ו-')} ואמשיך ב-${actionLabel}.`
+          : `מיד לאחר האימות אמשיך אוטומטית ב-${actionLabel}.`;
+      await bot.api
+        .editMessageText(
+          chatId,
+          statusMsg.message_id,
+          `📲 <b>${meta.emoji} ${escapeHtml(meta.displayName)}</b>\n${escapeHtml(res.message)}\n\n` +
+            `<i>פשוט הקלידו כאן את הקוד שקיבלתם ב-SMS. ${escapeHtml(nextHint)}</i>`,
+          { parse_mode: 'HTML', reply_markup: skipKb },
+        )
+        .catch(() => {});
+    } catch (err) {
+      logger.warn(
+        `Auto SMS OTP start failed for ${storeId}; continuing as guest`,
+        err,
+      );
+      const errMsg = err instanceof Error ? err.message : String(err);
+      await bot.api
+        .editMessageText(
+          chatId,
+          statusMsg.message_id,
+          `⚠️ התחברות SMS אוטומטית ל-${meta.emoji} <b>${escapeHtml(meta.displayName)}</b> לא הצליחה (${escapeHtml(errMsg.slice(0, 140))}).\n` +
+            `<i>ממשיך במצב אורח עבור ${escapeHtml(meta.shortName)}...</i>`,
+          { parse_mode: 'HTML' },
+        )
+        .catch(() => {});
+      failedAndShouldAdvance = true;
+    } finally {
+      activeOtpChats.delete(chatId);
+    }
+
+    if (failedAndShouldAdvance) {
+      await beginAutoOtpQueue(chatId, remainingStores, action);
+    }
+  }
+
+  async function ensureAutoSmsLoginBeforeAction(
+    chatId: number,
+    action: PendingPostOtpAction,
+  ): Promise<boolean> {
+    const excludeStoreId =
+      action.kind === 'mirror' ? action.sourceStoreId : undefined;
+    const unauthed = stores.getUnauthenticatedSmsOtpStores(excludeStoreId);
+    if (unauthed.length === 0) return false;
+
+    await beginAutoOtpQueue(chatId, unauthed, action);
+    return true;
+  }
+
+  async function runCompareForChat(
+    chatId: number,
+    skipAutoSmsLogin = false,
+  ): Promise<void> {
+    if (
+      !skipAutoSmsLogin &&
+      (await ensureAutoSmsLoginBeforeAction(chatId, {
+        kind: 'compare',
+        chatId,
+      }))
+    ) {
+      return;
+    }
+
+    const loading = await bot.api.sendMessage(
+      chatId,
       '⚖️ משווה עגלות ומחירים חיים בין כל הרשתות המחוברות...',
     );
     try {
-      await renderCompareView(ctx.chat.id, loading.message_id);
+      await renderCompareView(chatId, loading.message_id);
     } catch (err) {
       logger.error('/compare command failed', err);
-      await ctx.api.editMessageText(
-        ctx.chat.id,
+      await bot.api.editMessageText(
+        chatId,
         loading.message_id,
         formatUserFacingError(err),
         { parse_mode: 'HTML' },
       );
     }
+  }
+
+  bot.command(['compare', 'cheapest'], async (ctx) => {
+    await runCompareForChat(ctx.chat.id, false);
   });
 
   const activeMirrorChats = new Set<number>();
@@ -593,8 +807,9 @@ export function createTelegramBot(deps: CreateTelegramBotDeps): Bot {
     chatId: number;
     sourceStoreId: StoreId;
     senderName: string;
+    skipAutoSmsLogin?: boolean;
   }): Promise<void> {
-    const { chatId, sourceStoreId, senderName } = params;
+    const { chatId, sourceStoreId, senderName, skipAutoSmsLogin } = params;
     const sourceMeta = STORE_META[sourceStoreId];
 
     if (!stores.isMultiStore()) {
@@ -612,6 +827,18 @@ export function createTelegramBot(deps: CreateTelegramBotDeps): Bot {
         '⏳ העתקה והשוואה כבר רצה כרגע בקבוצה – אנא המתינו לסיומה.',
         { parse_mode: 'HTML' },
       );
+      return;
+    }
+
+    if (
+      !skipAutoSmsLogin &&
+      (await ensureAutoSmsLoginBeforeAction(chatId, {
+        kind: 'mirror',
+        chatId,
+        sourceStoreId,
+        senderName,
+      }))
+    ) {
       return;
     }
 
@@ -739,13 +966,6 @@ export function createTelegramBot(deps: CreateTelegramBotDeps): Bot {
     });
   });
 
-  const OTP_PENDING_TTL_MS = 5 * 60_000;
-  const pendingOtpByChat = new Map<
-    number,
-    { storeId: StoreId; expiresAt: number }
-  >();
-  const activeOtpChats = new Set<number>();
-
   async function handleStartSmsOtpLogin(
     ctx: Context,
     storeId: StoreId,
@@ -766,7 +986,11 @@ export function createTelegramBot(deps: CreateTelegramBotDeps): Bot {
     }
 
     const trimmedPhone = rawPhone.trim();
-    if (!trimmedPhone) {
+    const normalizedPhone = trimmedPhone
+      ? normalizeIsraeliPhone(trimmedPhone)
+      : getSavedSmsPhone(storeId);
+
+    if (!trimmedPhone && !normalizedPhone) {
       await ctx.reply(
         `📱 <b>התחברות ל-${meta.emoji} ${escapeHtml(meta.displayName)} באמצעות SMS</b>\n\n` +
           `שלחו את הפקודה עם מספר הנייד שלכם:\n` +
@@ -777,7 +1001,6 @@ export function createTelegramBot(deps: CreateTelegramBotDeps): Bot {
       return;
     }
 
-    const normalizedPhone = normalizeIsraeliPhone(trimmedPhone);
     if (!normalizedPhone) {
       await ctx.reply(
         `❌ מספר הטלפון לא תקין. נא להזין מספר נייד ישראלי, למשל:\n<code>${cmdName} 0501234567</code>`,
@@ -785,6 +1008,8 @@ export function createTelegramBot(deps: CreateTelegramBotDeps): Bot {
       );
       return;
     }
+
+    saveSmsPhone(storeId, normalizedPhone);
 
     if (activeOtpChats.has(chatId)) {
       await ctx.reply('⏳ כבר יש תהליך התחברות SMS פעיל בצ׳אט זה, רגע...');
@@ -800,7 +1025,9 @@ export function createTelegramBot(deps: CreateTelegramBotDeps): Bot {
     try {
       const res = await stores.startSmsOtpLogin(storeId, normalizedPhone);
       pendingOtpByChat.set(chatId, {
+        stage: 'awaiting_code',
         storeId,
+        remainingStores: [],
         expiresAt: Date.now() + OTP_PENDING_TTL_MS,
       });
       await bot.api
@@ -837,7 +1064,15 @@ export function createTelegramBot(deps: CreateTelegramBotDeps): Bot {
     if (!pending || Date.now() > pending.expiresAt) {
       pendingOtpByChat.delete(chatId);
       await ctx.reply(
-        `ℹ️ אין כרגע בקשת קוד SMS פעילה.\nלהתחברות שלחו <code>/login_haviv 05XXXXXXXX</code> או <code>/login_victory 05XXXXXXXX</code>.`,
+        `ℹ️ אין כרגע בקשת קוד SMS פעילה.\nהתחברות מתבצעת אוטומטית כשמריצים /mirror או /compare (או ידנית עם <code>/login_haviv 05XXXXXXXX</code>).`,
+        { parse_mode: 'HTML' },
+      );
+      return;
+    }
+
+    if (pending.stage === 'awaiting_phone') {
+      await ctx.reply(
+        `📱 אני ממתין קודם למספר הנייד שלך (למשל <code>0501234567</code>) כדי לשלוח קוד SMS.`,
         { parse_mode: 'HTML' },
       );
       return;
@@ -864,9 +1099,11 @@ export function createTelegramBot(deps: CreateTelegramBotDeps): Bot {
       { parse_mode: 'HTML' },
     );
 
+    let succeeded = false;
     try {
       const res = await stores.completeSmsOtpLogin(pending.storeId, code);
       pendingOtpByChat.delete(chatId);
+      succeeded = true;
       await bot.api
         .editMessageText(
           chatId,
@@ -894,6 +1131,18 @@ export function createTelegramBot(deps: CreateTelegramBotDeps): Bot {
         .catch(() => {});
     } finally {
       activeOtpChats.delete(chatId);
+    }
+
+    if (succeeded) {
+      if (pending.remainingStores.length > 0) {
+        await beginAutoOtpQueue(
+          chatId,
+          pending.remainingStores,
+          pending.onComplete,
+        );
+      } else if (pending.onComplete) {
+        await runPostOtpAction(pending.onComplete);
+      }
     }
   }
 
@@ -2565,6 +2814,19 @@ export function createTelegramBot(deps: CreateTelegramBotDeps): Bot {
           );
           return;
         }
+
+        if (payload.kind === 'otp_skip') {
+          const pending = pendingOtpByChat.get(chatId);
+          pendingOtpByChat.delete(chatId);
+          await ctx.answerCallbackQuery('ממשיך במצב אורח...');
+          await ctx
+            .editMessageText('⏭ דילגת על התחברות SMS — ממשיך במצב אורח...')
+            .catch(() => {});
+          if (pending?.onComplete) {
+            await runPostOtpAction(pending.onComplete);
+          }
+          return;
+        }
       }
     } catch (err) {
       if (err instanceof StoreManualVerificationRequiredError) {
@@ -2590,6 +2852,17 @@ export function createTelegramBot(deps: CreateTelegramBotDeps): Bot {
     if (pendingOtp) {
       if (Date.now() > pendingOtp.expiresAt) {
         pendingOtpByChat.delete(ctx.chat.id);
+      } else if (pendingOtp.stage === 'awaiting_phone') {
+        const normalizedPhone = normalizeIsraeliPhone(text);
+        if (normalizedPhone) {
+          saveSmsPhone(pendingOtp.storeId, normalizedPhone);
+          db.setSetting('sms_phone:default', normalizedPhone);
+          const queue = [pendingOtp.storeId, ...pendingOtp.remainingStores];
+          const action = pendingOtp.onComplete;
+          pendingOtpByChat.delete(ctx.chat.id);
+          await beginAutoOtpQueue(ctx.chat.id, queue, action);
+          return;
+        }
       } else if (/^\d{4,8}$/.test(text.replace(/[\s\-]/g, ''))) {
         await handleCompleteSmsOtpLogin(ctx, text);
         return;

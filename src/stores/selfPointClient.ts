@@ -354,10 +354,18 @@ export class SelfPointClient implements StoreClient {
     this.fetchFn = options.fetchFn ?? fetch;
     this.deliveryFee =
       options.defaultDeliveryFee ?? STORE_META[options.storeId].defaultDeliveryFee;
+    this.tryLoadSavedSession();
   }
 
   getAuthWarning(): string | null {
     return this.authFallbackReason;
+  }
+
+  isAuthenticated(): boolean {
+    if (!this.token) {
+      this.tryLoadSavedSession();
+    }
+    return Boolean(this.token && !this.isGuestSession);
   }
 
   private apiBase(): string {
@@ -699,6 +707,20 @@ export class SelfPointClient implements StoreClient {
 
     const text = await res.text();
     if (!res.ok) {
+      if (res.status === 401 && this.token) {
+        logger.info(
+          `${this.storeId} bearer token expired (HTTP 401); clearing cached session`,
+        );
+        this.token = null;
+        this.isGuestSession = true;
+        try {
+          if (fs.existsSync(this.options.sessionFilePath)) {
+            fs.unlinkSync(this.options.sessionFilePath);
+          }
+        } catch {
+          // ignore
+        }
+      }
       const lower = text.toLowerCase();
       if (
         res.status === 403 &&

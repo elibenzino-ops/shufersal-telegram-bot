@@ -87,3 +87,9 @@ export function normalizeIsraeliPhone(raw: string): string | null {
   }
   return null;
 }
+
+export function maskIsraeliPhone(phone: string): string {
+  const normalized = normalizeIsraeliPhone(phone);
+  if (!normalized) return '***';
+  return `${normalized.slice(0, 3)}-***-${normalized.slice(-4)}`;
+}

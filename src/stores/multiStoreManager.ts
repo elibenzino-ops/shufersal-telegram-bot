@@ -828,6 +828,18 @@ export class MultiStoreManager {
     };
   }
 
+  getUnauthenticatedSmsOtpStores(excludeStoreId?: StoreId): StoreId[] {
+    const out: StoreId[] = [];
+    for (const storeId of this.orderedStoreIds) {
+      if (excludeStoreId && storeId === excludeStoreId) continue;
+      const mgr = this.managers.get(storeId);
+      if (mgr && mgr.supportsSmsOtpLogin() && !mgr.isAuthenticated()) {
+        out.push(storeId);
+      }
+    }
+    return out;
+  }
+
   async startSmsOtpLogin(
     storeId: StoreId,
     phoneNumber: string,

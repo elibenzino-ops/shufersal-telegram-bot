@@ -7,6 +7,7 @@ import {
   isStoreId,
   type StoreId,
 } from './stores/types.js';
+import { normalizeIsraeliPhone } from './utils/format.js';
 
 dotenv.config();
 
@@ -115,6 +116,7 @@ const EnvSchema = z.object({
   // Super Haviv Online (סופר חביב)
   SUPER_HAVIV_USERNAME: z.string().optional(),
   SUPER_HAVIV_PASSWORD: z.string().optional(),
+  SUPER_HAVIV_PHONE: z.string().optional(),
   SUPER_HAVIV_BRANCH_ID: z.string().optional(),
   SUPER_HAVIV_AREA_ID: z.string().optional(),
   SUPER_HAVIV_DELIVERY_FEE: z.string().optional(),
@@ -122,9 +124,13 @@ const EnvSchema = z.object({
   // Victory Online (ויקטורי אונליין)
   VICTORY_USERNAME: z.string().optional(),
   VICTORY_PASSWORD: z.string().optional(),
+  VICTORY_PHONE: z.string().optional(),
   VICTORY_BRANCH_ID: z.string().optional(),
   VICTORY_AREA_ID: z.string().optional(),
   VICTORY_DELIVERY_FEE: z.string().optional(),
+
+  // Shared Israeli mobile phone for automatic SMS OTP login (Super Haviv / Victory)
+  SMS_LOGIN_PHONE: z.string().optional(),
 
   GEMINI_API_KEY: z.string().min(1, 'חובה להגדיר GEMINI_API_KEY לזיהוי חכם של מצרכים'),
   GEMINI_MODEL: z.string().default('gemini-3.8-flash'),
@@ -160,15 +166,19 @@ export interface AppConfig {
 
   superHavivUsername?: string;
   superHavivPassword?: string;
+  superHavivPhone?: string;
   superHavivBranchId?: number;
   superHavivAreaId?: number;
   superHavivDeliveryFee?: number;
 
   victoryUsername?: string;
   victoryPassword?: string;
+  victoryPhone?: string;
   victoryBranchId?: number;
   victoryAreaId?: number;
   victoryDeliveryFee?: number;
+
+  smsLoginPhone?: string;
 
   geminiApiKey: string;
   geminiModel: string;
@@ -223,6 +233,24 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
   const victoryUsername = data.VICTORY_USERNAME?.trim() || undefined;
   const victoryPassword = data.VICTORY_PASSWORD || undefined;
 
+  const smsLoginPhone = data.SMS_LOGIN_PHONE?.trim()
+    ? (normalizeIsraeliPhone(data.SMS_LOGIN_PHONE) ?? undefined)
+    : undefined;
+  const superHavivPhone =
+    (data.SUPER_HAVIV_PHONE?.trim()
+      ? (normalizeIsraeliPhone(data.SUPER_HAVIV_PHONE) ?? undefined)
+      : undefined) ??
+    (superHavivUsername
+      ? (normalizeIsraeliPhone(superHavivUsername) ?? undefined)
+      : undefined);
+  const victoryPhone =
+    (data.VICTORY_PHONE?.trim()
+      ? (normalizeIsraeliPhone(data.VICTORY_PHONE) ?? undefined)
+      : undefined) ??
+    (victoryUsername
+      ? (normalizeIsraeliPhone(victoryUsername) ?? undefined)
+      : undefined);
+
   const chromePath = detectChromeExecutable();
   const needsBrowser =
     enabledStores.includes('shufersal') ||
@@ -258,15 +286,19 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
 
     superHavivUsername,
     superHavivPassword,
+    superHavivPhone,
     superHavivBranchId: parseOptionalNumber(data.SUPER_HAVIV_BRANCH_ID),
     superHavivAreaId: parseOptionalNumber(data.SUPER_HAVIV_AREA_ID),
     superHavivDeliveryFee: parseOptionalNumber(data.SUPER_HAVIV_DELIVERY_FEE),
 
     victoryUsername,
     victoryPassword,
+    victoryPhone,
     victoryBranchId: parseOptionalNumber(data.VICTORY_BRANCH_ID),
     victoryAreaId: parseOptionalNumber(data.VICTORY_AREA_ID),
     victoryDeliveryFee: parseOptionalNumber(data.VICTORY_DELIVERY_FEE),
+
+    smsLoginPhone,
 
     geminiApiKey: data.GEMINI_API_KEY,
     geminiModel: data.GEMINI_MODEL,

@@ -227,6 +227,7 @@ export interface StoreClient {
   putOrderInUpdateMode(orderCode: string): Promise<CartState>;
   placeOrder(options: { removeMissingItems: boolean }): Promise<CheckoutResult>;
   getAuthWarning?(): string | null;
+  isAuthenticated?(): boolean;
   startSmsOtpLogin?(phoneNumber: string): Promise<{ message: string }>;
   completeSmsOtpLogin?(
     otpCode: string,

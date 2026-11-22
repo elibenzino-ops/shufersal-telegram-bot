@@ -459,6 +459,16 @@ export class StoreManager {
     });
   }
 
+  supportsSmsOtpLogin(): boolean {
+    return Boolean(
+      this.client.startSmsOtpLogin && this.client.completeSmsOtpLogin,
+    );
+  }
+
+  isAuthenticated(): boolean {
+    return this.client.isAuthenticated ? this.client.isAuthenticated() : true;
+  }
+
   async startSmsOtpLogin(phoneNumber: string): Promise<{ message: string }> {
     if (!this.client.startSmsOtpLogin) {
       throw new Error(`התחברות SMS אינה נתמכת עבור ${this.meta.displayName}`);

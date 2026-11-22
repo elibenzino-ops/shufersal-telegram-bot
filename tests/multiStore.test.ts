@@ -42,7 +42,10 @@ import {
   parseVictoryDomCards,
   parseVictoryJsonProducts,
 } from '../src/stores/victoryClient.js';
-import { normalizeIsraeliPhone } from '../src/utils/format.js';
+import {
+  maskIsraeliPhone,
+  normalizeIsraeliPhone,
+} from '../src/utils/format.js';
 
 function jsonResponse(body: unknown, status = 200): Response {
   return new Response(JSON.stringify(body), {
@@ -1419,6 +1422,85 @@ describe('SMS OTP login flow (Super Haviv & Victory)', () => {
       await expect(
         multi.startSmsOtpLogin('victory', '0501234567'),
       ).rejects.toThrow(/אינה מופעלת/);
+    } finally {
+      db.close();
+    }
+  });
+
+  it('masks Israeli phone numbers, persists settings in BotDatabase, and detects unauthenticated SMS OTP stores', () => {
+    expect(maskIsraeliPhone('0501234567')).toBe('050-***-4567');
+    expect(maskIsraeliPhone('+972-54-987-6543')).toBe('054-***-6543');
+    expect(maskIsraeliPhone('invalid')).toBe('***');
+
+    const dbPath = path.join(tmpDir, 'settings.sqlite');
+    const db = new BotDatabase(dbPath);
+    try {
+      expect(db.getSetting('sms_phone:default')).toBeNull();
+      db.setSetting('sms_phone:default', '0501234567');
+      expect(db.getSetting('sms_phone:default')).toBe('0501234567');
+      db.setSetting('sms_phone:default', '0527654321');
+      expect(db.getSetting('sms_phone:default')).toBe('0527654321');
+
+      const havivSessionPath = path.join(tmpDir, 'haviv-auth.json');
+      const victorySessionPath = path.join(tmpDir, 'victory-auth.json');
+
+      const guestHaviv = new SuperHavivClient({
+        headless: true,
+        sessionFilePath: havivSessionPath,
+        screenshotsDir: tmpDir,
+      });
+      const guestVictory = new VictoryClient({
+        headless: true,
+        sessionFilePath: victorySessionPath,
+        screenshotsDir: tmpDir,
+      });
+
+      expect(guestHaviv.isAuthenticated()).toBe(false);
+      expect(guestVictory.isAuthenticated()).toBe(false);
+
+      const multiGuest = new MultiStoreManager(
+        [new StoreManager(guestHaviv, db), new StoreManager(guestVictory, db)],
+        db,
+      );
+      expect(multiGuest.getUnauthenticatedSmsOtpStores()).toEqual([
+        'super_haviv',
+        'victory',
+      ]);
+
+      // Once session files are persisted on disk, both clients load authenticated state eagerly
+      fs.writeFileSync(
+        havivSessionPath,
+        JSON.stringify({ savedAt: new Date().toISOString(), token: 'tok-123' }),
+      );
+      fs.writeFileSync(
+        victorySessionPath,
+        JSON.stringify({
+          savedAt: new Date().toISOString(),
+          localStorage: { auth: 'ok' },
+        }),
+      );
+
+      const authedHaviv = new SuperHavivClient({
+        headless: true,
+        sessionFilePath: havivSessionPath,
+        screenshotsDir: tmpDir,
+      });
+      const authedVictory = new VictoryClient({
+        headless: true,
+        sessionFilePath: victorySessionPath,
+        screenshotsDir: tmpDir,
+      });
+      expect(authedHaviv.isAuthenticated()).toBe(true);
+      expect(authedVictory.isAuthenticated()).toBe(true);
+
+      const multiAuthed = new MultiStoreManager(
+        [
+          new StoreManager(authedHaviv, db),
+          new StoreManager(authedVictory, db),
+        ],
+        db,
+      );
+      expect(multiAuthed.getUnauthenticatedSmsOtpStores()).toEqual([]);
     } finally {
       db.close();
     }

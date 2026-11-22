@@ -100,6 +100,9 @@ export type CallbackPayload =
   | {
       kind: 'clear_others';
       keepStoreId: StoreId;
+    }
+  | {
+      kind: 'otp_skip';
     };
 
 export interface LearnedPreference {
@@ -299,6 +302,12 @@ export class BotDatabase {
         token TEXT PRIMARY KEY,
         payload_json TEXT NOT NULL,
         created_at INTEGER NOT NULL
+      );
+
+      CREATE TABLE IF NOT EXISTS bot_settings (
+        key TEXT PRIMARY KEY,
+        value TEXT NOT NULL,
+        updated_at INTEGER NOT NULL
       );
     `);
   }
@@ -624,6 +633,25 @@ export class BotDatabase {
       `DELETE FROM callback_tokens WHERE created_at < ?`,
     );
     stmt.run(sevenDaysAgo);
+  }
+
+  getSetting(key: string): string | null {
+    const row = this.db
+      .prepare(`SELECT value FROM bot_settings WHERE key = ?`)
+      .get(key) as { value?: string } | undefined;
+    return typeof row?.value === 'string' ? row.value : null;
+  }
+
+  setSetting(key: string, value: string): void {
+    this.db
+      .prepare(
+        `INSERT INTO bot_settings (key, value, updated_at)
+         VALUES (?, ?, ?)
+         ON CONFLICT(key) DO UPDATE SET
+           value = excluded.value,
+           updated_at = excluded.updated_at`,
+      )
+      .run(key, value, Date.now());
   }
 
   close(): void {

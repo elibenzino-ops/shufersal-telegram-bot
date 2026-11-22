@@ -514,6 +514,13 @@ export class VictoryClient implements StoreClient {
     }
   }
 
+  isAuthenticated(): boolean {
+    if (this.isGuestSession && this.readSavedSessionFile()) {
+      this.isGuestSession = false;
+    }
+    return !this.isGuestSession;
+  }
+
   private readSavedSessionFile(): {
     savedAt: string;
     cookies?: Array<Record<string, unknown>>;
