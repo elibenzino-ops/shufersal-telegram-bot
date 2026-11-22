@@ -451,9 +451,10 @@ export function createTelegramBot(deps: CreateTelegramBotDeps): Bot {
       kb.row();
     }
 
-    kb.text('🔄 רענן השוואה', 'nav:compare');
+    kb.text('🗑 הסר / ערוך פריטים', 'nav:edit_cart')
+      .text('🔄 רענן השוואה', 'nav:compare');
     if (stores.getStore('shufersal')) {
-      kb.text('🚚 חלונות משלוח', 'nav:slots');
+      kb.row().text('🚚 חלונות משלוח', 'nav:slots');
     }
     return kb;
   }
@@ -504,11 +505,12 @@ export function createTelegramBot(deps: CreateTelegramBotDeps): Bot {
         `<b>פקודות זמינות:</b>\n` +
         `• /compare – השוואת מחירים חיה בין כל הרשתות וזיהוי הסל הזול ביותר\n` +
         `• /cart – צפייה בעגלות ופירוט פריטים בכל חנות\n` +
+        `• /remove <code>[מוצר]</code> – הסרה או עריכת כמות של פריטים בעגלות / בהזמנה שנטענה\n` +
         `• /stores – סטטוס החנויות המחוברות וקישורים ישירים\n` +
         `• /search <code>&lt;מוצר&gt;</code> – חיפוש והשוואת מחיר של מוצר בכל הרשתות\n` +
         `• /slots – בחירת יום ושעת משלוח\n` +
         `• /orders – צפייה בהזמנות פעילות וטעינה לעדכון\n` +
-        `• /checkout – <b>(מנהלים)</b> השוואת עגלות ואישור הזמנה מהסופר הזול ביותר\n` +
+        `• /checkout – השוואת עגלות ואישור הזמנה מהסופר הזול ביותר\n` +
         `• /clear – <b>(מנהלים)</b> ריקון העגלות\n` +
         `• /id – הצגת מזהי הקבוצה והמשתמש`,
       { parse_mode: 'HTML' },
@@ -577,6 +579,206 @@ export function createTelegramBot(deps: CreateTelegramBotDeps): Bot {
     }
   });
 
+  function buildStoreCartActionKeyboard(
+    storeId: StoreId,
+    orderInUpdateMode: string | null,
+    hasItems: boolean,
+  ): InlineKeyboard {
+    const meta = STORE_META[storeId];
+    const kb = new InlineKeyboard();
+
+    if (hasItems) {
+      const editTok = db.saveCallbackPayload({
+        kind: 'cart_edit_page',
+        storeId,
+        page: 0,
+      });
+      kb.text(
+        orderInUpdateMode
+          ? '🗑 הסר / ערוך פריטים בהזמנה'
+          : `🗑 הסר / ערוך פריטים (${meta.shortName})`,
+        `a:${editTok}`,
+      ).row();
+    }
+
+    const refreshTok = db.saveCallbackPayload({
+      kind: 'store_cart',
+      storeId,
+    });
+    kb.text('🔄 רענן עגלה', `a:${refreshTok}`);
+    if (storeId === 'shufersal' && !orderInUpdateMode) {
+      kb.text('🚚 בחר חלון משלוח', 'nav:slots');
+    }
+    if (stores.isMultiStore()) {
+      kb.row().text('⚖️ השוואת כל הרשתות', 'nav:compare');
+    }
+    if (hasItems) {
+      const checkoutTok = db.saveCallbackPayload({
+        kind: 'checkout_store',
+        storeId,
+      });
+      kb.row().text(
+        orderInUpdateMode
+          ? `💳 שמור עדכון הזמנה #${orderInUpdateMode}`
+          : `💳 המשך להזמנה ב-${meta.shortName}`,
+        `a:${checkoutTok}`,
+      );
+    }
+    return kb;
+  }
+
+  async function renderCartEditView(
+    chatId: number,
+    storeId: StoreId,
+    page: number,
+    messageIdToEdit?: number,
+    noticeText?: string,
+  ): Promise<void> {
+    const mgr = stores.getStore(storeId) ?? stores.getPrimaryStore();
+    const cart = await mgr.getEnrichedCart(chatId);
+
+    if (cart.items.length === 0) {
+      const emptyMsg =
+        (noticeText ? `${noticeText}\n\n` : '') +
+        `🛒 עגלת ${mgr.meta.emoji} <b>${escapeHtml(mgr.meta.displayName)}</b> ריקה כרגע – אין פריטים נוספים להסרה.`;
+      const kb = new InlineKeyboard();
+      if (stores.isMultiStore()) {
+        for (const other of stores.getEnabledStores()) {
+          if (other.id === mgr.storeId) continue;
+          const otherTok = db.saveCallbackPayload({
+            kind: 'cart_edit_page',
+            storeId: other.id,
+            page: 0,
+          });
+          kb.text(`🗑 ערוך ${other.emoji} ${other.shortName}`, `a:${otherTok}`);
+        }
+        kb.row();
+      }
+      kb.text('⬅️ חזרה לעגלה', 'nav:cart');
+      if (messageIdToEdit) {
+        await bot.api.editMessageText(chatId, messageIdToEdit, emptyMsg, {
+          parse_mode: 'HTML',
+          reply_markup: kb,
+        });
+      } else {
+        await bot.api.sendMessage(chatId, emptyMsg, {
+          parse_mode: 'HTML',
+          reply_markup: kb,
+        });
+      }
+      return;
+    }
+
+    const ITEMS_PER_PAGE = 8;
+    const totalPages = Math.max(1, Math.ceil(cart.items.length / ITEMS_PER_PAGE));
+    const safePage = Math.max(0, Math.min(page, totalPages - 1));
+    const startIdx = safePage * ITEMS_PER_PAGE;
+    const pageItems = cart.items.slice(startIdx, startIdx + ITEMS_PER_PAGE);
+
+    const header = cart.orderInUpdateMode
+      ? `🗑 <b>הסרה ועריכת פריטים – הזמנה #${escapeHtml(cart.orderInUpdateMode)} (${escapeHtml(mgr.meta.shortName)})</b>`
+      : `🗑 <b>הסרה ועריכת פריטים ב-${mgr.meta.emoji} ${escapeHtml(mgr.meta.displayName)}</b>`;
+
+    const lines: string[] = [header];
+    if (noticeText) {
+      lines.push(noticeText);
+    }
+    lines.push(
+      `לחצו <b>❌</b> להסרה מלאה של מוצר, או <b>➖</b> להפחתת כמות (סה"כ כעת: <b>${formatCurrency(cart.totalPrice)}</b> • ${cart.items.length} פריטים` +
+        (totalPages > 1 ? ` • עמוד ${safePage + 1}/${totalPages}` : '') +
+        `):`,
+    );
+
+    const kb = new InlineKeyboard();
+    for (const item of pageItems) {
+      const displayName = item.productName ?? item.productCode;
+      const sellingMethod = item.sellingMethod ?? 'BY_UNIT';
+      const qtyShort = formatQuantity(item.quantity, sellingMethod);
+      const oosPrefix = item.inStock ? '' : '⚠️ ';
+      const rmTok = db.saveCallbackPayload({
+        kind: 'cart_item_op',
+        storeId: mgr.storeId,
+        productCode: item.productCode,
+        sellingMethod,
+        op: 'rm',
+        page: safePage,
+      });
+      const decTok = db.saveCallbackPayload({
+        kind: 'cart_item_op',
+        storeId: mgr.storeId,
+        productCode: item.productCode,
+        sellingMethod,
+        op: 'dec',
+        page: safePage,
+      });
+
+      const truncatedName =
+        displayName.length > 24 ? `${displayName.slice(0, 23)}…` : displayName;
+      kb.text(`❌ ${oosPrefix}${truncatedName} (${qtyShort})`, `a:${rmTok}`)
+        .text('➖', `a:${decTok}`)
+        .row();
+    }
+
+    if (totalPages > 1) {
+      if (safePage > 0) {
+        const prevTok = db.saveCallbackPayload({
+          kind: 'cart_edit_page',
+          storeId: mgr.storeId,
+          page: safePage - 1,
+        });
+        kb.text('⬅️ הקודם', `a:${prevTok}`);
+      }
+      if (safePage < totalPages - 1) {
+        const nextTok = db.saveCallbackPayload({
+          kind: 'cart_edit_page',
+          storeId: mgr.storeId,
+          page: safePage + 1,
+        });
+        kb.text('הבא ➡️', `a:${nextTok}`);
+      }
+      kb.row();
+    }
+
+    if (stores.isMultiStore()) {
+      for (const s of stores.getEnabledStores()) {
+        if (s.id === mgr.storeId) continue;
+        const switchTok = db.saveCallbackPayload({
+          kind: 'cart_edit_page',
+          storeId: s.id,
+          page: 0,
+        });
+        kb.text(`${s.emoji} ${s.shortName}`, `a:${switchTok}`);
+      }
+      kb.row();
+    }
+
+    const backCartTok = db.saveCallbackPayload({
+      kind: 'store_cart',
+      storeId: mgr.storeId,
+    });
+    const checkoutTok = db.saveCallbackPayload({
+      kind: 'checkout_store',
+      storeId: mgr.storeId,
+    });
+    kb.text('⬅️ חזרה לעגלה', `a:${backCartTok}`).text(
+      cart.orderInUpdateMode ? '💳 שמור עדכון' : '💳 להזמנה',
+      `a:${checkoutTok}`,
+    );
+
+    const text = lines.join('\n\n');
+    if (messageIdToEdit) {
+      await bot.api.editMessageText(chatId, messageIdToEdit, text, {
+        parse_mode: 'HTML',
+        reply_markup: kb,
+      });
+    } else {
+      await bot.api.sendMessage(chatId, text, {
+        parse_mode: 'HTML',
+        reply_markup: kb,
+      });
+    }
+  }
+
   async function renderSingleStoreCartView(
     chatId: number,
     storeId: StoreId,
@@ -588,28 +790,11 @@ export function createTelegramBot(deps: CreateTelegramBotDeps): Bot {
       mgr.getSelectedSlot().catch(() => null),
     ]);
 
-    const kb = new InlineKeyboard();
-    const refreshTok = db.saveCallbackPayload({
-      kind: 'store_cart',
-      storeId: mgr.storeId,
-    });
-    kb.text('🔄 רענן עגלה', `a:${refreshTok}`);
-    if (mgr.storeId === 'shufersal') {
-      kb.text('🚚 בחר חלון משלוח', 'nav:slots');
-    }
-    if (stores.isMultiStore()) {
-      kb.row().text('⚖️ השוואת כל הרשתות', 'nav:compare');
-    }
-    if (cart.items.length > 0) {
-      const checkoutTok = db.saveCallbackPayload({
-        kind: 'checkout_store',
-        storeId: mgr.storeId,
-      });
-      kb.row().text(
-        `💳 המשך להזמנה ב-${mgr.meta.shortName} (מנהל)`,
-        `a:${checkoutTok}`,
-      );
-    }
+    const kb = buildStoreCartActionKeyboard(
+      mgr.storeId,
+      cart.orderInUpdateMode,
+      cart.items.length > 0,
+    );
 
     const html = renderCartSummaryHtml(mgr.meta, cart, slot);
     if (messageIdToEdit) {
@@ -643,6 +828,83 @@ export function createTelegramBot(deps: CreateTelegramBotDeps): Bot {
       }
     } catch (err) {
       logger.error('/cart command failed', err);
+      await ctx.api.editMessageText(
+        ctx.chat.id,
+        loading.message_id,
+        formatUserFacingError(err),
+        { parse_mode: 'HTML' },
+      );
+    }
+  });
+
+  bot.command(['remove', 'edit'], async (ctx) => {
+    const query = ctx.match.trim();
+    if (!query) {
+      const loading = await ctx.reply(
+        '🗑 טוען את רשימת הפריטים בעגלה להסרה/עריכה...',
+      );
+      try {
+        await renderCartEditView(
+          ctx.chat.id,
+          stores.getPrimaryStore().storeId,
+          0,
+          loading.message_id,
+        );
+      } catch (err) {
+        logger.error('/remove command failed', err);
+        await ctx.api.editMessageText(
+          ctx.chat.id,
+          loading.message_id,
+          formatUserFacingError(err),
+          { parse_mode: 'HTML' },
+        );
+      }
+      return;
+    }
+
+    const loading = await ctx.reply(
+      `🗑 מחפש ומסיר את <b>${escapeHtml(query)}</b> מהעגלות...`,
+      { parse_mode: 'HTML' },
+    );
+    try {
+      const results = await stores.removeAcrossStores({
+        chatId: ctx.chat.id,
+        query,
+      });
+      const removedAny = results.filter((r) => r.removedItem);
+
+      if (removedAny.length === 0) {
+        const kb = new InlineKeyboard().text(
+          '🗑 פתח רשימת פריטים להסרה',
+          'nav:edit_cart',
+        );
+        await ctx.api.editMessageText(
+          ctx.chat.id,
+          loading.message_id,
+          `ℹ️ לא נמצא באף עגלה מוצר תואם ל-"<b>${escapeHtml(query)}</b>".\nלחצו על הכפתור כדי לבחור מתוך רשימת הפריטים בעגלה:`,
+          { parse_mode: 'HTML', reply_markup: kb },
+        );
+        return;
+      }
+
+      const kb = new InlineKeyboard()
+        .text('🗑 הסר פריטים נוספים', 'nav:edit_cart')
+        .text('🛒 הצג עגלות', 'nav:cart');
+      await ctx.api.editMessageText(
+        ctx.chat.id,
+        loading.message_id,
+        `🗑 <b>הוסר מהעגלות:</b> ${escapeHtml(query)}\n` +
+          removedAny
+            .map(
+              (r) =>
+                `${r.meta.emoji} ${escapeHtml(r.meta.shortName)}: ${escapeHtml(r.removedItem!.productName ?? r.removedItem!.productCode)}` +
+                (r.cart ? ` (עגלה: ${formatCurrency(r.cart.totalPrice)})` : ''),
+            )
+            .join('\n'),
+        { parse_mode: 'HTML', reply_markup: kb },
+      );
+    } catch (err) {
+      logger.error('/remove <query> command failed', err);
       await ctx.api.editMessageText(
         ctx.chat.id,
         loading.message_id,
@@ -1072,9 +1334,7 @@ export function createTelegramBot(deps: CreateTelegramBotDeps): Bot {
     }
     kb.text('❌ ביטול', 'nav:cancel');
 
-    const fullText =
-      `${summaryHtml}${modeNote}\n\n` +
-      `🔐 <i>אישור סופי זמין למנהלי הקבוצה בלבד.</i>`;
+    const fullText = `${summaryHtml}${modeNote}`;
 
     if (messageIdToEdit) {
       await bot.api.editMessageText(chatId, messageIdToEdit, fullText, {
@@ -1090,14 +1350,6 @@ export function createTelegramBot(deps: CreateTelegramBotDeps): Bot {
   }
 
   bot.command('checkout', async (ctx) => {
-    if (!(await isUserAdmin(ctx))) {
-      await ctx.reply(
-        `⛔ רק מנהל/ת הקבוצה רשאי/ת ליזום סגירה ואישור הזמנה.\n<i>(למתן הרשאה למשתמש נוסף ניתן להוסיף ל-<code>ADMIN_USER_IDS</code> את המזהה: <code>${ctx.from?.id ?? ''}</code>)</i>`,
-        { parse_mode: 'HTML' },
-      );
-      return;
-    }
-
     const loading = await ctx.reply(
       stores.isMultiStore()
         ? '💳 משווה את כל העגלות ומאתר את הסופר הזול ביותר להזמנה...'
@@ -1195,6 +1447,17 @@ export function createTelegramBot(deps: CreateTelegramBotDeps): Bot {
         return;
       }
 
+      if (data === 'nav:edit_cart') {
+        await ctx.answerCallbackQuery('פותח רשימת פריטים להסרה ועריכה...');
+        await renderCartEditView(
+          chatId,
+          stores.getPrimaryStore().storeId,
+          0,
+          messageId,
+        );
+        return;
+      }
+
       if (data === 'nav:slots') {
         await ctx.answerCallbackQuery('טוען חלונות משלוח...');
         const target = stores.getStore('shufersal') ?? stores.getPrimaryStore();
@@ -1203,13 +1466,6 @@ export function createTelegramBot(deps: CreateTelegramBotDeps): Bot {
       }
 
       if (data === 'nav:checkout') {
-        if (!(await isUserAdmin(ctx))) {
-          await ctx.answerCallbackQuery({
-            text: '⛔ פעולה זו מיועדת למנהלי הקבוצה בלבד',
-            show_alert: true,
-          });
-          return;
-        }
         await ctx.answerCallbackQuery('משווה עגלות ומכין סיכום...');
         if (stores.isMultiStore()) {
           await renderMultiStoreCheckoutChooser(chatId, messageId);
@@ -1736,7 +1992,7 @@ export function createTelegramBot(deps: CreateTelegramBotDeps): Bot {
             storeId: mgr.storeId,
           });
           const kb = new InlineKeyboard().text(
-            `💳 המשך לאישור הזמנה ב-${mgr.meta.shortName} (מנהל)`,
+            `💳 המשך לאישור הזמנה ב-${mgr.meta.shortName}`,
             `a:${checkoutTok}`,
           );
 
@@ -1750,35 +2006,95 @@ export function createTelegramBot(deps: CreateTelegramBotDeps): Bot {
         }
 
         if (payload.kind === 'order_edit') {
-          if (!(await isUserAdmin(ctx))) {
-            await ctx.answerCallbackQuery({
-              text: '⛔ טעינת הזמנה לעדכון מיועדת למנהלי הקבוצה בלבד',
-              show_alert: true,
-            });
-            return;
-          }
           const storeId: StoreId = payload.storeId ?? 'shufersal';
           const mgr = stores.getStore(storeId) ?? stores.getPrimaryStore();
           await ctx.answerCallbackQuery('טוען את ההזמנה לעגלה...');
           const cart = await mgr.loadOrderForUpdate(chatId, payload.orderCode);
+          const kb = buildStoreCartActionKeyboard(
+            mgr.storeId,
+            cart.orderInUpdateMode ?? payload.orderCode,
+            cart.items.length > 0,
+          );
           await ctx.editMessageText(
             `✏️ <b>הזמנה #${escapeHtml(payload.orderCode)} נטענה לעגלה במצב עדכון!</b>\n\n` +
-              `כל מצרך שיישלח עכשיו בקבוצה יתווסף להזמנה זו.\n` +
-              `⚠️ <b>חשוב:</b> בסיום הוספת המצרכים, על המנהל/ת להריץ /checkout ולאשר את שמירת העדכון!\n\n` +
+              `• להוספת מוצרים – כתבו כרגיל בקבוצה.\n` +
+              `• להסרת מוצרים – לחצו <b>🗑 הסר / ערוך פריטים בהזמנה</b> למטה, הקלידו <code>/remove</code>, או כתבו <i>"תורידו את..."</i>.\n` +
+              `⚠️ <b>חשוב:</b> בסיום העריכה, יש להריץ /checkout (או ללחוץ שמור עדכון) כדי לשמור את השינויים!\n\n` +
               renderCartSummaryHtml(mgr.meta, cart),
-            { parse_mode: 'HTML' },
+            {
+              parse_mode: 'HTML',
+              reply_markup: cart.items.length > 0 ? kb : undefined,
+            },
           );
           return;
         }
 
-        if (payload.kind === 'checkout_store') {
-          if (!(await isUserAdmin(ctx))) {
-            await ctx.answerCallbackQuery({
-              text: '⛔ פעולה זו מיועדת למנהלי הקבוצה בלבד',
-              show_alert: true,
+        if (payload.kind === 'cart_edit_page') {
+          await ctx.answerCallbackQuery();
+          await renderCartEditView(
+            chatId,
+            payload.storeId ?? stores.getPrimaryStore().storeId,
+            payload.page,
+            messageId,
+          );
+          return;
+        }
+
+        if (payload.kind === 'cart_item_op') {
+          const storeId: StoreId =
+            payload.storeId ?? stores.getPrimaryStore().storeId;
+          const mgr = stores.getStore(storeId) ?? stores.getPrimaryStore();
+
+          if (payload.op === 'rm') {
+            await ctx.answerCallbackQuery(
+              `מסיר מוצר מ-${mgr.meta.shortName}...`,
+            );
+            const { removedItem } = await mgr.removeProductByCode({
+              chatId,
+              productCode: payload.productCode,
             });
+            const notice = removedItem
+              ? `✅ <b>הוסר מהעגלה (${escapeHtml(mgr.meta.shortName)}):</b> ${escapeHtml(removedItem.productName ?? removedItem.productCode)}`
+              : `ℹ️ המוצר כבר אינו בעגלה.`;
+            await renderCartEditView(
+              chatId,
+              mgr.storeId,
+              payload.page,
+              messageId,
+              notice,
+            );
             return;
           }
+
+          if (payload.op === 'dec') {
+            const step = payload.sellingMethod === 'BY_WEIGHT' ? 0.5 : 1;
+            await ctx.answerCallbackQuery(
+              `מפחית כמות ב-${mgr.meta.shortName}...`,
+            );
+            const cached = db.getCachedProduct(payload.productCode, mgr.storeId);
+            const { newQuantity } = await mgr.adjustQuantityByDelta({
+              chatId,
+              productCode: payload.productCode,
+              sellingMethod: payload.sellingMethod,
+              delta: -step,
+            });
+            const label = escapeHtml(cached?.name ?? payload.productCode);
+            const notice =
+              newQuantity <= 0
+                ? `✅ <b>הוסר מהעגלה (${escapeHtml(mgr.meta.shortName)}):</b> ${label}`
+                : `✅ <b>עודכנה כמות (${escapeHtml(mgr.meta.shortName)}):</b> ${label} → <b>${escapeHtml(formatQuantity(newQuantity, payload.sellingMethod))}</b>`;
+            await renderCartEditView(
+              chatId,
+              mgr.storeId,
+              payload.page,
+              messageId,
+              notice,
+            );
+            return;
+          }
+        }
+
+        if (payload.kind === 'checkout_store') {
           await ctx.answerCallbackQuery(
             `מכין סיכום הזמנה ב-${STORE_META[payload.storeId].shortName}...`,
           );
@@ -1791,14 +2107,6 @@ export function createTelegramBot(deps: CreateTelegramBotDeps): Bot {
         }
 
         if (payload.kind === 'checkout_exec') {
-          if (!(await isUserAdmin(ctx))) {
-            await ctx.answerCallbackQuery({
-              text: '⛔ אישור וחיוב הזמנה מותר למנהלי הקבוצה בלבד!',
-              show_alert: true,
-            });
-            return;
-          }
-
           const storeId: StoreId = payload.storeId ?? stores.getPrimaryStore().storeId;
           const meta = STORE_META[storeId];
 
@@ -2112,7 +2420,8 @@ export async function registerBotCommands(bot: Bot): Promise<void> {
   await bot.api.setMyCommands([
     { command: 'compare', description: 'השוואת מחירים בין שופרסל, חצי חינם וסופר חביב' },
     { command: 'cart', description: 'הצגת העגלות ופירוט פריטים בכל חנות' },
-    { command: 'checkout', description: '(מנהל) בחירת הסל הזול ביותר ואישור הזמנה' },
+    { command: 'remove', description: 'הסרה או עריכת כמות של פריטים בעגלות / בהזמנה' },
+    { command: 'checkout', description: 'בחירת הסל הזול ביותר ואישור הזמנה' },
     { command: 'stores', description: 'רשימת החנויות המחוברות וקישורים לעגלות' },
     { command: 'slots', description: 'בחירת יום ושעת משלוח' },
     { command: 'orders', description: 'צפייה בהזמנות פעילות וטעינה לעדכון' },

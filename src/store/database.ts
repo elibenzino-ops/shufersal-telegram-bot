@@ -68,6 +68,19 @@ export type CallbackPayload =
       orderCode: string;
     }
   | {
+      kind: 'cart_edit_page';
+      storeId?: StoreId;
+      page: number;
+    }
+  | {
+      kind: 'cart_item_op';
+      storeId?: StoreId;
+      productCode: string;
+      sellingMethod: SellingMethodCode;
+      op: 'rm' | 'dec';
+      page: number;
+    }
+  | {
       kind: 'checkout_store';
       storeId: StoreId;
     }

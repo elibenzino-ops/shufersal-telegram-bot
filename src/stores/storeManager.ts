@@ -1,4 +1,5 @@
 import type { BotDatabase } from '../store/database.js';
+import { normalizeHebrewQuery } from '../utils/format.js';
 import { AsyncMutex } from '../utils/mutex.js';
 import type {
   ActiveOrderSummary,
@@ -109,15 +110,73 @@ export class StoreManager {
       const rawCart = await this.client.getCartState();
       const enriched = this.enrichCart(params.chatId, rawCart);
       const needle = params.query.trim().toLowerCase();
+      const normalizedNeedle = normalizeHebrewQuery(params.query);
+      const needleTokens = normalizedNeedle.split(' ').filter((t) => t.length > 0);
 
-      const match = enriched.items.find((item) => {
+      // 1. Direct code or contiguous substring match
+      let match = enriched.items.find((item) => {
         const name = (item.productName ?? '').toLowerCase();
+        const normName = normalizeHebrewQuery(item.productName ?? '');
         return (
-          name.includes(needle) ||
-          (name.length > 0 && needle.includes(name)) ||
-          item.productCode.toLowerCase() === needle
+          item.productCode.toLowerCase() === needle ||
+          (needle.length > 0 && name.includes(needle)) ||
+          (normalizedNeedle.length > 0 && normName.includes(normalizedNeedle)) ||
+          (name.length > 0 && needle.includes(name))
         );
       });
+
+      // 2. Multi-word token match (e.g. "חלב תנובה" matches "חלב מפוסטר 3% תנובה בקרטון")
+      if (!match && needleTokens.length > 0) {
+        let bestItem: CartItem | undefined;
+        let bestScore = 0;
+
+        for (const item of enriched.items) {
+          const normName = normalizeHebrewQuery(item.productName ?? '');
+          if (!normName) continue;
+          const matchedTokens = needleTokens.filter((t) => normName.includes(t));
+          const ratio = matchedTokens.length / needleTokens.length;
+          if (matchedTokens.length > 0 && ratio >= 0.5 && ratio > bestScore) {
+            bestScore = ratio;
+            bestItem = item;
+          }
+        }
+        match = bestItem;
+      }
+
+      if (!match) {
+        return { removedItem: null, cart: enriched };
+      }
+
+      const nextCart = await this.client.removeFromCart(
+        match.productCode,
+        match.entryNumber,
+      );
+      this.db.removeProductContributors(
+        params.chatId,
+        match.productCode,
+        this.storeId,
+      );
+
+      return {
+        removedItem: match,
+        cart: this.enrichCart(params.chatId, nextCart),
+      };
+    });
+  }
+
+  async removeProductByCode(params: {
+    chatId: number;
+    productCode: string;
+  }): Promise<{
+    removedItem: CartItem | null;
+    cart: CartState;
+  }> {
+    return this.mutex.runExclusive(async () => {
+      const rawCart = await this.client.getCartState();
+      const enriched = this.enrichCart(params.chatId, rawCart);
+      const match = enriched.items.find(
+        (item) => item.productCode === params.productCode,
+      );
 
       if (!match) {
         return { removedItem: null, cart: enriched };

@@ -288,6 +288,81 @@ describe('BotDatabase & ShufersalManager', () => {
     const pref = db.getPreference('חלב 3%"');
     expect(pref?.productCode).toBe(milkYotvata.code);
   });
+
+  it('removes items by multi-word Hebrew query or exact product code', async () => {
+    let mockItems: CartState['items'] = [
+      {
+        entryNumber: 0,
+        productCode: milkTnuva.code,
+        productName: milkTnuva.name,
+        quantity: 2,
+        itemPrice: 14.2,
+        inStock: true,
+      },
+      {
+        entryNumber: 1,
+        productCode: milkYotvata.code,
+        productName: milkYotvata.name,
+        quantity: 1,
+        itemPrice: 8.5,
+        inStock: true,
+      },
+    ];
+
+    const mockClient = {
+      getCartState: vi.fn(async (): Promise<CartState> => ({
+        items: [...mockItems],
+        totalPrice: mockItems.reduce((s, i) => s + i.itemPrice, 0),
+        orderInUpdateMode: '99887766',
+      })),
+      removeFromCart: vi.fn(async (code: string): Promise<CartState> => {
+        mockItems = mockItems.filter((i) => i.productCode !== code);
+        return {
+          items: [...mockItems],
+          totalPrice: mockItems.reduce((s, i) => s + i.itemPrice, 0),
+          orderInUpdateMode: '99887766',
+        };
+      }),
+    } as unknown as ShufersalClient;
+
+    const manager = new ShufersalManager(mockClient, db);
+    const chatId = -100777;
+    db.addContributor(chatId, milkTnuva.code, 'אלי');
+
+    // Non-contiguous multi-word Hebrew query ("חלב תנובה") matches "חלב מפוסטר 3% תנובה בקרטון"
+    const res1 = await manager.removeMatchingProduct({
+      chatId,
+      query: 'חלב תנובה',
+    });
+    expect(res1.removedItem?.productCode).toBe(milkTnuva.code);
+    expect(res1.cart.items).toHaveLength(1);
+    expect(db.getContributorsByChat(chatId).has(milkTnuva.code)).toBe(false);
+
+    // Direct removal by productCode (used by interactive inline buttons)
+    const res2 = await manager.removeProductByCode({
+      chatId,
+      productCode: milkYotvata.code,
+    });
+    expect(res2.removedItem?.productCode).toBe(milkYotvata.code);
+    expect(res2.cart.items).toHaveLength(0);
+
+    // Verify compact callback token for cart_item_op
+    const opTok = db.saveCallbackPayload({
+      kind: 'cart_item_op',
+      productCode: milkTnuva.code,
+      sellingMethod: 'BY_UNIT',
+      op: 'rm',
+      page: 0,
+    });
+    expect(Buffer.byteLength(`a:${opTok}`, 'utf8')).toBeLessThan(32);
+    expect(db.getCallbackPayload(opTok)).toEqual({
+      kind: 'cart_item_op',
+      productCode: milkTnuva.code,
+      sellingMethod: 'BY_UNIT',
+      op: 'rm',
+      page: 0,
+    });
+  });
 });
 
 describe('format helpers', () => {
