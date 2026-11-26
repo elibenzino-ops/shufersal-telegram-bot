@@ -554,7 +554,19 @@ export function createTelegramBot(deps: CreateTelegramBotDeps): Bot {
 
     kb.text('🗑 הסר / ערוך פריטים', 'nav:edit_cart')
       .text('🔄 רענן השוואה', 'nav:compare');
-    kb.row().text('🚚 חלונות משלוח', 'nav:slots');
+    kb.row();
+    const enabledStores = stores.getEnabledStores();
+    if (enabledStores.length > 1) {
+      for (const meta of enabledStores) {
+        const slotTok = db.saveCallbackPayload({
+          kind: 'store_slots',
+          storeId: meta.id,
+        });
+        kb.text(`🚚 ${meta.emoji} משלוח ${meta.shortName}`, `a:${slotTok}`);
+      }
+    } else {
+      kb.text('🚚 חלונות משלוח', 'nav:slots');
+    }
     return kb;
   }
 
@@ -1345,12 +1357,24 @@ export function createTelegramBot(deps: CreateTelegramBotDeps): Bot {
     const mgr = stores.getStore(storeId) ?? stores.getPrimaryStore();
     const slots = await mgr.getAvailableSlots();
     if (slots.length === 0) {
+      const isAuthed = mgr.isAuthenticated();
+      const authWarn = mgr.getAuthWarning();
+      const reasonLine = !isAuthed
+        ? `\n🔐 <b>הבוט פועל כרגע במצב אורח ב-${escapeHtml(mgr.meta.shortName)}</b>` +
+          (authWarn ? ` (${escapeHtml(authWarn.slice(0, 140))})` : '') +
+          ` — כדי לטעון חלונות משלוח לכתובת שלכם יש להגדיר <code>HAZI_HINAM_USERNAME</code> ו-<code>HAZI_HINAM_PASSWORD</code> ב-<code>.env</code>.`
+        : `\nℹ️ ייתכן שכל החלונות הפנויים לכתובת ברירת המחדל מלאים כרגע או שלא הוגדרה כתובת משלוח בחשבון.`;
       const msg =
-        `😕 לא נמצאו חלונות משלוח זמינים דרך ה-API ב-${escapeHtml(mgr.meta.displayName)}.\n` +
-        `ניתן לבחור חלון משלוח ישירות בקישור: <a href="${escapeHtml(mgr.meta.cartUrl)}">${escapeHtml(mgr.meta.displayName)}</a>`;
-      const kb = stores.isMultiStore()
-        ? new InlineKeyboard().text('⬅️ בחר רשת אחרת', 'nav:slots')
-        : undefined;
+        `😕 לא נמצאו חלונות משלוח זמינים כרגע ב-${escapeHtml(mgr.meta.displayName)}.${reasonLine}\n\n` +
+        `🔗 ניתן לבחור חלון משלוח ישירות באתר: <a href="${escapeHtml(mgr.meta.cartUrl)}">${escapeHtml(mgr.meta.displayName)}</a>`;
+      const retryTok = db.saveCallbackPayload({
+        kind: 'store_slots',
+        storeId: mgr.storeId,
+      });
+      const kb = new InlineKeyboard().text('🔄 נסה שוב', `a:${retryTok}`);
+      if (stores.isMultiStore()) {
+        kb.text('⬅️ בחר רשת אחרת', 'nav:slots');
+      }
       if (messageIdToEdit) {
         await bot.api.editMessageText(chatId, messageIdToEdit, msg, {
           parse_mode: 'HTML',
@@ -1365,6 +1389,14 @@ export function createTelegramBot(deps: CreateTelegramBotDeps): Bot {
       return;
     }
 
+    const firstRaw = slots[0]?.rawSlot ?? {};
+    const locationLine =
+      firstRaw['IsSelfPickUp'] === true && typeof firstRaw['StoreName'] === 'string' && firstRaw['StoreName']
+        ? `\n🏪 <i>איסוף עצמי: ${escapeHtml(firstRaw['StoreName'])}</i>`
+        : typeof firstRaw['AddressName'] === 'string' && firstRaw['AddressName']
+          ? `\n📍 <i>כתובת משלוח: ${escapeHtml(firstRaw['AddressName'])}</i>`
+          : '';
+
     const byDay = new Map<string, { label: string; slots: DeliverySlot[] }>();
     for (const s of slots) {
       const { dateKey, label } = formatHebrewDayHeader(s.startIso);
@@ -1378,7 +1410,7 @@ export function createTelegramBot(deps: CreateTelegramBotDeps): Bot {
 
     if (!selectedDayKey || !byDay.has(selectedDayKey)) {
       text =
-        `🚚 <b>בחירת יום משלוח ב-${escapeHtml(mgr.meta.emoji)} ${escapeHtml(mgr.meta.displayName)}:</b>\n` +
+        `🚚 <b>בחירת יום משלוח ב-${escapeHtml(mgr.meta.emoji)} ${escapeHtml(mgr.meta.displayName)}:</b>${locationLine}\n` +
         `בחרו את היום המבוקש מתוך החלונות הפנויים:`;
       for (const [dateKey, group] of byDay.entries()) {
         const tok = db.saveCallbackPayload({
@@ -1397,7 +1429,7 @@ export function createTelegramBot(deps: CreateTelegramBotDeps): Bot {
     } else {
       const group = byDay.get(selectedDayKey)!;
       text =
-        `🕒 <b>בחירת שעת משלוח עבור ${escapeHtml(group.label)} (${escapeHtml(mgr.meta.shortName)}):</b>\n` +
+        `🕒 <b>בחירת שעת משלוח עבור ${escapeHtml(group.label)} (${escapeHtml(mgr.meta.shortName)}):</b>${locationLine}\n` +
         `לחצו על השעה הרצויה לשריון המשלוח בעגלה:`;
 
       for (const s of group.slots) {
@@ -1742,9 +1774,11 @@ export function createTelegramBot(deps: CreateTelegramBotDeps): Bot {
         storeId: mgr.storeId,
       });
       kb.text(
-        selectedSlot ? '🕒 החלף חלון משלוח' : '🚚 בחר חלון משלוח',
+        selectedSlot
+          ? `🕒 החלף חלון משלוח (${mgr.meta.shortName})`
+          : `🚚 בחר חלון משלוח (${mgr.meta.shortName})`,
         `a:${slotsTok}`,
-      );
+      ).row();
     }
     if (stores.isMultiStore()) {
       kb.text('⚖️ החלף חנות', 'nav:checkout');

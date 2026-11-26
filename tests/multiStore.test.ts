@@ -1144,4 +1144,428 @@ describe('rankStoreQuotes & MultiStoreManager (Shufersal + Hazi Hinam)', () => {
     expect(greeting.isGroceryRelated).toBe(false);
     expect(mockGenerate.mock.calls.length).toBe(callsAfterFirst429);
   });
+
+  it('loads real Hazi Hinam getNextDeliveries Addresses/Stores ShipmentsByDate, cartSummary, and ChangeDraftOrderShipping', async () => {
+    const sessionFilePath = path.join(tmpDir, 'hazi-real-api-session.json');
+    let draftShippingCall: { url: string; body: Record<string, unknown> } | null = null;
+    let clearCartDeleted = false;
+
+    const mockFetch: typeof fetch = vi.fn(async (input, init) => {
+      const url = typeof input === 'string' ? input : input.toString();
+      const method = (init?.method ?? 'GET').toUpperCase();
+
+      if (url.includes('/connect/token')) {
+        return new Response(
+          JSON.stringify({ access_token: 'hazi-real-token', expires_in: 7200 }),
+          { status: 200, headers: { 'content-type': 'application/json' } },
+        );
+      }
+
+      if (url.includes('/proxy/api/delivery/getNextDeliveries')) {
+        return new Response(
+          JSON.stringify({
+            IsOK: true,
+            Results: {
+              Addresses: [
+                {
+                  Id: 101,
+                  Name: 'חיפה, הרצל 1',
+                  IsDefault: false,
+                  ShipmentsByDate: [],
+                },
+                {
+                  Id: 202,
+                  Name: 'ירושלים, יפו 15',
+                  IsDefault: true,
+                  ShipmentsByDate: [
+                    {
+                      Date: '28/11/2026',
+                      DOW: 'שבת',
+                      Shipments: [
+                        {
+                          ShipmentId: 9001,
+                          IsClosedShipment: true,
+                          Time: { From: '08:00', To: '10:00' },
+                        },
+                      ],
+                    },
+                    {
+                      Date: '29/11/2026',
+                      DOW: 'ראשון',
+                      Shipments: [
+                        {
+                          ShipmentId: 9002,
+                          IsClosedShipment: false,
+                          Time: { From: '10:00', To: '12:00' },
+                          Price: 29.9,
+                        },
+                        {
+                          ShipmentId: 9003,
+                          IsClosedShipment: false,
+                          Time: { From: '16:00', To: '18:00' },
+                          Price: 24.9,
+                        },
+                      ],
+                    },
+                  ],
+                },
+              ],
+              Stores: [],
+            },
+          }),
+          { status: 200, headers: { 'content-type': 'application/json' } },
+        );
+      }
+
+      if (url.includes('/proxy/api/item/getItemsInCart')) {
+        return new Response(
+          JSON.stringify({
+            IsOK: true,
+            Results: {
+              CartItems: [
+                {
+                  ItemId: 777,
+                  Name: 'לחם אחיד פרוס',
+                  Quantity: 2,
+                  Price_NET: 8.5,
+                  IsInStock: true,
+                },
+              ],
+            },
+          }),
+          { status: 200, headers: { 'content-type': 'application/json' } },
+        );
+      }
+
+      if (url.includes('/proxy/api/order/cartSummary')) {
+        return new Response(
+          JSON.stringify({
+            IsOK: true,
+            Results: {
+              CartSummary: {
+                Price_Order_Total: 17.0,
+                Price_Shipping: 29.9,
+                Minimum_Cart_Price_NET: 200,
+                Order_Draft_Id: 5544,
+              },
+            },
+          }),
+          { status: 200, headers: { 'content-type': 'application/json' } },
+        );
+      }
+
+      if (url.includes('/proxy/api/order/ChangeDraftOrderShipping')) {
+        draftShippingCall = {
+          url,
+          body: JSON.parse(String(init?.body ?? '{}')) as Record<string, unknown>,
+        };
+        return new Response(JSON.stringify({ IsOK: true }), {
+          status: 200,
+          headers: { 'content-type': 'application/json' },
+        });
+      }
+
+      if (url.includes('/proxy/api/item/removeItemsInCart') && method === 'DELETE') {
+        clearCartDeleted = true;
+        return new Response(JSON.stringify({ IsOK: true }), {
+          status: 200,
+          headers: { 'content-type': 'application/json' },
+        });
+      }
+
+      if (url.includes('/proxy/api/order/history')) {
+        return new Response(
+          JSON.stringify({
+            IsOK: true,
+            Results: {
+              Orders: [
+                {
+                  OrderId: 6601,
+                  ShipmentDate: '30/11/2026',
+                  Time: { From: '12:00', To: '14:00' },
+                  Price_Order_Total: 312.5,
+                  ItemsCount: 18,
+                  StatusName: 'התקבלה',
+                },
+              ],
+            },
+          }),
+          { status: 200, headers: { 'content-type': 'application/json' } },
+        );
+      }
+
+      return new Response(JSON.stringify({ IsOK: false }), { status: 404 });
+    });
+
+    const client = new HaziHinamClient({
+      username: 'eli@example.com',
+      password: 'secret',
+      sessionFilePath,
+      fetchFn: mockFetch,
+    });
+
+    const cart = await client.getCartState();
+    expect(cart.items).toHaveLength(1);
+    expect(cart.totalPrice).toBe(17);
+    expect(cart.deliveryFee).toBe(29.9);
+
+    const slots = await client.getAvailableTimeSlots();
+    expect(slots).toHaveLength(2);
+    expect(slots.map((s) => s.code)).toEqual(['9002', '9003']);
+    expect(slots[0]?.startHourText).toBe('10:00');
+    expect(slots[0]?.endHourText).toBe('12:00');
+    expect(slots[0]?.rawSlot['AddressName']).toBe('ירושלים, יפו 15');
+    expect(slots[0]?.rawSlot['AddressId']).toBe(202);
+
+    const chosen = await client.selectTimeSlot('9003');
+    expect(chosen.code).toBe('9003');
+    expect(chosen.deliveryFee).toBe(24.9);
+    expect(draftShippingCall).not.toBeNull();
+    expect(draftShippingCall!.url).toContain('Id=5544');
+    expect(draftShippingCall!.body).toEqual({
+      Object: { AddressId: 202, StoreId: null, ShipmentId: 9003 },
+    });
+
+    const orders = await client.getActiveOrders();
+    expect(orders).toHaveLength(1);
+    expect(orders[0]?.code).toBe('6601');
+    expect(orders[0]?.deliveryHoursText).toBe('12:00–14:00');
+
+    await client.clearCart();
+    expect(clearCartDeleted).toBe(true);
+
+    // Pickup store fallback when Addresses has no open slots
+    const pickupSlots = parseHaziHinamDeliverySlots(
+      {
+        IsOK: true,
+        Results: {
+          Addresses: [],
+          Stores: [
+            {
+              Id: 7,
+              Name: 'חצי חינם חולון',
+              ShipmentsByDate: [
+                {
+                  Date: '01/12/2026',
+                  DOW: 'שלישי',
+                  Shipments: [
+                    {
+                      ShipmentId: 8801,
+                      IsClosedShipment: false,
+                      Time: { From: '14:00', To: '16:00' },
+                      Price: 0,
+                    },
+                  ],
+                },
+              ],
+            },
+          ],
+        },
+      },
+      29.9,
+    );
+    expect(pickupSlots).toHaveLength(1);
+    expect(pickupSlots[0]?.code).toBe('8801');
+    expect(pickupSlots[0]?.rawSlot['IsSelfPickUp']).toBe(true);
+    expect(pickupSlots[0]?.rawSlot['StoreName']).toBe('חצי חינם חולון');
+    expect(pickupSlots[0]?.deliveryFee).toBe(0);
+  });
+
+  it('supports full Telegram /slots and /compare delivery slot selection flow for Hazi Hinam', async () => {
+    const shufersalSlot: DeliverySlot = {
+      code: 'SHUF-1',
+      startIso: '2026-12-01T08:00:00.000Z',
+      endIso: '2026-12-01T10:00:00.000Z',
+      startHourText: '10:00',
+      endHourText: '12:00',
+      deliveryFee: 29.9,
+      selectable: true,
+      isToday: false,
+      rawSlot: {},
+    };
+    const haziSlot: DeliverySlot = {
+      code: '9002',
+      startIso: '2026-12-02T08:00:00.000Z',
+      endIso: '2026-12-02T10:00:00.000Z',
+      startHourText: '10:00',
+      endHourText: '12:00',
+      deliveryFee: 24.9,
+      selectable: true,
+      isToday: false,
+      rawSlot: {
+        AddressId: 202,
+        AddressName: 'ירושלים, יפו 15',
+        IsSelfPickUp: false,
+      },
+    };
+
+    const shufersalClient = makeMockStoreClient('shufersal', [], 29.9, [shufersalSlot]);
+    const haziClient = makeMockStoreClient('hazi_hinam', [], 29.9, [haziSlot]);
+    const multi = new MultiStoreManager(
+      [new StoreManager(shufersalClient, db), new StoreManager(haziClient, db)],
+      db,
+    );
+
+    const apiCalls: Array<{ method: string; payload: Record<string, unknown> }> = [];
+    const bot = createTelegramBot({
+      config: {
+        telegramBotToken: '123456:TEST_TOKEN',
+        geminiApiKey: 'dummy',
+        geminiModel: 'gemini-3.8-flash',
+        enabledStores: ['shufersal', 'hazi_hinam'],
+        shufersalUsername: 'u',
+        shufersalPassword: 'p',
+        allowedChatIds: [-100555],
+        adminUserIds: [111],
+        autoRemoveOutOfStock: true,
+        headless: true,
+        dataDir: tmpDir,
+        dbPath: path.join(tmpDir, 'test.sqlite'),
+        sessionFilePath: path.join(tmpDir, 'shuf.json'),
+        haziHinamSessionFilePath: path.join(tmpDir, 'hazi.json'),
+        screenshotsDir: tmpDir,
+      } as AppConfig,
+      db,
+      stores: multi,
+      ai: new GroceryAiService('dummy-key', 'gemini-3.8-flash'),
+    });
+
+    bot.botInfo = {
+      id: 999,
+      is_bot: true,
+      first_name: 'TestBot',
+      username: 'test_bot',
+      can_join_groups: true,
+      can_read_all_group_messages: true,
+      supports_inline_queries: false,
+      can_connect_to_business: false,
+      has_main_web_app: false,
+    };
+
+    let nextMsgId = 100;
+    bot.api.config.use(async (_prev, method, payload) => {
+      apiCalls.push({ method, payload: payload as Record<string, unknown> });
+      if (method === 'sendMessage') {
+        return {
+          ok: true,
+          result: {
+            message_id: ++nextMsgId,
+            date: Math.floor(Date.now() / 1000),
+            chat: { id: -100555, type: 'supergroup', title: 'Family' },
+            text: String((payload as Record<string, unknown>)['text'] ?? ''),
+          },
+        } as never;
+      }
+      return { ok: true, result: true } as never;
+    });
+
+    const extractButtons = (
+      call: { payload: Record<string, unknown> } | undefined,
+    ): Array<{ text: string; callback_data?: string }> => {
+      const markup = call?.payload['reply_markup'] as
+        | { inline_keyboard?: Array<Array<{ text: string; callback_data?: string }>> }
+        | undefined;
+      return markup?.inline_keyboard?.flat() ?? [];
+    };
+
+    // 1. User sends /slots -> chooser shows both Shufersal and Hazi Hinam
+    await bot.handleUpdate({
+      update_id: 1,
+      message: {
+        message_id: 1,
+        date: Math.floor(Date.now() / 1000),
+        chat: { id: -100555, type: 'supergroup', title: 'Family' },
+        from: { id: 111, is_bot: false, first_name: 'Eli' },
+        text: '/slots',
+        entities: [{ offset: 0, length: 6, type: 'bot_command' }],
+      },
+    });
+
+    const chooserCall = [...apiCalls].reverse().find((c) => c.method === 'editMessageText');
+    const chooserButtons = extractButtons(chooserCall);
+    const haziSlotsBtn = chooserButtons.find((b) => b.text.includes('חצי חינם'));
+    expect(haziSlotsBtn?.callback_data).toMatch(/^a:/);
+
+    // 2. Click Hazi Hinam slots button -> shows delivery address + day picker
+    await bot.handleUpdate({
+      update_id: 2,
+      callback_query: {
+        id: 'cb-1',
+        from: { id: 111, is_bot: false, first_name: 'Eli' },
+        chat_instance: 'ci-1',
+        data: haziSlotsBtn!.callback_data!,
+        message: {
+          message_id: 101,
+          date: Math.floor(Date.now() / 1000),
+          chat: { id: -100555, type: 'supergroup', title: 'Family' },
+          text: '',
+        },
+      },
+    });
+
+    const dayPickerCall = [...apiCalls].reverse().find((c) => c.method === 'editMessageText');
+    expect(String(dayPickerCall?.payload['text'])).toContain('ירושלים, יפו 15');
+    const dayBtn = extractButtons(dayPickerCall).find((b) => b.text.includes('חלונות'));
+    expect(dayBtn?.callback_data).toMatch(/^a:/);
+
+    // 3. Click day button -> shows Hazi Hinam hour button
+    await bot.handleUpdate({
+      update_id: 3,
+      callback_query: {
+        id: 'cb-2',
+        from: { id: 111, is_bot: false, first_name: 'Eli' },
+        chat_instance: 'ci-1',
+        data: dayBtn!.callback_data!,
+        message: {
+          message_id: 101,
+          date: Math.floor(Date.now() / 1000),
+          chat: { id: -100555, type: 'supergroup', title: 'Family' },
+          text: '',
+        },
+      },
+    });
+
+    const hourPickerCall = [...apiCalls].reverse().find((c) => c.method === 'editMessageText');
+    const hourBtn = extractButtons(hourPickerCall).find((b) => b.text.includes('10:00–12:00'));
+    expect(hourBtn?.callback_data).toMatch(/^a:/);
+
+    // 4. Click hour button -> reserves Hazi Hinam slot
+    await bot.handleUpdate({
+      update_id: 4,
+      callback_query: {
+        id: 'cb-3',
+        from: { id: 111, is_bot: false, first_name: 'Eli' },
+        chat_instance: 'ci-1',
+        data: hourBtn!.callback_data!,
+        message: {
+          message_id: 101,
+          date: Math.floor(Date.now() / 1000),
+          chat: { id: -100555, type: 'supergroup', title: 'Family' },
+          text: '',
+        },
+      },
+    });
+
+    const confirmCall = [...apiCalls].reverse().find((c) => c.method === 'editMessageText');
+    expect(String(confirmCall?.payload['text'])).toContain('חצי חינם אונליין');
+    expect((await haziClient.getSelectedTimeSlot())?.code).toBe('9002');
+
+    // 5. /compare also exposes a direct one-click Hazi Hinam slot button
+    await bot.handleUpdate({
+      update_id: 5,
+      message: {
+        message_id: 2,
+        date: Math.floor(Date.now() / 1000),
+        chat: { id: -100555, type: 'supergroup', title: 'Family' },
+        from: { id: 111, is_bot: false, first_name: 'Eli' },
+        text: '/compare',
+        entities: [{ offset: 0, length: 8, type: 'bot_command' }],
+      },
+    });
+
+    const compareCall = [...apiCalls].reverse().find((c) => c.method === 'editMessageText');
+    const compareButtons = extractButtons(compareCall);
+    expect(compareButtons.some((b) => b.text.includes('משלוח חצי חינם'))).toBe(true);
+    expect(compareButtons.some((b) => b.text.includes('משלוח שופרסל'))).toBe(true);
+  });
 });

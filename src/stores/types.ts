@@ -37,7 +37,7 @@ export const STORE_META: Record<StoreId, StoreMeta> = {
     shortName: 'חצי חינם',
     emoji: '🟢',
     baseUrl: 'https://shop.hazi-hinam.co.il',
-    cartUrl: 'https://shop.hazi-hinam.co.il/cart',
+    cartUrl: 'https://shop.hazi-hinam.co.il/checkout/cart',
     defaultDeliveryFee: 29.9,
     minimumOrderAmount: 200,
     supportsAutoCheckout: false,

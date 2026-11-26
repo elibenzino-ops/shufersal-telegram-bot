@@ -194,12 +194,15 @@ export function parseHaziHinamCartResponse(
     | undefined;
   if (!results || typeof results !== 'object') return null;
 
-  const cartObj = (results['Cart'] ?? results) as Record<string, unknown>;
+  const cartObj = (results['Cart'] ??
+    results['CartSummary'] ??
+    results) as Record<string, unknown>;
+  const summaryObj = (results['CartSummary'] ?? cartObj) as Record<string, unknown>;
   const rawItems =
     (Array.isArray(cartObj['Items']) ? cartObj['Items'] : null) ??
     (Array.isArray(cartObj['CartItems']) ? cartObj['CartItems'] : null) ??
-    (Array.isArray(results['Items']) ? results['Items'] : null) ??
-    (Array.isArray(results['CartItems']) ? results['CartItems'] : null);
+    (Array.isArray(results['CartItems']) ? results['CartItems'] : null) ??
+    (Array.isArray(results['Items']) ? results['Items'] : null);
 
   if (!rawItems) return null;
 
@@ -221,6 +224,7 @@ export function parseHaziHinamCartResponse(
       entry['TotalPrice'] ??
         entry['FinalPrice'] ??
         entry['TotalPriceAfterDiscount'] ??
+        entry['Price_Total'] ??
         0,
     );
     const unitPrice = Number(
@@ -255,9 +259,14 @@ export function parseHaziHinamCartResponse(
   });
 
   const serverTotal = Number(
-    cartObj['TotalToPay'] ??
+    summaryObj['Price_Order_Total'] ??
+      summaryObj['TotalToPay'] ??
+      summaryObj['TotalPrice'] ??
+      summaryObj['SubTotal'] ??
+      cartObj['TotalToPay'] ??
       cartObj['TotalPrice'] ??
       cartObj['SubTotal'] ??
+      results['Price_Order_Total'] ??
       results['TotalToPay'] ??
       results['TotalPrice'] ??
       0,
@@ -268,8 +277,11 @@ export function parseHaziHinamCartResponse(
       : Number(computedTotal.toFixed(2));
 
   const deliveryFeeRaw = Number(
-    cartObj['DeliveryPrice'] ??
+    summaryObj['Price_Shipping'] ??
+      cartObj['Price_Shipping'] ??
+      cartObj['DeliveryPrice'] ??
       cartObj['ShipmentPrice'] ??
+      results['Price_Shipping'] ??
       results['DeliveryPrice'] ??
       NaN,
   );
@@ -329,6 +341,59 @@ function normalizeHourText(raw: unknown): string {
   return trimmed;
 }
 
+function israelLocalToIso(
+  year: number,
+  month: number,
+  day: number,
+  hour: number,
+  minute: number,
+): string | null {
+  if (
+    !Number.isInteger(year) ||
+    !Number.isInteger(month) ||
+    !Number.isInteger(day) ||
+    month < 1 ||
+    month > 12 ||
+    day < 1 ||
+    day > 31
+  ) {
+    return null;
+  }
+  const approxUtc = Date.UTC(year, month - 1, day, hour, minute, 0);
+  const parts = new Intl.DateTimeFormat('en-US', {
+    timeZone: 'Asia/Jerusalem',
+    year: 'numeric',
+    month: '2-digit',
+    day: '2-digit',
+    hour: '2-digit',
+    minute: '2-digit',
+    hour12: false,
+  }).formatToParts(new Date(approxUtc));
+
+  const get = (type: string): number =>
+    Number(parts.find((p) => p.type === type)?.value ?? 0);
+  const tzHour = get('hour') === 24 ? 0 : get('hour');
+  const tzAsUtc = Date.UTC(
+    get('year'),
+    get('month') - 1,
+    get('day'),
+    tzHour,
+    get('minute'),
+    0,
+  );
+  const offsetMs = tzAsUtc - approxUtc;
+  const resolved = new Date(approxUtc - offsetMs);
+  return Number.isNaN(resolved.getTime()) ? null : resolved.toISOString();
+}
+
+function parseHourParts(hourStr: string): { hour: number; minute: number } {
+  const m = /^(\d{1,2}):(\d{2})$/.exec(hourStr);
+  if (m) {
+    return { hour: Number(m[1]), minute: Number(m[2]) };
+  }
+  return { hour: 9, minute: 0 };
+}
+
 function combineDateAndHourToIso(dateRaw: unknown, hourRaw?: unknown): string | null {
   if (typeof dateRaw === 'number' && Number.isFinite(dateRaw) && dateRaw > 0) {
     const dt = new Date(dateRaw);
@@ -337,22 +402,39 @@ function combineDateAndHourToIso(dateRaw: unknown, hourRaw?: unknown): string | 
   if (typeof dateRaw !== 'string' || !dateRaw.trim()) return null;
   const trimmed = dateRaw.trim();
   const hourStr = normalizeHourText(hourRaw);
+  const { hour, minute } = parseHourParts(hourStr);
 
-  // Date-only format (YYYY-MM-DD) or DD/MM/YYYY with separate hour text
+  // Date-only format (YYYY-MM-DD)
   const ymd = /^(\d{4})-(\d{2})-(\d{2})$/.exec(trimmed);
   if (ymd) {
-    const timePart = /^\d{2}:\d{2}$/.test(hourStr) ? `${hourStr}:00` : '09:00:00';
-    const dt = new Date(`${ymd[1]}-${ymd[2]}-${ymd[3]}T${timePart}+02:00`);
-    return Number.isNaN(dt.getTime()) ? null : dt.toISOString();
+    return israelLocalToIso(Number(ymd[1]), Number(ymd[2]), Number(ymd[3]), hour, minute);
   }
 
-  const dmy = /^(\d{1,2})[/.-](\d{1,2})[/.-](\d{4})$/.exec(trimmed);
-  if (dmy) {
-    const timePart = /^\d{2}:\d{2}$/.test(hourStr) ? `${hourStr}:00` : '09:00:00';
-    const dt = new Date(
-      `${dmy[3]}-${dmy[2]!.padStart(2, '0')}-${dmy[1]!.padStart(2, '0')}T${timePart}+02:00`,
-    );
-    return Number.isNaN(dt.getTime()) ? null : dt.toISOString();
+  // DD/MM/YYYY, DD.MM.YYYY, DD-MM-YYYY (Hazi Hinam ShipmentsByDate.Date format)
+  const dmy4 = /^(\d{1,2})[/.-](\d{1,2})[/.-](\d{4})$/.exec(trimmed);
+  if (dmy4) {
+    return israelLocalToIso(Number(dmy4[3]), Number(dmy4[2]), Number(dmy4[1]), hour, minute);
+  }
+
+  // DD/MM/YY
+  const dmy2 = /^(\d{1,2})[/.-](\d{1,2})[/.-](\d{2})$/.exec(trimmed);
+  if (dmy2) {
+    return israelLocalToIso(2000 + Number(dmy2[3]), Number(dmy2[2]), Number(dmy2[1]), hour, minute);
+  }
+
+  // DD/MM or DD.MM (infer current/next year)
+  const dm = /^(\d{1,2})[/.-](\d{1,2})$/.exec(trimmed);
+  if (dm) {
+    const now = new Date();
+    const day = Number(dm[1]);
+    const month = Number(dm[2]);
+    let year = now.getFullYear();
+    const candidate = israelLocalToIso(year, month, day, hour, minute);
+    if (candidate && new Date(candidate).getTime() < now.getTime() - 30 * 86_400_000) {
+      year += 1;
+      return israelLocalToIso(year, month, day, hour, minute);
+    }
+    return candidate;
   }
 
   const direct = new Date(trimmed);
@@ -361,9 +443,11 @@ function combineDateAndHourToIso(dateRaw: unknown, hourRaw?: unknown): string | 
       /^\d{2}:\d{2}$/.test(hourStr) &&
       trimmed.includes('T00:00:00')
     ) {
-      const datePrefix = trimmed.slice(0, 10);
-      const combined = new Date(`${datePrefix}T${hourStr}:00+02:00`);
-      if (!Number.isNaN(combined.getTime())) return combined.toISOString();
+      const y = Number(trimmed.slice(0, 4));
+      const mo = Number(trimmed.slice(5, 7));
+      const da = Number(trimmed.slice(8, 10));
+      const combined = israelLocalToIso(y, mo, da, hour, minute);
+      if (combined) return combined;
     }
     return direct.toISOString();
   }
@@ -388,36 +472,41 @@ export function parseHaziHinamDeliverySlots(
     | undefined;
   if (!results) return [];
 
-  const rawEntries: Array<Record<string, unknown>> = Array.isArray(results)
-    ? results
-    : Array.isArray(results['Dates'])
-      ? (results['Dates'] as Array<Record<string, unknown>>)
-      : Array.isArray(results['Shipments'])
-        ? (results['Shipments'] as Array<Record<string, unknown>>)
-        : Array.isArray(results['DeliveryDates'])
-          ? (results['DeliveryDates'] as Array<Record<string, unknown>>)
-          : Array.isArray(results['TimeSlots'])
-            ? (results['TimeSlots'] as Array<Record<string, unknown>>)
-            : Array.isArray(results['Slots'])
-              ? (results['Slots'] as Array<Record<string, unknown>>)
-              : [];
-
   const slots: DeliverySlot[] = [];
   const seenCodes = new Set<string>();
 
   const pushSlot = (
     s: Record<string, unknown>,
     parentDate?: unknown,
+    contextMeta?: Record<string, unknown>,
   ): void => {
     const rawCode =
-      s['Id'] ??
       s['ShipmentId'] ??
+      s['Id'] ??
       s['SlotId'] ??
       s['TimeSlotId'] ??
       s['Code'] ??
       s['id'];
-    const fromHourRaw = s['FromHour'] ?? s['StartHour'] ?? s['StartTime'] ?? s['fromHour'];
-    const toHourRaw = s['ToHour'] ?? s['EndHour'] ?? s['EndTime'] ?? s['toHour'];
+
+    const timeObj =
+      s['Time'] && typeof s['Time'] === 'object' && !Array.isArray(s['Time'])
+        ? (s['Time'] as Record<string, unknown>)
+        : null;
+
+    const fromHourRaw =
+      timeObj?.['From'] ??
+      timeObj?.['from'] ??
+      s['FromHour'] ??
+      s['StartHour'] ??
+      s['StartTime'] ??
+      s['fromHour'];
+    const toHourRaw =
+      timeObj?.['To'] ??
+      timeObj?.['to'] ??
+      s['ToHour'] ??
+      s['EndHour'] ??
+      s['EndTime'] ??
+      s['toHour'];
 
     const startIso = combineDateAndHourToIso(
       s['FromDate'] ?? s['StartDate'] ?? s['DeliveryDate'] ?? s['Date'] ?? parentDate,
@@ -441,6 +530,7 @@ export function parseHaziHinamDeliverySlots(
         : `${startIso.slice(0, 10)}_${startHourText}`;
 
     const selectable =
+      s['IsClosedShipment'] !== true &&
       s['IsAvailable'] !== false &&
       s['Available'] !== false &&
       s['Selectable'] !== false &&
@@ -452,11 +542,18 @@ export function parseHaziHinamDeliverySlots(
 
     const feeRaw = Number(
       s['Price'] ??
+        s['Price_Shipping'] ??
         s['DeliveryPrice'] ??
         s['ShipmentPrice'] ??
         s['Cost'] ??
         NaN,
     );
+
+    const rawSlot: Record<string, unknown> = {
+      ...s,
+      ...(parentDate !== undefined ? { ParentDate: parentDate } : {}),
+      ...(contextMeta ?? {}),
+    };
 
     slots.push({
       code,
@@ -470,28 +567,111 @@ export function parseHaziHinamDeliverySlots(
         typeof s['IsToday'] === 'boolean'
           ? s['IsToday']
           : isSameIsraelDay(startIso),
-      rawSlot: parentDate !== undefined ? { ...s, ParentDate: parentDate } : s,
+      rawSlot,
     });
   };
 
-  for (const entry of rawEntries) {
-    const nested =
-      (Array.isArray(entry['Hours']) ? entry['Hours'] : null) ??
-      (Array.isArray(entry['TimeSlots']) ? entry['TimeSlots'] : null) ??
-      (Array.isArray(entry['Shipments']) ? entry['Shipments'] : null) ??
-      (Array.isArray(entry['Slots']) ? entry['Slots'] : null);
+  const extractFromDateGroups = (
+    dateGroups: unknown,
+    contextMeta?: Record<string, unknown>,
+  ): void => {
+    if (!Array.isArray(dateGroups)) return;
+    for (const rawDay of dateGroups) {
+      if (!rawDay || typeof rawDay !== 'object') continue;
+      const day = rawDay as Record<string, unknown>;
+      const nested =
+        (Array.isArray(day['Shipments']) ? day['Shipments'] : null) ??
+        (Array.isArray(day['Hours']) ? day['Hours'] : null) ??
+        (Array.isArray(day['TimeSlots']) ? day['TimeSlots'] : null) ??
+        (Array.isArray(day['Slots']) ? day['Slots'] : null);
 
-    if (nested && nested.length > 0) {
       const parentDate =
-        entry['Date'] ?? entry['DeliveryDate'] ?? entry['FromDate'] ?? entry['DayDate'];
-      for (const child of nested) {
-        if (child && typeof child === 'object') {
-          pushSlot(child as Record<string, unknown>, parentDate);
+        day['Date'] ?? day['DeliveryDate'] ?? day['FromDate'] ?? day['DayDate'];
+      const dayMeta: Record<string, unknown> = {
+        ...(contextMeta ?? {}),
+        ...(typeof day['DOW'] === 'string' ? { DOW: day['DOW'] } : {}),
+      };
+
+      if (nested && nested.length > 0) {
+        for (const child of nested) {
+          if (child && typeof child === 'object') {
+            pushSlot(child as Record<string, unknown>, parentDate, dayMeta);
+          }
+        }
+      } else {
+        pushSlot(day, undefined, dayMeta);
+      }
+    }
+  };
+
+  // Real Hazi Hinam getNextDeliveries / order/checkout schema:
+  // Results.Addresses[].ShipmentsByDate[].Shipments[] (and Results.Stores[] for pickup fallback)
+  if (!Array.isArray(results)) {
+    const rawAddresses = Array.isArray(results['Addresses'])
+      ? (results['Addresses'] as Array<Record<string, unknown>>)
+      : [];
+
+    if (rawAddresses.length > 0) {
+      // Prefer IsDefault address first, then any address that has open ShipmentsByDate
+      const orderedAddresses = [
+        ...rawAddresses.filter((a) => a['IsDefault'] === true),
+        ...rawAddresses.filter((a) => a['IsDefault'] !== true),
+      ];
+      for (const addr of orderedAddresses) {
+        const beforeCount = slots.length;
+        extractFromDateGroups(addr['ShipmentsByDate'], {
+          AddressId: addr['Id'] ?? addr['AddressId'] ?? null,
+          AddressName:
+            typeof addr['Name'] === 'string' && addr['Name'].trim()
+              ? addr['Name'].trim()
+              : null,
+          IsSelfPickUp: false,
+        });
+        if (slots.length > beforeCount) {
+          break;
         }
       }
-    } else {
-      pushSlot(entry);
     }
+
+    // Fallback to pickup stores if no home delivery address has open slots
+    if (slots.length === 0 && Array.isArray(results['Stores'])) {
+      const rawStores = results['Stores'] as Array<Record<string, unknown>>;
+      for (const store of rawStores) {
+        const beforeCount = slots.length;
+        extractFromDateGroups(store['ShipmentsByDate'], {
+          StoreId: store['Id'] ?? store['StoreId'] ?? null,
+          StoreName:
+            typeof store['Name'] === 'string' && store['Name'].trim()
+              ? store['Name'].trim()
+              : null,
+          IsSelfPickUp: true,
+        });
+        if (slots.length > beforeCount) {
+          break;
+        }
+      }
+    }
+  }
+
+  // Fallback for direct ShipmentsByDate / Dates / Shipments / DeliveryDates / TimeSlots / Slots payloads
+  if (slots.length === 0) {
+    const rawEntries: Array<Record<string, unknown>> = Array.isArray(results)
+      ? results
+      : Array.isArray(results['ShipmentsByDate'])
+        ? (results['ShipmentsByDate'] as Array<Record<string, unknown>>)
+        : Array.isArray(results['Dates'])
+          ? (results['Dates'] as Array<Record<string, unknown>>)
+          : Array.isArray(results['Shipments'])
+            ? (results['Shipments'] as Array<Record<string, unknown>>)
+            : Array.isArray(results['DeliveryDates'])
+              ? (results['DeliveryDates'] as Array<Record<string, unknown>>)
+              : Array.isArray(results['TimeSlots'])
+                ? (results['TimeSlots'] as Array<Record<string, unknown>>)
+                : Array.isArray(results['Slots'])
+                  ? (results['Slots'] as Array<Record<string, unknown>>)
+                  : [];
+
+    extractFromDateGroups(rawEntries);
   }
 
   slots.sort(
@@ -509,25 +689,49 @@ export function parseHaziHinamOrders(
     | undefined;
   if (!results) return [];
 
-  const rawOrders: Array<Record<string, unknown>> = Array.isArray(results)
-    ? results
-    : Array.isArray(results['Orders'])
-      ? (results['Orders'] as Array<Record<string, unknown>>)
-      : Array.isArray(results['ActiveOrders'])
-        ? (results['ActiveOrders'] as Array<Record<string, unknown>>)
-        : Array.isArray(results['Items'])
-          ? (results['Items'] as Array<Record<string, unknown>>)
-          : [];
+  const rawOrders: Array<Record<string, unknown>> = [];
+  if (Array.isArray(results)) {
+    rawOrders.push(...results);
+  } else {
+    for (const key of [
+      'DraftOrders',
+      'ActiveOrders',
+      'Orders',
+      'OrderHistory',
+      'Items',
+    ]) {
+      if (Array.isArray(results[key])) {
+        rawOrders.push(...(results[key] as Array<Record<string, unknown>>));
+      }
+    }
+    if (
+      results['ActiveDraftOrder'] &&
+      typeof results['ActiveDraftOrder'] === 'object' &&
+      !Array.isArray(results['ActiveDraftOrder'])
+    ) {
+      rawOrders.unshift(results['ActiveDraftOrder'] as Record<string, unknown>);
+    }
+  }
 
   const orders: ActiveOrderSummary[] = [];
+  const seenCodes = new Set<string>();
   for (const raw of rawOrders) {
     const code = String(
-      raw['OrderId'] ?? raw['OrderNumber'] ?? raw['Id'] ?? raw['Code'] ?? '',
+      raw['Order_Draft_Id'] ??
+        raw['OrderId'] ??
+        raw['OrderNumber'] ??
+        raw['Id'] ??
+        raw['Code'] ??
+        '',
     ).trim();
-    if (!code) continue;
+    if (!code || seenCodes.has(code)) continue;
 
     const statusCode = String(
-      raw['StatusName'] ?? raw['Status'] ?? raw['OrderStatus'] ?? 'ACTIVE',
+      raw['StatusName'] ??
+        raw['OrderStatusName'] ??
+        raw['Status'] ??
+        raw['OrderStatus'] ??
+        'ACTIVE',
     ).trim();
     const statusLower = statusCode.toLowerCase();
     if (
@@ -535,26 +739,46 @@ export function parseHaziHinamOrders(
       statusLower.includes('בוטל') ||
       statusLower.includes('delivered') ||
       statusLower.includes('סופק') ||
+      statusLower.includes('הושלמ') ||
       raw['IsHistory'] === true
     ) {
       continue;
     }
 
-    const fromHour = normalizeHourText(raw['FromHour'] ?? raw['StartHour']);
-    const toHour = normalizeHourText(raw['ToHour'] ?? raw['EndHour']);
+    const timeObj =
+      raw['Time'] && typeof raw['Time'] === 'object' && !Array.isArray(raw['Time'])
+        ? (raw['Time'] as Record<string, unknown>)
+        : null;
+    const fromHour = normalizeHourText(
+      timeObj?.['From'] ?? raw['FromHour'] ?? raw['StartHour'],
+    );
+    const toHour = normalizeHourText(
+      timeObj?.['To'] ?? raw['ToHour'] ?? raw['EndHour'],
+    );
     const deliveryIso =
       combineDateAndHourToIso(
-        raw['DeliveryDate'] ?? raw['SupplyDate'] ?? raw['FromDate'] ?? raw['OrderDate'],
+        raw['DeliveryDate'] ??
+          raw['ShipmentDate'] ??
+          raw['SupplyDate'] ??
+          raw['FromDate'] ??
+          raw['OrderDate'],
         fromHour,
       ) ?? new Date().toISOString();
 
     const totalPrice = Number(
-      raw['TotalToPay'] ?? raw['TotalPrice'] ?? raw['FinalPrice'] ?? 0,
+      raw['Price_Order_Total'] ??
+        raw['TotalToPay'] ??
+        raw['TotalPrice'] ??
+        raw['FinalPrice'] ??
+        0,
     );
     const totalItems = Number(
-      raw['ItemsCount'] ?? raw['TotalItems'] ?? (Array.isArray(raw['Items']) ? raw['Items'].length : 0),
+      raw['ItemsCount'] ??
+        raw['TotalItems'] ??
+        (Array.isArray(raw['Items']) ? raw['Items'].length : 0),
     );
 
+    seenCodes.add(code);
     orders.push({
       code,
       deliveryIso,
@@ -568,7 +792,7 @@ export function parseHaziHinamOrders(
       totalItems: Number.isFinite(totalItems) ? totalItems : 0,
       statusCode,
       isUpdatable: false,
-      isBeingUpdated: false,
+      isBeingUpdated: Boolean(raw['IsActiveDraft']),
     });
   }
 
@@ -595,6 +819,9 @@ export class HaziHinamClient implements StoreClient {
   private readonly knownProducts = new Map<string, CatalogProduct>();
   private readonly trackedCart = new Map<string, TrackedCartEntry>();
   private selectedSlot: DeliverySlot | null = null;
+  private lastFetchedSlots: DeliverySlot[] = [];
+  private lastSlotsFetchedAt = 0;
+  private activeDraftOrderId: string | null = null;
 
   constructor(private readonly options: HaziHinamClientOptions) {
     this.baseUrl = (options.baseUrl ?? HAZI_HINAM_BASE_URL).replace(/\/+$/, '');
@@ -642,6 +869,8 @@ export class HaziHinamClient implements StoreClient {
     const headers: Record<string, string> = {
       Accept: 'application/json, text/plain, */*',
       'Content-Type': 'application/json; charset=UTF-8',
+      'Cache-Control': 'no-cache, no-store',
+      Pragma: 'no-cache',
       'User-Agent': DEFAULT_USER_AGENT,
       Origin: this.baseUrl,
       Referer: `${this.baseUrl}/`,
@@ -958,13 +1187,13 @@ export class HaziHinamClient implements StoreClient {
       page.setDefaultNavigationTimeout(BROWSER_NAV_TIMEOUT_MS);
       await page.setViewport({ width: 1366, height: 900 });
 
-      await page.goto(`${this.baseUrl}/login`, {
+      await page.goto(`${this.baseUrl}/`, {
         waitUntil: 'domcontentloaded',
         timeout: BROWSER_NAV_TIMEOUT_MS,
       });
       await this.detectBrowserSecurityGate(page);
 
-      // If /login redirected to home, click a visible login trigger if present
+      // Click the visible login trigger to open Hazi Hinam's login modal if inputs are not already visible
       const userSelector =
         'input[type="email"], input[name*="email" i], input[name*="user" i], input[id*="email" i], input[id*="user" i], input[autocomplete="username"]';
       const passSelector = 'input[type="password"]';
@@ -1268,7 +1497,7 @@ export class HaziHinamClient implements StoreClient {
 
   private async apiFetchJson(
     path: string,
-    init: { method: 'GET' | 'POST'; body?: unknown },
+    init: { method: 'GET' | 'POST' | 'PUT' | 'DELETE'; body?: unknown },
     retryOn401 = true,
   ): Promise<Record<string, unknown>> {
     await this.ensureAuthenticated();
@@ -1360,7 +1589,7 @@ export class HaziHinamClient implements StoreClient {
       items,
       totalPrice: Number(totalPrice.toFixed(2)),
       deliveryFee: this.selectedSlot?.deliveryFee ?? this.defaultDeliveryFee,
-      orderInUpdateMode: null,
+      orderInUpdateMode: this.activeDraftOrderId,
       isGuestSession: this.isGuestSession,
     };
   }
@@ -1384,8 +1613,92 @@ export class HaziHinamClient implements StoreClient {
     }
   }
 
+  private captureDraftOrderId(payload: Record<string, unknown>): void {
+    const results = (payload['Results'] ?? payload['results'] ?? payload) as
+      | Record<string, unknown>
+      | undefined;
+    if (!results || typeof results !== 'object') return;
+    const summary = (results['CartSummary'] ??
+      results['PendingOrderInfo'] ??
+      results['ActiveDraftOrder'] ??
+      results) as Record<string, unknown>;
+    const rawId =
+      summary['Order_Draft_Id'] ??
+      summary['DraftOrderId'] ??
+      summary['ActiveDraftOrderId'] ??
+      results['Order_Draft_Id'] ??
+      results['DraftOrderId'];
+    if (rawId !== undefined && rawId !== null && String(rawId).trim() && String(rawId) !== '0') {
+      this.activeDraftOrderId = String(rawId).trim();
+    }
+  }
+
   async getCartState(): Promise<CartState> {
     await this.ensureAuthenticated();
+
+    // Primary real Hazi Hinam endpoints: item/getItemsInCart + order/cartSummary
+    try {
+      const itemsResp = await this.apiFetchJson(
+        '/proxy/api/item/getItemsInCart?SortBy=0&IsDescending=false',
+        { method: 'GET' },
+      );
+      if (itemsResp['IsOK'] !== false) {
+        let summaryObj: Record<string, unknown> | undefined;
+        try {
+          const summaryResp = await this.apiFetchJson('/proxy/api/order/cartSummary', {
+            method: 'GET',
+          });
+          this.captureDraftOrderId(summaryResp);
+          const summaryResults = (summaryResp['Results'] ??
+            summaryResp['results'] ??
+            summaryResp) as Record<string, unknown> | undefined;
+          if (summaryResults && typeof summaryResults === 'object') {
+            summaryObj = (summaryResults['CartSummary'] ?? summaryResults) as Record<
+              string,
+              unknown
+            >;
+          }
+        } catch (err) {
+          if (isTimeoutError(err)) {
+            logger.warn('Hazi Hinam cartSummary timed out; using item totals');
+          }
+        }
+
+        const itemsResults = (itemsResp['Results'] ??
+          itemsResp['results'] ??
+          itemsResp) as Record<string, unknown>;
+        const combined: Record<string, unknown> = {
+          Results: {
+            ...itemsResults,
+            ...(summaryObj ? { CartSummary: summaryObj } : {}),
+          },
+        };
+        const parsed = parseHaziHinamCartResponse(
+          combined,
+          this.selectedSlot?.deliveryFee ?? this.defaultDeliveryFee,
+          this.isGuestSession,
+        );
+        if (parsed) {
+          parsed.orderInUpdateMode = this.activeDraftOrderId;
+          if (
+            this.trackedCart.size === 0 ||
+            (!this.isGuestSession && parsed.items.length > 0) ||
+            parsed.items.length >= this.trackedCart.size
+          ) {
+            this.syncTrackedFromServer(parsed);
+            return parsed;
+          }
+          return this.buildTrackedCartState();
+        }
+      }
+    } catch (err) {
+      if (isTimeoutError(err)) {
+        logger.warn('Hazi Hinam getItemsInCart timed out; returning locally tracked cart state');
+        return this.buildTrackedCartState();
+      }
+      // Fall through to legacy cart endpoint fallback
+    }
+
     for (const attempt of [
       { method: 'GET' as const, path: '/proxy/api/cart/getCart' },
       { method: 'POST' as const, path: '/proxy/api/cart/getCart', body: {} },
@@ -1589,17 +1902,30 @@ export class HaziHinamClient implements StoreClient {
 
   async clearCart(): Promise<void> {
     await this.ensureAuthenticated();
-    try {
-      await this.apiFetchJson('/proxy/api/cart/clearCart', {
-        method: 'POST',
-        body: {},
-      });
-    } catch (err) {
-      if (!isTimeoutError(err)) {
-        const codes = [...this.trackedCart.keys()];
-        for (const code of codes) {
-          await this.removeFromCart(code).catch(() => {});
+    let clearedOnServer = false;
+    for (const attempt of [
+      { method: 'DELETE' as const, path: '/proxy/api/item/removeItemsInCart' },
+      { method: 'POST' as const, path: '/proxy/api/cart/clearCart', body: {} },
+    ]) {
+      try {
+        const resp = await this.apiFetchJson(attempt.path, {
+          method: attempt.method,
+          body: attempt.body,
+        });
+        if (resp['IsOK'] !== false) {
+          clearedOnServer = true;
+          break;
         }
+      } catch (err) {
+        if (isTimeoutError(err)) {
+          break;
+        }
+      }
+    }
+    if (!clearedOnServer) {
+      const codes = [...this.trackedCart.keys()];
+      for (const code of codes) {
+        await this.removeFromCart(code).catch(() => {});
       }
     }
     this.trackedCart.clear();
@@ -1607,28 +1933,71 @@ export class HaziHinamClient implements StoreClient {
 
   async getAvailableTimeSlots(): Promise<DeliverySlot[]> {
     await this.ensureAuthenticated();
-    for (const attempt of [
-      { method: 'POST' as const, path: '/proxy/api/delivery/getDeliveryDates', body: {} },
-      { method: 'GET' as const, path: '/proxy/api/delivery/getDeliveryDates' },
-      { method: 'POST' as const, path: '/proxy/api/shipment/getShipments', body: {} },
-    ]) {
+    const attempts: Array<{
+      method: 'GET' | 'POST';
+      path: string;
+      body?: unknown;
+      requiresAuth?: boolean;
+    }> = [
+      { method: 'GET', path: '/proxy/api/delivery/getNextDeliveries' },
+      { method: 'GET', path: '/proxy/api/order/checkout', requiresAuth: true },
+      { method: 'POST', path: '/proxy/api/delivery/getDeliveryDates', body: {} },
+      { method: 'GET', path: '/proxy/api/delivery/getDeliveryDates' },
+    ];
+
+    const diagnostics: string[] = [];
+
+    for (const attempt of attempts) {
+      if (attempt.requiresAuth && this.isGuestSession) {
+        continue;
+      }
       try {
         const data = await this.apiFetchJson(attempt.path, {
           method: attempt.method,
           body: attempt.body,
         });
+        this.captureDraftOrderId(data);
         const slots = parseHaziHinamDeliverySlots(data, this.defaultDeliveryFee);
         if (slots.length > 0) {
+          this.lastFetchedSlots = slots;
+          this.lastSlotsFetchedAt = Date.now();
+          logger.info(
+            `Hazi Hinam loaded ${slots.length} delivery slots via ${attempt.method} ${attempt.path}`,
+          );
           return slots;
         }
+        const results = (data['Results'] ?? data['results']) as
+          | Record<string, unknown>
+          | undefined;
+        const addrCount = Array.isArray(results?.['Addresses'])
+          ? results['Addresses'].length
+          : 0;
+        const storeCount = Array.isArray(results?.['Stores'])
+          ? results['Stores'].length
+          : 0;
+        const errDesc =
+          data['IsOK'] === false
+            ? JSON.stringify(data['ErrorResponse'] ?? 'IsOK=false').slice(0, 120)
+            : 'empty';
+        diagnostics.push(
+          `${attempt.method} ${attempt.path} -> 0 slots (IsOK=${String(data['IsOK'])}, addresses=${addrCount}, stores=${storeCount}, detail=${errDesc})`,
+        );
       } catch (err) {
         if (isTimeoutError(err)) {
-          logger.warn('Hazi Hinam delivery slots request timed out');
+          logger.warn(
+            `Hazi Hinam delivery slots request timed out on ${attempt.method} ${attempt.path}`,
+          );
+          diagnostics.push(`${attempt.method} ${attempt.path} -> timeout`);
           break;
         }
-        // try next endpoint shape
+        const msg = err instanceof Error ? err.message : String(err);
+        diagnostics.push(`${attempt.method} ${attempt.path} -> ${msg.slice(0, 120)}`);
       }
     }
+
+    logger.warn(
+      `Hazi Hinam returned 0 delivery slots (guest=${String(this.isGuestSession)}): ${diagnostics.join(' | ')}`,
+    );
     return [];
   }
 
@@ -1644,8 +2013,14 @@ export class HaziHinamClient implements StoreClient {
 
   async selectTimeSlot(slotCode: string): Promise<DeliverySlot> {
     await this.ensureAuthenticated();
-    const slots = await this.getAvailableTimeSlots();
-    const match = slots.find((s) => s.code === slotCode);
+    let match =
+      Date.now() - this.lastSlotsFetchedAt < 5 * 60_000
+        ? this.lastFetchedSlots.find((s) => s.code === slotCode)
+        : undefined;
+    if (!match) {
+      const slots = await this.getAvailableTimeSlots();
+      match = slots.find((s) => s.code === slotCode);
+    }
     if (!match) {
       throw new Error(`חלון המשלוח המבוקש (${slotCode}) כבר אינו פנוי בחצי חינם`);
     }
@@ -1654,37 +2029,71 @@ export class HaziHinamClient implements StoreClient {
       const numericId = Number(match.code);
       const idVal =
         Number.isFinite(numericId) && numericId > 0 ? numericId : match.code;
-      const bodyPayload = {
-        Object: {
-          ...match.rawSlot,
-          Id: idVal,
-          ShipmentId: idVal,
-          DeliveryDate: match.startIso,
-        },
-      };
+      const isSelfPickUp = Boolean(match.rawSlot['IsSelfPickUp']);
+      const addressId = match.rawSlot['AddressId'] ?? null;
+      const storeId = match.rawSlot['StoreId'] ?? null;
 
       let reservedOnServer = false;
-      for (const endpoint of [
-        '/proxy/api/delivery/setDeliveryDate',
-        '/proxy/api/cart/setDeliveryDate',
-      ]) {
+
+      // Real Hazi Hinam endpoint when editing an active draft order
+      if (this.activeDraftOrderId) {
         try {
-          const resp = await this.apiFetchJson(endpoint, {
-            method: 'POST',
-            body: bodyPayload,
-          });
+          const resp = await this.apiFetchJson(
+            `/proxy/api/order/ChangeDraftOrderShipping/?Id=${encodeURIComponent(this.activeDraftOrderId)}`,
+            {
+              method: 'POST',
+              body: {
+                Object: {
+                  AddressId: isSelfPickUp ? null : addressId,
+                  StoreId: isSelfPickUp ? storeId : null,
+                  ShipmentId: idVal,
+                },
+              },
+            },
+          );
           if (resp['IsOK'] !== false) {
             reservedOnServer = true;
-            break;
           }
         } catch (err) {
-          if (isTimeoutError(err)) break;
-          // try fallback endpoint
+          logger.warn(
+            `Hazi Hinam ChangeDraftOrderShipping failed for draft ${this.activeDraftOrderId}`,
+            err,
+          );
         }
       }
+
       if (!reservedOnServer) {
-        logger.warn(
-          `Hazi Hinam server slot reservation fallback used for slot ${slotCode}; saved locally for cart/checkout`,
+        const bodyPayload = {
+          Object: {
+            ...match.rawSlot,
+            Id: idVal,
+            ShipmentId: idVal,
+            DeliveryDate: match.startIso,
+          },
+        };
+        for (const endpoint of [
+          '/proxy/api/delivery/setDeliveryDate',
+          '/proxy/api/cart/setDeliveryDate',
+        ]) {
+          try {
+            const resp = await this.apiFetchJson(endpoint, {
+              method: 'POST',
+              body: bodyPayload,
+            });
+            if (resp['IsOK'] !== false) {
+              reservedOnServer = true;
+              break;
+            }
+          } catch (err) {
+            if (isTimeoutError(err)) break;
+            // Hazi Hinam binds normal cart slots during checkout order/post; keep saved locally
+          }
+        }
+      }
+
+      if (!reservedOnServer) {
+        logger.info(
+          `Hazi Hinam slot ${slotCode} saved locally for cart/checkout (server slot is finalized at checkout)`,
         );
       }
     }
@@ -1700,15 +2109,16 @@ export class HaziHinamClient implements StoreClient {
       return [];
     }
     for (const attempt of [
+      { method: 'GET' as const, path: '/proxy/api/order/history' },
       { method: 'POST' as const, path: '/proxy/api/order/getOrders', body: {} },
       { method: 'GET' as const, path: '/proxy/api/order/getOrders' },
-      { method: 'POST' as const, path: '/proxy/api/customer/getOrders', body: {} },
     ]) {
       try {
         const data = await this.apiFetchJson(attempt.path, {
           method: attempt.method,
           body: attempt.body,
         });
+        this.captureDraftOrderId(data);
         const orders = parseHaziHinamOrders(data);
         if (orders.length > 0) {
           return orders;
