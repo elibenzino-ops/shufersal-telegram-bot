@@ -198,9 +198,16 @@ export function parseHaziHinamCartResponse(
     results['CartSummary'] ??
     results) as Record<string, unknown>;
   const summaryObj = (results['CartSummary'] ?? cartObj) as Record<string, unknown>;
+  const cartItemsObj =
+    results['CartItems'] &&
+    typeof results['CartItems'] === 'object' &&
+    !Array.isArray(results['CartItems'])
+      ? (results['CartItems'] as Record<string, unknown>)
+      : null;
   const rawItems =
     (Array.isArray(cartObj['Items']) ? cartObj['Items'] : null) ??
     (Array.isArray(cartObj['CartItems']) ? cartObj['CartItems'] : null) ??
+    (Array.isArray(cartItemsObj?.['Items']) ? cartItemsObj['Items'] : null) ??
     (Array.isArray(results['CartItems']) ? results['CartItems'] : null) ??
     (Array.isArray(results['Items']) ? results['Items'] : null);
 
@@ -212,16 +219,24 @@ export function parseHaziHinamCartResponse(
   rawItems.forEach((rawEntry, idx) => {
     const entry = rawEntry as Record<string, unknown>;
     const nestedItem = (entry['Item'] ?? entry) as Record<string, unknown>;
+    const nestedCart =
+      entry['Cart'] && typeof entry['Cart'] === 'object' && !Array.isArray(entry['Cart'])
+        ? (entry['Cart'] as Record<string, unknown>)
+        : null;
     const productCode = String(
       entry['ItemId'] ?? nestedItem['Id'] ?? entry['Id'] ?? '',
     ).trim();
     if (!productCode) return;
 
-    const quantity = Number(entry['Quantity'] ?? entry['Qty'] ?? 1);
+    const quantity = Number(
+      nestedCart?.['Quantity'] ?? entry['Quantity'] ?? entry['Qty'] ?? 1,
+    );
     if (!Number.isFinite(quantity) || quantity <= 0) return;
 
     const lineTotalRaw = Number(
-      entry['TotalPrice'] ??
+      nestedCart?.['Price_Total'] ??
+        nestedCart?.['TotalPrice'] ??
+        entry['TotalPrice'] ??
         entry['FinalPrice'] ??
         entry['TotalPriceAfterDiscount'] ??
         entry['Price_Total'] ??
@@ -2138,17 +2153,34 @@ export class HaziHinamClient implements StoreClient {
     throw new Error('עדכון הזמנה קיימת אינו נתמך אוטומטית בחצי חינם');
   }
 
-  async placeOrder(_options: {
+  async placeOrder(options: {
     removeMissingItems: boolean;
   }): Promise<CheckoutResult> {
-    const cart = await this.getCartState();
-    if (cart.items.length === 0) {
-      throw new Error('עגלת חצי חינם ריקה – אין מה להזמין.');
+    await this.ensureAuthenticated();
+
+    let cart = await this.getCartState();
+    const removedOutOfStockCodes: string[] = [];
+
+    if (options.removeMissingItems) {
+      const outOfStock = cart.items.filter((i) => !i.inStock);
+      for (const item of outOfStock) {
+        logger.info(
+          `Removing out-of-stock item from Hazi Hinam cart before checkout: ${item.productCode}`,
+        );
+        cart = await this.removeFromCart(item.productCode);
+        removedOutOfStockCodes.push(item.productCode);
+      }
     }
 
+    const inStockItems = cart.items.filter((i) => i.inStock);
+    if (inStockItems.length === 0) {
+      throw new Error('עגלת חצי חינם ריקה ממוצרים במלאי – אין מה להזמין.');
+    }
+
+    const slot = await this.getSelectedTimeSlot();
     const total = formatCurrency(cart.totalPrice);
-    const slotNote = this.selectedSlot
-      ? ` (חלון משלוח שנבחר: ${formatHebrewDateTime(this.selectedSlot.startIso, this.selectedSlot.endHourText)})`
+    const slotNote = slot
+      ? ` (חלון משלוח שנבחר: ${formatHebrewDateTime(slot.startIso, slot.endHourText)})`
       : '';
 
     if (this.isGuestSession) {
@@ -2160,12 +2192,343 @@ export class HaziHinamClient implements StoreClient {
       );
     }
 
-    throw new StoreManualVerificationRequiredError(
-      'hazi_hinam',
-      'MANUAL_CHECKOUT',
-      `העגלה שלכם בחצי חינם מוכנה עם ${cart.items.length} פריטים בסך ${total}${slotNote}! להשלמת התשלום המאובטח לחצו על הקישור הישיר לעגלה:`,
-      STORE_META.hazi_hinam.cartUrl,
+    if (!slot) {
+      throw new Error(
+        'יש לבחור חלון משלוח בחצי חינם לפני סגירת ההזמנה (/slots).',
+      );
+    }
+
+    // 1. Validate cart summary & minimum order amount just like Hazi Hinam's passedStepCartValidations()
+    let summaryTotal = cart.totalPrice;
+    try {
+      const summaryResp = await this.apiFetchJson('/proxy/api/order/cartSummary', {
+        method: 'GET',
+      });
+      if (summaryResp['IsOK'] !== false) {
+        const sResults = (summaryResp['Results'] ??
+          summaryResp['results'] ??
+          summaryResp) as Record<string, unknown>;
+        const summary = (sResults['CartSummary'] ?? sResults) as Record<
+          string,
+          unknown
+        >;
+        const orderTotal = Number(summary['Price_Order_Total'] ?? NaN);
+        const minTotal = Number(summary['Minimum_Cart_Price_NET'] ?? NaN);
+        if (Number.isFinite(orderTotal) && orderTotal > 0) {
+          summaryTotal = Number(orderTotal.toFixed(2));
+        }
+        if (
+          Number.isFinite(minTotal) &&
+          minTotal > 0 &&
+          summaryTotal < minTotal
+        ) {
+          throw new Error(
+            `סכום העגלה בחצי חינם (${formatCurrency(summaryTotal)}) נמוך ממינימום ההזמנה (${formatCurrency(minTotal)}). הוסיפו עוד מוצרים ונסו שוב.`,
+          );
+        }
+      }
+    } catch (err) {
+      if (err instanceof Error && err.message.includes('מינימום ההזמנה')) {
+        throw err;
+      }
+      logger.warn('Hazi Hinam pre-checkout cartSummary check failed; continuing to order/checkout', err);
+    }
+
+    // 2. Fetch checkout configuration (saved cards UserCC, addresses, required acknowledgments, remarks)
+    let checkoutResp: Record<string, unknown>;
+    try {
+      checkoutResp = await this.apiFetchJson('/proxy/api/order/checkout', {
+        method: 'GET',
+      });
+    } catch (err) {
+      const reason = err instanceof Error ? err.message : String(err);
+      logger.warn(`Hazi Hinam GET /proxy/api/order/checkout failed: ${reason}`);
+      throw new StoreManualVerificationRequiredError(
+        'hazi_hinam',
+        'MANUAL_CHECKOUT',
+        `לא ניתן היה לטעון את פרטי הקופה בחצי חינם (${reason.slice(0, 140)}). העגלה מוכנה עם ${inStockItems.length} פריטים בסך ${formatCurrency(summaryTotal)}${slotNote} – ניתן להשלים ידנית בקישור:`,
+        STORE_META.hazi_hinam.cartUrl,
+      );
+    }
+
+    if (checkoutResp['IsOK'] === false) {
+      const errObj = (checkoutResp['ErrorResponse'] ?? {}) as Record<string, unknown>;
+      const errDesc = String(
+        errObj['ErrorDescription'] ?? errObj['Message'] ?? 'שגיאה בטעינת הקופה',
+      );
+      logger.warn(`Hazi Hinam order/checkout returned IsOK=false: ${errDesc}`);
+      throw new StoreManualVerificationRequiredError(
+        'hazi_hinam',
+        'MANUAL_CHECKOUT',
+        `חצי חינם לא אפשר טעינת קופה אוטומטית: ${errDesc}. ניתן להשלים ישירות באתר:`,
+        STORE_META.hazi_hinam.cartUrl,
+      );
+    }
+
+    const checkout = (checkoutResp['Results'] ??
+      checkoutResp['results'] ??
+      checkoutResp) as Record<string, unknown>;
+
+    if (checkout['IsOrderAllowed'] === false) {
+      const notAllowedMsg = String(
+        checkout['OrderNotAllowedMessage'] ??
+          'לא ניתן להשלים כרגע את ההזמנה בחצי חינם',
+      );
+      logger.warn(`Hazi Hinam IsOrderAllowed=false: ${notAllowedMsg}`);
+      throw new StoreManualVerificationRequiredError(
+        'hazi_hinam',
+        'MANUAL_CHECKOUT',
+        `חצי חינם אינו מאפשר הזמנה כרגע: ${notAllowedMsg}. ניתן לבדוק ישירות בעגלה:`,
+        STORE_META.hazi_hinam.cartUrl,
+      );
+    }
+
+    const pendingInfo = (checkout['PendingOrderInfo'] ?? null) as Record<
+      string,
+      unknown
+    > | null;
+    const userInfo = (checkout['UserInfo'] ?? {}) as Record<string, unknown>;
+    const isBusiness = Boolean(
+      userInfo['IsBussinessCustomer'] ?? userInfo['IsBusinessCustomer'],
     );
+
+    // Resolve saved credit card token
+    let userCards: Array<Record<string, unknown>> = Array.isArray(checkout['UserCC'])
+      ? (checkout['UserCC'] as Array<Record<string, unknown>>)
+      : [];
+    if (!isBusiness && userCards.length === 0) {
+      try {
+        const ccResp = await this.apiFetchJson('/proxy/api/user/cc', {
+          method: 'GET',
+        });
+        const ccResults = (ccResp['Results'] ?? ccResp['results'] ?? ccResp) as
+          | Record<string, unknown>
+          | Array<Record<string, unknown>>;
+        if (Array.isArray(ccResults)) {
+          userCards = ccResults;
+        } else if (Array.isArray(ccResults?.['UserCC'])) {
+          userCards = ccResults['UserCC'] as Array<Record<string, unknown>>;
+        }
+      } catch {
+        // ignore fallback card lookup error
+      }
+    }
+
+    const preferredCardToken =
+      typeof pendingInfo?.['CCToken'] === 'string' ? pendingInfo['CCToken'] : null;
+    const selectedCard =
+      (preferredCardToken
+        ? userCards.find((c) => c['CCToken'] === preferredCardToken)
+        : undefined) ?? userCards[0];
+    const ccToken =
+      typeof selectedCard?.['CCToken'] === 'string' && selectedCard['CCToken'].trim()
+        ? selectedCard['CCToken'].trim()
+        : null;
+
+    if (!isBusiness && !ccToken) {
+      logger.warn('Hazi Hinam checkout has no saved credit card (UserCC is empty); falling back to manual checkout');
+      throw new StoreManualVerificationRequiredError(
+        'hazi_hinam',
+        'MANUAL_CHECKOUT',
+        `לא נמצא כרטיס אשראי שמור בחשבון חצי חינם שלכם. העגלה מוכנה (${inStockItems.length} פריטים, ${formatCurrency(summaryTotal)})${slotNote} – השלימו תשלום ושמרו כרטיס באתר כדי שבהזמנות הבאות התשלום יתבצע אוטומטית:`,
+        STORE_META.hazi_hinam.cartUrl,
+      );
+    }
+
+    if (!isBusiness && !this.options.password) {
+      logger.warn('Hazi Hinam password missing for payment PWD verification; falling back to manual checkout');
+      throw new StoreManualVerificationRequiredError(
+        'hazi_hinam',
+        'MANUAL_CHECKOUT',
+        `נדרשת סיסמת החשבון (HAZI_HINAM_PASSWORD ב-.env) לאימות חיוב הכרטיס השמור בחצי חינם. ניתן להשלים ידנית בקישור:`,
+        STORE_META.hazi_hinam.cartUrl,
+      );
+    }
+
+    // Resolve delivery address / pickup store & numeric ShipmentId
+    const rawSlot = slot.rawSlot ?? {};
+    const rawShipmentId = rawSlot['ShipmentId'] ?? slot.code;
+    const numericShipmentId = Number(rawShipmentId);
+    const shipmentId: number | string =
+      Number.isFinite(numericShipmentId) && numericShipmentId > 0
+        ? numericShipmentId
+        : String(rawShipmentId);
+
+    let isSelfPickUp = Boolean(rawSlot['IsSelfPickUp']);
+    let addressId: number | string | null =
+      rawSlot['AddressId'] !== undefined && rawSlot['AddressId'] !== null
+        ? (rawSlot['AddressId'] as number | string)
+        : null;
+    let storeId: number | string | null =
+      rawSlot['StoreId'] !== undefined && rawSlot['StoreId'] !== null
+        ? (rawSlot['StoreId'] as number | string)
+        : null;
+
+    const checkoutAddresses = Array.isArray(checkout['Addresses'])
+      ? (checkout['Addresses'] as Array<Record<string, unknown>>)
+      : [];
+    const checkoutStores = Array.isArray(checkout['Stores'])
+      ? (checkout['Stores'] as Array<Record<string, unknown>>)
+      : [];
+
+    if (!isSelfPickUp && addressId === null) {
+      const matchingAddr =
+        checkoutAddresses.find((a) => {
+          const days = Array.isArray(a['ShipmentsByDate'])
+            ? (a['ShipmentsByDate'] as Array<Record<string, unknown>>)
+            : [];
+          return days.some(
+            (d) =>
+              Array.isArray(d['Shipments']) &&
+              (d['Shipments'] as Array<Record<string, unknown>>).some(
+                (s) => String(s['ShipmentId']) === String(shipmentId),
+              ),
+          );
+        }) ??
+        checkoutAddresses.find((a) => a['IsDefault'] === true) ??
+        checkoutAddresses[0];
+      if (matchingAddr?.['Id'] !== undefined && matchingAddr['Id'] !== null) {
+        addressId = matchingAddr['Id'] as number | string;
+      }
+    }
+
+    if (isSelfPickUp && storeId === null) {
+      const matchingStore =
+        checkoutStores.find((s) => {
+          const days = Array.isArray(s['ShipmentsByDate'])
+            ? (s['ShipmentsByDate'] as Array<Record<string, unknown>>)
+            : [];
+          return days.some(
+            (d) =>
+              Array.isArray(d['Shipments']) &&
+              (d['Shipments'] as Array<Record<string, unknown>>).some(
+                (sh) => String(sh['ShipmentId']) === String(shipmentId),
+              ),
+          );
+        }) ?? checkoutStores[0];
+      if (matchingStore?.['Id'] !== undefined && matchingStore['Id'] !== null) {
+        storeId = matchingStore['Id'] as number | string;
+      }
+    }
+
+    if (!isSelfPickUp && addressId === null && storeId !== null) {
+      isSelfPickUp = true;
+    }
+
+    if ((!isSelfPickUp && addressId === null) || (isSelfPickUp && storeId === null)) {
+      throw new StoreManualVerificationRequiredError(
+        'hazi_hinam',
+        'MANUAL_CHECKOUT',
+        `לא נמצאה כתובת משלוח/סניף תואם לחלון שנבחר בחצי חינם. בחרו חלון משלוח מחדש (/slots) או השלימו ישירות באתר:`,
+        STORE_META.hazi_hinam.cartUrl,
+      );
+    }
+
+    // Resolve required OrderRemarkId & mandatory Acknowledgments (IsMust: true)
+    const orderRemarks = Array.isArray(checkout['OrderRemarks'])
+      ? (checkout['OrderRemarks'] as Array<Record<string, unknown>>)
+      : [];
+    const orderRemarkId =
+      pendingInfo?.['OrderRemarkId'] ?? orderRemarks[0]?.['Id'] ?? null;
+
+    const rawAcks = Array.isArray(checkout['OrderAcknowledgments'])
+      ? (checkout['OrderAcknowledgments'] as Array<Record<string, unknown>>)
+      : [];
+    const ackIdSet = new Set<unknown>();
+    for (const ack of rawAcks) {
+      if (ack['IsMust'] === true && ack['Id'] !== undefined && ack['Id'] !== null) {
+        ackIdSet.add(ack['Id']);
+      }
+    }
+    if (Array.isArray(pendingInfo?.['Acknowledgments'])) {
+      for (const id of pendingInfo['Acknowledgments']) {
+        if (id !== undefined && id !== null) ackIdSet.add(id);
+      }
+    }
+    const acknowledgments = [...ackIdSet];
+
+    const payments =
+      typeof pendingInfo?.['Payments'] === 'number' && pendingInfo['Payments'] >= 1
+        ? pendingInfo['Payments']
+        : 1;
+
+    // 3. Submit order via Hazi Hinam's real POST /proxy/api/order/post endpoint
+    logger.info(
+      `Submitting Hazi Hinam order (shipmentId=${String(shipmentId)}, addressId=${String(addressId)}, storeId=${String(storeId)}, business=${String(isBusiness)}, acks=${acknowledgments.length})...`,
+    );
+
+    const orderResp = await this.apiFetchJson('/proxy/api/order/post', {
+      method: 'POST',
+      body: {
+        Object: {
+          AddressId: isSelfPickUp ? null : addressId,
+          StoreId: isSelfPickUp ? storeId : null,
+          ShippmentId: shipmentId,
+          CCToken: isBusiness ? null : ccToken,
+          KeepCC: !isBusiness,
+          PWD: isBusiness ? null : this.options.password,
+          Payments: payments,
+          OrderRemarkId: orderRemarkId,
+          ShipmentRemarkFreeText: '',
+          ShipmentRemarkId: null,
+          Acknowledgments: acknowledgments,
+        },
+      },
+    });
+
+    if (orderResp['IsOK'] === false) {
+      const errObj = (orderResp['ErrorResponse'] ?? {}) as Record<string, unknown>;
+      const errCode = errObj['ErrorCode'];
+      const errDesc = String(
+        errObj['ErrorDescription'] ?? errObj['Message'] ?? 'שגיאה ביצירת ההזמנה',
+      );
+      logger.warn(
+        `Hazi Hinam POST /proxy/api/order/post rejected (ErrorCode=${String(errCode)}): ${errDesc}`,
+      );
+      throw new StoreManualVerificationRequiredError(
+        'hazi_hinam',
+        'MANUAL_CHECKOUT',
+        `חצי חינם דחה את יצירת ההזמנה האוטומטית: ${errDesc}. כל הפריטים עדיין בעגלה – ניתן להשלים ידנית בקישור:`,
+        STORE_META.hazi_hinam.cartUrl,
+      );
+    }
+
+    const confirmation = (orderResp['Results'] ??
+      orderResp['results'] ??
+      {}) as Record<string, unknown>;
+    const orderCode = String(
+      confirmation['Order_Draft_Id'] ??
+        confirmation['OrderId'] ??
+        confirmation['OrderNumber'] ??
+        'אושרה',
+    ).trim();
+
+    const confirmedTotalRaw = Number(
+      confirmation['Price_Order_Total'] ??
+        confirmation['TotalPrice'] ??
+        NaN,
+    );
+    const finalTotal =
+      Number.isFinite(confirmedTotalRaw) && confirmedTotalRaw > 0
+        ? Number(confirmedTotalRaw.toFixed(2))
+        : summaryTotal;
+
+    const deliveryIso = slot.startIso;
+    this.trackedCart.clear();
+    this.selectedSlot = null;
+    this.activeDraftOrderId = null;
+    this.saveSession();
+
+    logger.info(`Hazi Hinam order #${orderCode} placed successfully (total=${finalTotal})`);
+
+    return {
+      storeId: 'hazi_hinam',
+      orderCode,
+      deliveryIso,
+      totalPrice: finalTotal,
+      wasOrderUpdate: false,
+      removedOutOfStockCodes,
+    };
   }
 
   async shutdown(): Promise<void> {

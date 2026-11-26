@@ -1824,4 +1824,216 @@ describe('rankStoreQuotes & MultiStoreManager (Shufersal + Hazi Hinam)', () => {
     expect((await shufersalClient.getCartState()).items).toHaveLength(1);
     expect((await shufersalClient.getCartState()).items[0]?.quantity).toBe(1);
   });
+
+  it('places real Hazi Hinam orders via order/checkout + order/post with saved card and falls back cleanly when no card is saved', async () => {
+    // Verify nested Results.CartItems.Items + entry.Cart.Quantity shape
+    const nestedCart = parseHaziHinamCartResponse(
+      {
+        IsOK: true,
+        Results: {
+          CartItems: {
+            Items: [
+              {
+                Id: 4441,
+                Name: 'גבינה צהובה עמק',
+                Price_NET: 22.5,
+                IsInStock: true,
+                Cart: { Quantity: 2 },
+              },
+            ],
+          },
+          CartSummary: {
+            Price_Order_Total: 45,
+            Price_Shipping: 29.9,
+          },
+        },
+      },
+      29.9,
+      false,
+    );
+    expect(nestedCart?.items).toHaveLength(1);
+    expect(nestedCart?.items[0]?.quantity).toBe(2);
+    expect(nestedCart?.items[0]?.itemPrice).toBe(45);
+
+    const sessionFilePath = path.join(tmpDir, 'hazi-checkout-session.json');
+    let submittedOrderBody: Record<string, unknown> | null = null;
+    let userCards: Array<Record<string, unknown>> = [
+      { CCToken: 'cc-tok-999', CCNumber: '****-1234' },
+    ];
+    let cartTotal = 240;
+
+    const mockFetch: typeof fetch = vi.fn(async (input, init) => {
+      const url = typeof input === 'string' ? input : input.toString();
+
+      if (url.includes('/connect/token')) {
+        return new Response(
+          JSON.stringify({ access_token: 'hazi-auth-token', expires_in: 7200 }),
+          { status: 200, headers: { 'content-type': 'application/json' } },
+        );
+      }
+
+      if (url.includes('/proxy/api/delivery/getNextDeliveries')) {
+        return new Response(
+          JSON.stringify({
+            IsOK: true,
+            Results: {
+              Addresses: [
+                {
+                  Id: 303,
+                  Name: 'ירושלים, אגריפס 12',
+                  IsDefault: true,
+                  ShipmentsByDate: [
+                    {
+                      Date: '30/11/2026',
+                      DOW: 'שני',
+                      Shipments: [
+                        {
+                          ShipmentId: 195653,
+                          IsClosedShipment: false,
+                          Time: { From: '14:00', To: '16:00' },
+                          Price: 29.9,
+                        },
+                      ],
+                    },
+                  ],
+                },
+              ],
+              Stores: [],
+            },
+          }),
+          { status: 200, headers: { 'content-type': 'application/json' } },
+        );
+      }
+
+      if (url.includes('/proxy/api/item/getItemsInCart')) {
+        return new Response(
+          JSON.stringify({
+            IsOK: true,
+            Results: {
+              CartItems: {
+                Items: [
+                  {
+                    Id: 5001,
+                    Name: 'שמן זית 750 מ"ל',
+                    Price_NET: 60,
+                    IsInStock: true,
+                    Cart: { Quantity: 4 },
+                  },
+                ],
+              },
+            },
+          }),
+          { status: 200, headers: { 'content-type': 'application/json' } },
+        );
+      }
+
+      if (url.includes('/proxy/api/order/cartSummary')) {
+        return new Response(
+          JSON.stringify({
+            IsOK: true,
+            Results: {
+              CartSummary: {
+                Price_Order_Total: cartTotal,
+                Price_Shipping: 29.9,
+                Minimum_Cart_Price_NET: 200,
+              },
+            },
+          }),
+          { status: 200, headers: { 'content-type': 'application/json' } },
+        );
+      }
+
+      if (url.includes('/proxy/api/order/checkout')) {
+        return new Response(
+          JSON.stringify({
+            IsOK: true,
+            Results: {
+              IsOrderAllowed: true,
+              UserInfo: { IsBussinessCustomer: false },
+              UserCC: userCards,
+              OrderRemarks: [{ Id: 11, Description: 'התקשרו אליי בחוסרים' }],
+              OrderAcknowledgments: [
+                { Id: 1, IsMust: true },
+                { Id: 2, IsMust: false },
+                { Id: 3, IsMust: true },
+              ],
+              Addresses: [{ Id: 303, IsDefault: true, ShipmentsByDate: [] }],
+              Stores: [],
+            },
+          }),
+          { status: 200, headers: { 'content-type': 'application/json' } },
+        );
+      }
+
+      if (url.includes('/proxy/api/order/post')) {
+        submittedOrderBody = JSON.parse(String(init?.body ?? '{}')) as Record<
+          string,
+          unknown
+        >;
+        return new Response(
+          JSON.stringify({
+            IsOK: true,
+            Results: {
+              Order_Draft_Id: 778899,
+              Price_Order_Total: 269.9,
+            },
+          }),
+          { status: 200, headers: { 'content-type': 'application/json' } },
+        );
+      }
+
+      return new Response(JSON.stringify({ IsOK: false }), { status: 404 });
+    });
+
+    const client = new HaziHinamClient({
+      username: 'eli@example.com',
+      password: 'my-hazi-password',
+      sessionFilePath,
+      fetchFn: mockFetch,
+    });
+
+    const slots = await client.getAvailableTimeSlots();
+    expect(slots).toHaveLength(1);
+    await client.selectTimeSlot('195653');
+
+    // 1. Below minimum order fails fast with clear Hebrew message
+    cartTotal = 150;
+    await expect(
+      client.placeOrder({ removeMissingItems: true }),
+    ).rejects.toThrow(/מינימום ההזמנה/);
+
+    // 2. Missing saved credit card falls back cleanly to MANUAL_CHECKOUT with specific reason
+    cartTotal = 240;
+    userCards = [];
+    await expect(
+      client.placeOrder({ removeMissingItems: true }),
+    ).rejects.toSatisfy(
+      (err: unknown) =>
+        err instanceof StoreManualVerificationRequiredError &&
+        err.message.includes('לא נמצא כרטיס אשראי שמור'),
+    );
+
+    // 3. With saved credit card + password + slot, submits real POST /proxy/api/order/post!
+    userCards = [{ CCToken: 'cc-tok-999', CCNumber: '****-1234' }];
+    const result = await client.placeOrder({ removeMissingItems: true });
+    expect(result.orderCode).toBe('778899');
+    expect(result.totalPrice).toBe(269.9);
+    expect(result.storeId).toBe('hazi_hinam');
+    expect(submittedOrderBody).toEqual({
+      Object: {
+        AddressId: 303,
+        StoreId: null,
+        ShippmentId: 195653,
+        CCToken: 'cc-tok-999',
+        KeepCC: true,
+        PWD: 'my-hazi-password',
+        Payments: 1,
+        OrderRemarkId: 11,
+        ShipmentRemarkFreeText: '',
+        ShipmentRemarkId: null,
+        Acknowledgments: [1, 3],
+      },
+    });
+    expect(await client.getSelectedTimeSlot()).toBeNull();
+  });
 });

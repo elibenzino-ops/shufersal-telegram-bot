@@ -1806,11 +1806,14 @@ export function createTelegramBot(deps: CreateTelegramBotDeps): Bot {
     }
 
     if (
-      mgr.storeId === 'shufersal' &&
+      mgr.meta.supportsAutoCheckout &&
+      !cart.isGuestSession &&
       !selectedSlot &&
       !cart.orderInUpdateMode
     ) {
-      const updatableOrder = activeOrders.find((o) => o.isUpdatable);
+      const updatableOrder = mgr.meta.supportsOrderUpdate
+        ? activeOrders.find((o) => o.isUpdatable)
+        : undefined;
       const slotsTok = db.saveCallbackPayload({
         kind: 'store_slots',
         storeId: mgr.storeId,
@@ -1819,7 +1822,7 @@ export function createTelegramBot(deps: CreateTelegramBotDeps): Bot {
       if (updatableOrder) {
         const editTok = db.saveCallbackPayload({
           kind: 'order_edit',
-          storeId: 'shufersal',
+          storeId: mgr.storeId,
           orderCode: updatableOrder.code,
         });
         kb.row().text(
@@ -1832,7 +1835,7 @@ export function createTelegramBot(deps: CreateTelegramBotDeps): Bot {
       }
 
       const msg =
-        `⚠️ <b>לפני השלמת ההזמנה בשופרסל יש לבחור חלון משלוח</b>\n\n` +
+        `⚠️ <b>לפני השלמת ההזמנה ב-${escapeHtml(mgr.meta.shortName)} יש לבחור חלון משלוח</b>\n\n` +
         `בעגלה יש כרגע <b>${inStockCount} פריטים</b> בסך <b>${formatCurrency(cart.totalPrice)}</b>, אך טרם שוריין מועד משלוח.`;
       if (messageIdToEdit) {
         await bot.api.editMessageText(chatId, messageIdToEdit, msg, {
@@ -1853,16 +1856,16 @@ export function createTelegramBot(deps: CreateTelegramBotDeps): Bot {
       : undefined;
 
     const summaryHtml = renderCartSummaryHtml(mgr.meta, cart, selectedSlot);
-    const isGuestNoSync = Boolean(cart.isGuestSession && !mgr.meta.supportsAutoCheckout);
+    const isGuestNoSync = Boolean(cart.isGuestSession);
     const modeNote = cart.orderInUpdateMode
       ? `\n\n📌 <b>פעולה:</b> שמירת עדכון להזמנה קיימת <b>#${escapeHtml(cart.orderInUpdateMode)}</b>` +
         (updatingOrder
           ? ` (${escapeHtml(formatHebrewDateTime(updatingOrder.deliveryIso))})`
           : '')
-      : mgr.meta.supportsAutoCheckout
-        ? `\n\n📌 <b>פעולה:</b> יצירת הזמנה חדשה וחיוב כרטיס האשראי השמור ב-${escapeHtml(mgr.meta.displayName)}`
-        : isGuestNoSync
-          ? `\n\n⚠️ <b>שים לב (מצב אורח):</b> הבוט אינו מחובר לחשבון שלכם ב-${escapeHtml(mgr.meta.shortName)}, ולכן הקישור לאתר יפתח עגלה ריקה (ההשוואה היא למחיר בלבד). כדי שהבוט ימלא אוטומטית את העגלה בחשבון שלכם, הוסיפו פרטי התחברות ל-<code>.env</code>.`
+      : isGuestNoSync
+        ? `\n\n⚠️ <b>שים לב (מצב אורח):</b> הבוט אינו מחובר לחשבון שלכם ב-${escapeHtml(mgr.meta.shortName)}, ולכן הקישור לאתר יפתח עגלה ריקה (ההשוואה היא למחיר בלבד). כדי שהבוט ימלא אוטומטית את העגלה בחשבון שלכם, הוסיפו פרטי התחברות ל-<code>.env</code>.`
+        : mgr.meta.supportsAutoCheckout
+          ? `\n\n📌 <b>פעולה:</b> יצירת הזמנה חדשה וחיוב כרטיס האשראי השמור ב-${escapeHtml(mgr.meta.displayName)}`
           : `\n\n📌 <b>פעולה:</b> סנכרון העגלה לחשבון שלכם ב-${escapeHtml(mgr.meta.displayName)} וקבלת קישור ישיר להשלמת התשלום`;
 
     const confirmTok = db.saveCallbackPayload({

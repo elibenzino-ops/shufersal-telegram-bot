@@ -40,7 +40,7 @@ export const STORE_META: Record<StoreId, StoreMeta> = {
     cartUrl: 'https://shop.hazi-hinam.co.il/checkout/cart',
     defaultDeliveryFee: 29.9,
     minimumOrderAmount: 200,
-    supportsAutoCheckout: false,
+    supportsAutoCheckout: true,
     supportsOrderUpdate: false,
   },
 };
