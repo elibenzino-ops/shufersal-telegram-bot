@@ -1,6 +1,6 @@
 import { GoogleGenAI, Type } from '@google/genai';
 import { logger } from '../logger.js';
-import type { CatalogProduct } from '../shufersal/types.js';
+import type { CatalogProduct, StoreId } from '../stores/types.js';
 import { TimeoutError, withTimeout } from '../utils/timeout.js';
 
 export interface ParsedGroceryItem {
@@ -10,6 +10,7 @@ export interface ParsedGroceryItem {
   quantity: number;
   unitPreference: 'UNIT' | 'WEIGHT';
   pickerComment?: string;
+  targetStore?: StoreId;
 }
 
 export interface ParsedMessageResult {
@@ -82,6 +83,126 @@ export function extractRetryDelayMs(errorMessage: string): number | null {
     if (totalMs > 0) return totalMs;
   }
   return null;
+}
+
+function normalizeStoreToken(raw: string): StoreId | null {
+  const clean = raw
+    .trim()
+    .toLowerCase()
+    .replace(/^["'״׳]+|["'״׳:,.!]+$/g, '');
+  if (/^(?:ל|ב|מ)?שופרסל(?:\s+אונליין)?$/.test(clean) || /^shufersal$/.test(clean)) {
+    return 'shufersal';
+  }
+  if (
+    /^(?:ל|ב|מ)?חצי[\s_-]?חינם(?:\s+אונליין)?$/.test(clean) ||
+    /^(?:hazi[\s_-]?hinam|hatzi[\s_-]?hinam|hazi|hatzi)$/.test(clean)
+  ) {
+    return 'hazi_hinam';
+  }
+  return null;
+}
+
+/**
+ * Parses explicit store prefix/suffix in `/add <store> <item>` commands.
+ * Examples:
+ * - "שופרסל 2 חלב" -> { storeId: 'shufersal', remainder: '2 חלב' }
+ * - "חצי חינם קוטג' 5%" -> { storeId: 'hazi_hinam', remainder: "קוטג' 5%" }
+ * - "hazi 2 חלב" -> { storeId: 'hazi_hinam', remainder: '2 חלב' }
+ * - "2 חלב לשופרסל" -> { storeId: 'shufersal', remainder: '2 חלב' }
+ * - "2 חלב" -> { storeId: null, remainder: '2 חלב' }
+ */
+export function extractTargetStoreFromCommand(text: string): {
+  storeId: StoreId | null;
+  remainder: string;
+} {
+  const trimmed = text.trim();
+  if (!trimmed) return { storeId: null, remainder: '' };
+
+  const leadingPatterns: Array<{ re: RegExp; storeId: StoreId }> = [
+    {
+      re: /^(?:רק\s+)?(?:(?:ל|ב|מ)?חצי[\s_-]?חינם(?:\s+אונליין)?|hazi[\s_-]?hinam|hatzi[\s_-]?hinam|hazi|hatzi)(?:\s*[:\-–]\s*|\s+)(.+)$/i,
+      storeId: 'hazi_hinam',
+    },
+    {
+      re: /^(?:רק\s+)?(?:(?:ל|ב|מ)?שופרסל(?:\s+אונליין)?|shufersal)(?:\s*[:\-–]\s*|\s+)(.+)$/i,
+      storeId: 'shufersal',
+    },
+  ];
+  for (const { re, storeId } of leadingPatterns) {
+    const m = re.exec(trimmed);
+    if (m?.[1]?.trim()) {
+      return { storeId, remainder: m[1].trim() };
+    }
+  }
+
+  // Also check if the user wrote the store at the end with an explicit preposition (e.g. "/add 2 חלב לחצי חינם")
+  const natural = extractTargetStoreFromNaturalText(trimmed);
+  if (natural.storeId && natural.cleanedText) {
+    return { storeId: natural.storeId, remainder: natural.cleanedText };
+  }
+
+  // Single token matching a store name only (no product text yet)
+  const soloStore = normalizeStoreToken(trimmed);
+  if (soloStore) {
+    return { storeId: soloStore, remainder: '' };
+  }
+
+  return { storeId: null, remainder: trimmed };
+}
+
+/**
+ * Extracts explicit target store directives from natural Hebrew/English grocery text
+ * without stripping private-label brand names like "חלב שופרסל".
+ */
+export function extractTargetStoreFromNaturalText(text: string): {
+  storeId: StoreId | undefined;
+  cleanedText: string;
+} {
+  let working = text.trim();
+  if (!working) return { storeId: undefined, cleanedText: '' };
+
+  // Prefix with colon (e.g. "חצי חינם: חלב, ביצים" or "רק לשופרסל: 2 קוטג'")
+  const colonPrefixPatterns: Array<{ re: RegExp; storeId: StoreId }> = [
+    {
+      re: /^(?:רק\s+)?(?:(?:ל|ב|מ)?חצי[\s_-]?חינם(?:\s+אונליין)?|hazi[\s_-]?hinam|hatzi[\s_-]?hinam|hazi|hatzi)\s*:\s*(.+)$/i,
+      storeId: 'hazi_hinam',
+    },
+    {
+      re: /^(?:רק\s+)?(?:(?:ל|ב|מ)?שופרסל(?:\s+אונליין)?|shufersal)\s*:\s*(.+)$/i,
+      storeId: 'shufersal',
+    },
+  ];
+  for (const { re, storeId } of colonPrefixPatterns) {
+    const m = re.exec(working);
+    if (m?.[1]?.trim()) {
+      return { storeId, cleanedText: m[1].trim() };
+    }
+  }
+
+  // Explicit prepositional directives anywhere in the clause (e.g. "תוסיפו חלב רק בחצי חינם", "לחם לשופרסל", "ביצים מ-חצי חינם")
+  const directivePatterns: Array<{ re: RegExp; storeId: StoreId }> = [
+    {
+      re: /(?:^|\s)(?:(?:רק\s+)?(?:ל|ב|מ)-?חצי[\s_-]?חינם(?:\s+אונליין)?|רק\s+חצי[\s_-]?חינם(?:\s+אונליין)?|(?:only\s+)?(?:in|to|from)\s+(?:hazi[\s_-]?hinam|hatzi[\s_-]?hinam|hazi|hatzi)|only\s+(?:hazi[\s_-]?hinam|hatzi[\s_-]?hinam|hazi|hatzi))(?=$|\s|[,.!?:;])/i,
+      storeId: 'hazi_hinam',
+    },
+    {
+      re: /(?:^|\s)(?:(?:רק\s+)?(?:ל|ב|מ)-?שופרסל(?:\s+אונליין)?|רק\s+שופרסל(?:\s+אונליין)?|(?:only\s+)?(?:in|to|from)\s+shufersal|only\s+shufersal)(?=$|\s|[,.!?:;])/i,
+      storeId: 'shufersal',
+    },
+  ];
+
+  for (const { re, storeId } of directivePatterns) {
+    if (re.test(working)) {
+      const cleaned = working
+        .replace(re, ' ')
+        .replace(/\s+/g, ' ')
+        .replace(/^[\s,:-]+|[\s,:-]+$/g, '')
+        .trim();
+      return { storeId, cleanedText: cleaned };
+    }
+  }
+
+  return { storeId: undefined, cleanedText: working };
 }
 
 const HEBREW_MATCH_STOP_WORDS = new Set([
@@ -446,7 +567,7 @@ export class GroceryAiService {
 תפקידך לנתח הודעות בעברית של משתתפי הקבוצה ולהחליט:
 1. האם ההודעה היא בקשה להוסיף, לעדכן או להסיר מצרכים מרשימת הקניות (isGroceryRelated = true), או סתם שיחה כללית בקבוצה כמו "בוקר טוב", "תודה", "מתי המשלוח מגיע?" (isGroceryRelated = false).
 2. עבור כל מצרך שמוזכר בהודעה:
-   - searchQuery: שאילתת חיפוש נקייה ומדויקת לקטלוג סופרמרקט בעברית (למשל: "חלב תנובה 3%", "קוטג 5%", "עגבניות", "לחם פרוס אחיד"). אל תכלול בשאילתה מילות בקשה כמו "תביא", "צריך", "עוד" או את הכמות של מספר היחידות.
+   - searchQuery: שאילתת חיפוש נקייה ומדויקת לקטלוג סופרמרקט בעברית (למשל: "חלב תנובה 3%", "קוטג 5%", "עגבניות", "לחם פרוס אחיד"). אל תכלול בשאילתה מילות בקשה כמו "תביא", "צריך", "עוד", את הכמות של מספר היחידות, או הנחיית חנות יעד כמו "לשופרסל" / "רק בחצי חינם".
    - הבחנה חשובה בין גודל אריזה לבין משקל שקילה:
      • מוצר ארוז שמצוין משקל האריזה שלו (למשל "גבינה לבנה 500 גרם" או "חומוס אחלה 400 גרם"): השאר את המשקל כחלק מ-searchQuery, קבע unitPreference="UNIT" ו-quantity=1 (או מספר האריזות המבוקש).
      • ירקות/פירות/בשר במשקל (למשל "חצי קילו עגבניות", "1.5 קילו תפוחי אדמה", "300 גרם גבינה צהובה במעדנייה"): קבע searchQuery לשם המוצר בלבד ("עגבניות"), unitPreference="WEIGHT", ו-quantity בקילוגרמים (למשל 0.5 עבור חצי קילו / 500 גרם).
@@ -454,6 +575,10 @@ export class GroceryAiService {
      • "add" – ברירת מחדל להוספת מצרך (כולל "צריך חלב", "תוסיפו 2 חלב", "עוד חלב").
      • "set" – רק כשמבקשים לקבוע כמות סופית מוחלטת ("שיהיה סה״כ 3 חלב", "תשנו ל-2 קוטג'").
      • "remove" – כשמבקשים להוריד/לבטל מוצר מהעגלה ("תורידו את החלב", "לבטל לחם", "בסוף לא צריך ביצים").
+   - targetStore:
+     • "shufersal" – רק אם המשתמש ביקש במפורש להוסיף/להסיר את המוצר רק בשופרסל (למשל "תוסיפו חלב לשופרסל", "רק בשופרסל", "תורידו ביצים משופרסל"). שימו לב: אם שם המותג הוא "חלב שופרסל" ללא מילת יעד, השאירו "all".
+     • "hazi_hinam" – רק אם המשתמש ביקש במפורש להוסיף/להסיר את המוצר רק בחצי חינם (למשל "קוטג' לחצי חינם", "רק בחצי חינם", "מחצי חינם").
+     • "all" – ברירת מחדל כשלא צוינה רשת ספציפית.
    - pickerComment: הערה למלקט אם צוינה (למשל "ירוקות", "בשלות", "פרוס דק"), אחרת מחרוזת ריקה.`;
 
     try {
@@ -483,6 +608,10 @@ export class GroceryAiService {
                       type: Type.STRING,
                       enum: ['UNIT', 'WEIGHT'],
                     },
+                    targetStore: {
+                      type: Type.STRING,
+                      enum: ['all', 'shufersal', 'hazi_hinam'],
+                    },
                     pickerComment: { type: Type.STRING },
                   },
                   required: [
@@ -505,15 +634,38 @@ export class GroceryAiService {
         return { isGroceryRelated: false, items: [] };
       }
 
-      const parsed = JSON.parse(rawJson) as ParsedMessageResult;
-      const sanitizedItems = (parsed.items ?? [])
+      const parsed = JSON.parse(rawJson) as {
+        isGroceryRelated?: boolean;
+        items?: Array<
+          Omit<ParsedGroceryItem, 'targetStore'> & {
+            targetStore?: 'all' | StoreId;
+          }
+        >;
+      };
+      const messageLevelDirective = extractTargetStoreFromNaturalText(trimmed);
+      const sanitizedItems: ParsedGroceryItem[] = (parsed.items ?? [])
         .filter((i) => i.searchQuery && i.searchQuery.trim().length > 0)
-        .map((i) => ({
-          ...i,
-          searchQuery: i.searchQuery.trim(),
-          quantity: i.quantity > 0 ? i.quantity : 1,
-          pickerComment: i.pickerComment?.trim() || undefined,
-        }));
+        .map((i) => {
+          const itemDirective = extractTargetStoreFromNaturalText(i.searchQuery);
+          const resolvedTarget: StoreId | undefined =
+            i.targetStore === 'shufersal' || i.targetStore === 'hazi_hinam'
+              ? i.targetStore
+              : itemDirective.storeId ?? messageLevelDirective.storeId;
+          const cleanQuery =
+            itemDirective.storeId && itemDirective.cleanedText
+              ? itemDirective.cleanedText
+              : i.searchQuery.trim();
+          return {
+            rawText: i.rawText,
+            searchQuery: cleanQuery,
+            action: i.action,
+            quantity: i.quantity > 0 ? i.quantity : 1,
+            unitPreference: i.unitPreference,
+            pickerComment: i.pickerComment?.trim() || undefined,
+            ...(resolvedTarget ? { targetStore: resolvedTarget } : {}),
+          };
+        })
+        .filter((i) => i.searchQuery.length > 0);
 
       return {
         isGroceryRelated: Boolean(parsed.isGroceryRelated && sanitizedItems.length > 0),
@@ -855,21 +1007,53 @@ ${strictRule}`;
     return Math.max(1, Math.round(request.quantity));
   }
 
-  private fallbackParse(text: string): ParsedMessageResult {
+  async parseExplicitAddText(
+    text: string,
+    forcedTargetStore?: StoreId,
+  ): Promise<ParsedGroceryItem[]> {
+    const trimmed = text.trim();
+    if (!trimmed) return [];
+
+    const parsed = await this.parseGroupMessage(trimmed);
+    let items = parsed.isGroceryRelated ? parsed.items : [];
+    if (items.length === 0) {
+      items = this.fallbackParse(trimmed, true).items;
+    }
+    return items.map((item) => ({
+      ...item,
+      action: item.action === 'remove' ? 'add' : item.action,
+      ...(forcedTargetStore
+        ? { targetStore: forcedTargetStore }
+        : item.targetStore
+          ? { targetStore: item.targetStore }
+          : {}),
+    }));
+  }
+
+  private fallbackParse(text: string, forceGrocery = false): ParsedMessageResult {
     // Ignore obvious non-grocery chat / questions / greetings when Gemini is unavailable
     if (
-      text.endsWith('?') ||
-      /^(בוקר טוב|ערב טוב|לילה טוב|שלום|היי|הי|תודה|סבבה|אוקיי|אוקי|בסדר|מעולה|מצוין|כן|לא|אחלה|מה נשמע|מה קורה)/i.test(
-        text,
-      )
+      !forceGrocery &&
+      (text.endsWith('?') ||
+        /^(בוקר טוב|ערב טוב|לילה טוב|שלום|היי|הי|תודה|סבבה|אוקיי|אוקי|בסדר|מעולה|מצוין|כן|לא|אחלה|מה נשמע|מה קורה)/i.test(
+          text,
+        ))
     ) {
       return { isGroceryRelated: false, items: [] };
     }
 
-    const lines = text
+    // Check message-level store prefix like "רק בחצי חינם: חלב, ביצים" or "לשופרסל: 2 קוטג'"
+    const colonPrefix = /^(?:רק\s+)?(?:(?:ל|ב|מ)?(?:חצי[\s_-]?חינם(?:\s+אונליין)?|שופרסל(?:\s+אונליין)?)|hazi[\s_-]?hinam|hatzi[\s_-]?hinam|hazi|hatzi|shufersal)\s*:\s*/i.test(
+      text.trim(),
+    );
+    const msgDirective = colonPrefix
+      ? extractTargetStoreFromNaturalText(text)
+      : { storeId: undefined, cleanedText: text };
+
+    const lines = msgDirective.cleanedText
       .split(/[\n,]+/)
       .map((l) => l.trim())
-      .filter((l) => l.length >= 2 && l.length <= 60);
+      .filter((l) => l.length >= 2 && l.length <= 80);
 
     if (lines.length === 0) {
       return { isGroceryRelated: false, items: [] };
@@ -877,7 +1061,9 @@ ${strictRule}`;
 
     const items: ParsedGroceryItem[] = [];
     for (const rawLine of lines) {
-      let line = rawLine;
+      const lineDirective = extractTargetStoreFromNaturalText(rawLine);
+      const targetStore = lineDirective.storeId ?? msgDirective.storeId;
+      let line = lineDirective.cleanedText;
       let action: 'add' | 'set' | 'remove' = 'add';
       if (/^(?:תורידו|תוריד|להוריד|תסירו|לבטל|בלי|לא צריך)\s+/i.test(line)) {
         action = 'remove';
@@ -922,6 +1108,7 @@ ${strictRule}`;
           action,
           quantity: quantity > 0 ? quantity : 1,
           unitPreference,
+          ...(targetStore ? { targetStore } : {}),
         });
       }
     }

@@ -7,6 +7,8 @@ import {
   GroceryAiService,
   extractRecommendedGeminiModel,
   extractRetryDelayMs,
+  extractTargetStoreFromCommand,
+  extractTargetStoreFromNaturalText,
   type ParsedGroceryItem,
 } from '../src/ai/groceryAi.js';
 import {
@@ -1567,5 +1569,259 @@ describe('rankStoreQuotes & MultiStoreManager (Shufersal + Hazi Hinam)', () => {
     const compareButtons = extractButtons(compareCall);
     expect(compareButtons.some((b) => b.text.includes('משלוח חצי חינם'))).toBe(true);
     expect(compareButtons.some((b) => b.text.includes('משלוח שופרסל'))).toBe(true);
+  });
+
+  it('parses target store directives in /add commands and natural Hebrew without breaking brand names', () => {
+    expect(extractTargetStoreFromCommand('שופרסל 2 חלב תנובה 3%')).toEqual({
+      storeId: 'shufersal',
+      remainder: '2 חלב תנובה 3%',
+    });
+    expect(extractTargetStoreFromCommand("חצי חינם קוטג' 5%")).toEqual({
+      storeId: 'hazi_hinam',
+      remainder: "קוטג' 5%",
+    });
+    expect(extractTargetStoreFromCommand('hazi חצי קילו עגבניות')).toEqual({
+      storeId: 'hazi_hinam',
+      remainder: 'חצי קילו עגבניות',
+    });
+    expect(extractTargetStoreFromCommand('2 חלב לחצי חינם')).toEqual({
+      storeId: 'hazi_hinam',
+      remainder: '2 חלב',
+    });
+    expect(extractTargetStoreFromCommand("קוטג' 5%")).toEqual({
+      storeId: null,
+      remainder: "קוטג' 5%",
+    });
+
+    // Natural text: explicit prepositions target the store; bare brand name stays untouched
+    expect(extractTargetStoreFromNaturalText('תוסיפו 2 חלב רק בחצי חינם')).toEqual({
+      storeId: 'hazi_hinam',
+      cleanedText: 'תוסיפו 2 חלב',
+    });
+    expect(extractTargetStoreFromNaturalText('ביצים לשופרסל')).toEqual({
+      storeId: 'shufersal',
+      cleanedText: 'ביצים',
+    });
+    expect(extractTargetStoreFromNaturalText('חצי חינם: חלב, ביצים')).toEqual({
+      storeId: 'hazi_hinam',
+      cleanedText: 'חלב, ביצים',
+    });
+    expect(extractTargetStoreFromNaturalText('חלב שופרסל 3%')).toEqual({
+      storeId: undefined,
+      cleanedText: 'חלב שופרסל 3%',
+    });
+  });
+
+  it('adds products to a specific store via /add <store>, interactive /add chooser, and natural text', async () => {
+    const shufMilk: CatalogProduct = {
+      code: 'SHUF-MILK',
+      storeId: 'shufersal',
+      barcode: '7290000001111',
+      name: 'חלב תנובה 3%',
+      brandName: 'תנובה',
+      unitDescription: '1 ליטר',
+      sellingMethod: 'BY_UNIT',
+      price: 7.2,
+      formattedPrice: '₪7.20',
+      pricePerUnitText: null,
+      promotionMsg: null,
+      inStock: true,
+      purchasable: true,
+      categoryName: 'חלב',
+      imageUrl: null,
+    };
+    const shufCottage: CatalogProduct = {
+      ...shufMilk,
+      code: 'SHUF-COT',
+      barcode: '7290000002222',
+      name: "קוטג' תנובה 5%",
+      price: 6.9,
+      formattedPrice: '₪6.90',
+    };
+    const haziMilk: CatalogProduct = {
+      ...shufMilk,
+      code: 'HAZI-MILK',
+      storeId: 'hazi_hinam',
+      price: 6.5,
+      formattedPrice: '₪6.50',
+    };
+    const haziCottage: CatalogProduct = {
+      ...shufCottage,
+      code: 'HAZI-COT',
+      storeId: 'hazi_hinam',
+      price: 6.1,
+      formattedPrice: '₪6.10',
+    };
+
+    const shufersalClient = makeMockStoreClient(
+      'shufersal',
+      [shufMilk, shufCottage],
+      29.9,
+    );
+    const haziClient = makeMockStoreClient(
+      'hazi_hinam',
+      [haziMilk, haziCottage],
+      29.9,
+    );
+    const multi = new MultiStoreManager(
+      [new StoreManager(shufersalClient, db), new StoreManager(haziClient, db)],
+      db,
+    );
+
+    const ai = new GroceryAiService('dummy-key', 'gemini-3.8-flash');
+    // Force local fallback parser so test runs deterministically without hitting live Gemini
+    (
+      ai as unknown as {
+        ai: { models: { generateContent: () => Promise<never> } };
+      }
+    ).ai = {
+      models: {
+        generateContent: vi.fn(async () => {
+          throw new Error('503 UNAVAILABLE');
+        }),
+      },
+    };
+
+    const apiCalls: Array<{ method: string; payload: Record<string, unknown> }> = [];
+    const bot = createTelegramBot({
+      config: {
+        telegramBotToken: '123456:TEST_TOKEN',
+        geminiApiKey: 'dummy',
+        geminiModel: 'gemini-3.8-flash',
+        enabledStores: ['shufersal', 'hazi_hinam'],
+        shufersalUsername: 'u',
+        shufersalPassword: 'p',
+        allowedChatIds: [-100555],
+        adminUserIds: [111],
+        autoRemoveOutOfStock: true,
+        headless: true,
+        dataDir: tmpDir,
+        dbPath: path.join(tmpDir, 'test.sqlite'),
+        sessionFilePath: path.join(tmpDir, 'shuf.json'),
+        haziHinamSessionFilePath: path.join(tmpDir, 'hazi.json'),
+        screenshotsDir: tmpDir,
+      } as AppConfig,
+      db,
+      stores: multi,
+      ai,
+    });
+
+    bot.botInfo = {
+      id: 999,
+      is_bot: true,
+      first_name: 'TestBot',
+      username: 'test_bot',
+      can_join_groups: true,
+      can_read_all_group_messages: true,
+      supports_inline_queries: false,
+      can_connect_to_business: false,
+      has_main_web_app: false,
+    };
+
+    let nextMsgId = 200;
+    bot.api.config.use(async (_prev, method, payload) => {
+      apiCalls.push({ method, payload: payload as Record<string, unknown> });
+      if (method === 'sendMessage') {
+        return {
+          ok: true,
+          result: {
+            message_id: ++nextMsgId,
+            date: Math.floor(Date.now() / 1000),
+            chat: { id: -100555, type: 'supergroup', title: 'Family' },
+            text: String((payload as Record<string, unknown>)['text'] ?? ''),
+          },
+        } as never;
+      }
+      return { ok: true, result: true } as never;
+    });
+
+    const extractButtons = (
+      call: { payload: Record<string, unknown> } | undefined,
+    ): Array<{ text: string; callback_data?: string }> => {
+      const markup = call?.payload['reply_markup'] as
+        | { inline_keyboard?: Array<Array<{ text: string; callback_data?: string }>> }
+        | undefined;
+      return markup?.inline_keyboard?.flat() ?? [];
+    };
+
+    // 1. Direct command: /add חצי חינם 2 חלב תנובה 3% -> adds ONLY to Hazi Hinam
+    await bot.handleUpdate({
+      update_id: 10,
+      message: {
+        message_id: 10,
+        date: Math.floor(Date.now() / 1000),
+        chat: { id: -100555, type: 'supergroup', title: 'Family' },
+        from: { id: 111, is_bot: false, first_name: 'Eli' },
+        text: '/add חצי חינם 2 חלב תנובה 3%',
+        entities: [{ offset: 0, length: 4, type: 'bot_command' }],
+      },
+    });
+
+    expect((await haziClient.getCartState()).items).toHaveLength(1);
+    expect((await haziClient.getCartState()).items[0]?.productCode).toBe('HAZI-MILK');
+    expect((await haziClient.getCartState()).items[0]?.quantity).toBe(2);
+    expect((await shufersalClient.getCartState()).items).toHaveLength(0);
+    const directCard = [...apiCalls].reverse().find((c) => c.method === 'editMessageText');
+    expect(String(directCard?.payload['text'])).toContain('חצי חינם אונליין');
+
+    // 2. Interactive command: /add קוטג' תנובה 5% -> shows store chooser -> click Shufersal
+    await bot.handleUpdate({
+      update_id: 11,
+      message: {
+        message_id: 11,
+        date: Math.floor(Date.now() / 1000),
+        chat: { id: -100555, type: 'supergroup', title: 'Family' },
+        from: { id: 111, is_bot: false, first_name: 'Eli' },
+        text: "/add קוטג' תנובה 5%",
+        entities: [{ offset: 0, length: 4, type: 'bot_command' }],
+      },
+    });
+
+    const chooserCall = [...apiCalls].reverse().find((c) => c.method === 'sendMessage');
+    const chooserBtns = extractButtons(chooserCall);
+    const shufBtn = chooserBtns.find((b) => b.text.includes('שופרסל'));
+    expect(shufBtn?.callback_data).toMatch(/^a:/);
+    expect(chooserBtns.some((b) => b.text.includes('חצי חינם'))).toBe(true);
+
+    await bot.handleUpdate({
+      update_id: 12,
+      callback_query: {
+        id: 'cb-add-shuf',
+        from: { id: 111, is_bot: false, first_name: 'Eli' },
+        chat_instance: 'ci-add',
+        data: shufBtn!.callback_data!,
+        message: {
+          message_id: nextMsgId,
+          date: Math.floor(Date.now() / 1000),
+          chat: { id: -100555, type: 'supergroup', title: 'Family' },
+          text: '',
+        },
+      },
+    });
+
+    expect((await shufersalClient.getCartState()).items).toHaveLength(1);
+    expect((await shufersalClient.getCartState()).items[0]?.productCode).toBe('SHUF-COT');
+    // Hazi Hinam still only has the milk from step 1
+    expect((await haziClient.getCartState()).items).toHaveLength(1);
+
+    // 3. Natural language free-text: "תוסיפו קוטג' תנובה 5% רק בחצי חינם"
+    await bot.handleUpdate({
+      update_id: 13,
+      message: {
+        message_id: 13,
+        date: Math.floor(Date.now() / 1000),
+        chat: { id: -100555, type: 'supergroup', title: 'Family' },
+        from: { id: 111, is_bot: false, first_name: 'Eli' },
+        text: "תוסיפו קוטג' תנובה 5% רק בחצי חינם",
+      },
+    });
+
+    expect((await haziClient.getCartState()).items.map((i) => i.productCode)).toEqual([
+      'HAZI-MILK',
+      'HAZI-COT',
+    ]);
+    // Shufersal was NOT touched by the Hazi-only message
+    expect((await shufersalClient.getCartState()).items).toHaveLength(1);
+    expect((await shufersalClient.getCartState()).items[0]?.quantity).toBe(1);
   });
 });

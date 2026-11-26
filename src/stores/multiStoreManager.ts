@@ -6,17 +6,18 @@ import type {
 import { logger } from '../logger.js';
 import type { BotDatabase } from '../store/database.js';
 import type { StoreManager } from './storeManager.js';
-import type {
-  CartComparisonResult,
-  CartItem,
-  CartState,
-  CatalogProduct,
-  CheckoutResult,
-  DeliverySlot,
-  SellingMethodCode,
-  StoreCartQuote,
-  StoreId,
-  StoreMeta,
+import {
+  STORE_META,
+  type CartComparisonResult,
+  type CartItem,
+  type CartState,
+  type CatalogProduct,
+  type CheckoutResult,
+  type DeliverySlot,
+  type SellingMethodCode,
+  type StoreCartQuote,
+  type StoreId,
+  type StoreMeta,
 } from './types.js';
 
 export interface StoreAddItemOutcome {
@@ -224,21 +225,46 @@ export class MultiStoreManager {
     senderName: string;
     request: ParsedGroceryItem;
     ai: GroceryAiService;
+    targetStoreId?: StoreId;
   }): Promise<MultiStoreAddItemResult> {
     const mode = params.request.action === 'set' ? 'set' : 'increment';
+    const effectiveTarget = params.targetStoreId ?? params.request.targetStore;
 
-    this.db.upsertShoppingListItem({
-      chatId: params.chatId,
-      query: params.request.searchQuery,
-      quantity: params.request.quantity,
-      mode,
-      unitPreference: params.request.unitPreference,
-      senderName: params.senderName,
-    });
+    // Only record in the shared cross-store shopping list when targeting all stores
+    if (!effectiveTarget) {
+      this.db.upsertShoppingListItem({
+        chatId: params.chatId,
+        query: params.request.searchQuery,
+        quantity: params.request.quantity,
+        mode,
+        unitPreference: params.request.unitPreference,
+        senderName: params.senderName,
+      });
+    }
 
-    // 1. Search all enabled stores in parallel
+    const targetStoreIds = effectiveTarget
+      ? this.orderedStoreIds.filter((id) => id === effectiveTarget)
+      : this.orderedStoreIds;
+
+    if (effectiveTarget && targetStoreIds.length === 0) {
+      const meta = STORE_META[effectiveTarget];
+      return {
+        request: params.request,
+        outcomes: [
+          {
+            storeId: effectiveTarget,
+            meta,
+            status: 'error',
+            error: `הרשת ${meta.displayName} אינה פעילה בבוט`,
+          },
+        ],
+        cheapestItemStoreId: null,
+      };
+    }
+
+    // 1. Search target store(s) in parallel
     const searchResults = await Promise.all(
-      this.orderedStoreIds.map(async (storeId) => {
+      targetStoreIds.map(async (storeId) => {
         const mgr = this.managers.get(storeId)!;
         try {
           const candidates = await mgr.search(params.request.searchQuery, 15);
@@ -278,7 +304,7 @@ export class MultiStoreManager {
       }
     }
 
-    // 3. Add selected products to each store's online cart in parallel
+    // 3. Add selected products to each target store's online cart in parallel
     const outcomes: StoreAddItemOutcome[] = await Promise.all(
       searchResults.map(async (sr): Promise<StoreAddItemOutcome> => {
         if (sr.error) {
@@ -351,11 +377,18 @@ export class MultiStoreManager {
   async removeAcrossStores(params: {
     chatId: number;
     query: string;
+    targetStoreId?: StoreId;
   }): Promise<StoreRemoveItemOutcome[]> {
-    this.db.removeShoppingListItem(params.chatId, params.query);
+    const targetStoreIds = params.targetStoreId
+      ? this.orderedStoreIds.filter((id) => id === params.targetStoreId)
+      : this.orderedStoreIds;
+
+    if (!params.targetStoreId) {
+      this.db.removeShoppingListItem(params.chatId, params.query);
+    }
 
     return Promise.all(
-      this.orderedStoreIds.map(async (storeId): Promise<StoreRemoveItemOutcome> => {
+      targetStoreIds.map(async (storeId): Promise<StoreRemoveItemOutcome> => {
         const mgr = this.managers.get(storeId)!;
         try {
           const { removedItem, cart } = await mgr.removeMatchingProduct({

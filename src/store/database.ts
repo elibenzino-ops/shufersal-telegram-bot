@@ -104,6 +104,13 @@ export type CallbackPayload =
   | {
       kind: 'store_slots';
       storeId: StoreId;
+    }
+  | {
+      kind: 'add_to_store';
+      storeId: StoreId | 'all';
+      chatId: number;
+      text: string;
+      senderName: string;
     };
 
 export interface LearnedPreference {

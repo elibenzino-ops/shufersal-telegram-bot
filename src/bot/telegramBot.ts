@@ -1,5 +1,9 @@
 import { Bot, InlineKeyboard, type Context } from 'grammy';
-import type { GroceryAiService, ParsedGroceryItem } from '../ai/groceryAi.js';
+import {
+  extractTargetStoreFromCommand,
+  type GroceryAiService,
+  type ParsedGroceryItem,
+} from '../ai/groceryAi.js';
 import type { AppConfig } from '../config.js';
 import { logger } from '../logger.js';
 import type {
@@ -611,9 +615,11 @@ export function createTelegramBot(deps: CreateTelegramBotDeps): Bot {
         `פשוט כותבים בקבוצה בשפה חופשית מה צריך הביתה, למשל:\n` +
         `• <i>"צריך 2 חלב תנובה 3%, קוטג' ולחם פרוס"</i>\n` +
         `• <i>"תוסיפו חצי קילו עגבניות שרי ובננות קצת ירוקות"</i>\n` +
+        `• <i>"תוסיפו קוטג' רק בחצי חינם"</i> או <i>"2 חלב לשופרסל"</i> (הוספה לרשת ספציפית)\n` +
         `• <i>"תורידו את הקוטג'"</i>\n\n` +
         `אני ממלא אוטומטית את העגלה בשופרסל ובחצי חינם במקביל, משווה מחירים כולל דמי משלוח, ובזמן ההזמנה בוחרים את <b>העגלה הזולה ביותר 🏆</b>!\n\n` +
         `<b>פקודות זמינות:</b>\n` +
+        `• /add <code>[חנות] &lt;מוצר&gt;</code> – הוספת מוצר לחנות ספציפית (למשל: <code>/add חצי חינם קוטג'</code> או <code>/add חלב</code> לבחירה)\n` +
         `• /compare – השוואת מחירים חיה בין שופרסל וחצי חינם וזיהוי הסל הזול ביותר\n` +
         `• /mirror – העתקת כל הפריטים מהעגלה/הזמנה בשופרסל לחצי חינם והשוואה\n` +
         `• /cart – צפייה בעגלות ופירוט פריטים בכל חנות\n` +
@@ -1208,6 +1214,114 @@ export function createTelegramBot(deps: CreateTelegramBotDeps): Bot {
       );
     } catch (err) {
       logger.error('/remove <query> command failed', err);
+      await ctx.api.editMessageText(
+        ctx.chat.id,
+        loading.message_id,
+        formatUserFacingError(err),
+        { parse_mode: 'HTML' },
+      );
+    }
+  });
+
+  bot.command('add', async (ctx) => {
+    const rawArg = ctx.match.trim();
+    if (!rawArg) {
+      await ctx.reply(
+        `➕ <b>הוספת מוצר לחנות ספציפית:</b>\n\n` +
+          `• <code>/add שופרסל 2 חלב תנובה 3%</code>\n` +
+          `• <code>/add חצי חינם קוטג' 5%</code>\n` +
+          `• <code>/add hazi חצי קילו עגבניות</code>\n` +
+          `• <code>/add חלב תנובה 3%</code> — פותח כפתורים לבחירת הרשת\n\n` +
+          `💡 <i>אפשר גם לכתוב חופשי בקבוצה, למשל: "תוסיפו קוטג' רק בחצי חינם" או "2 ביצים לשופרסל".</i>`,
+        { parse_mode: 'HTML' },
+      );
+      return;
+    }
+
+    const { storeId, remainder } = extractTargetStoreFromCommand(rawArg);
+    if (storeId && !remainder) {
+      const meta = STORE_META[storeId];
+      await ctx.reply(
+        `➕ ציינו גם את שם המוצר להוספה ב-${meta.emoji} <b>${escapeHtml(meta.displayName)}</b>, למשל:\n` +
+          `<code>/add ${escapeHtml(meta.shortName)} 2 חלב תנובה 3%</code>`,
+        { parse_mode: 'HTML' },
+      );
+      return;
+    }
+
+    const senderName = getSenderDisplayName(ctx);
+
+    // If no specific store was named and multiple stores are enabled, show an inline store chooser
+    if (!storeId && stores.isMultiStore()) {
+      const kb = new InlineKeyboard();
+      for (const meta of stores.getEnabledStores()) {
+        const tok = db.saveCallbackPayload({
+          kind: 'add_to_store',
+          storeId: meta.id,
+          chatId: ctx.chat.id,
+          text: remainder,
+          senderName,
+        });
+        kb.text(`➕ ${meta.emoji} הוסף ל-${meta.shortName}`, `a:${tok}`).row();
+      }
+      const allTok = db.saveCallbackPayload({
+        kind: 'add_to_store',
+        storeId: 'all',
+        chatId: ctx.chat.id,
+        text: remainder,
+        senderName,
+      });
+      kb.text('⚖️ הוסף לשתי הרשתות', `a:${allTok}`).row();
+      kb.text('❌ ביטול', 'nav:cancel');
+
+      await ctx.reply(
+        `🛒 <b>לאיזו רשת להוסיף את "<code>${escapeHtml(remainder)}</code>"?</b>`,
+        { parse_mode: 'HTML', reply_markup: kb },
+      );
+      return;
+    }
+
+    const resolvedStoreId: StoreId =
+      storeId ?? stores.getPrimaryStore().storeId;
+    const mgr = stores.getStore(resolvedStoreId);
+    if (!mgr) {
+      const meta = STORE_META[resolvedStoreId];
+      await ctx.reply(
+        `⚠️ הרשת ${meta.emoji} <b>${escapeHtml(meta.displayName)}</b> אינה מופעלת כרגע בבוט.`,
+        { parse_mode: 'HTML' },
+      );
+      return;
+    }
+
+    const loading = await ctx.reply(
+      `⏳ מוסיף <b>${escapeHtml(remainder)}</b> לעגלת ${mgr.meta.emoji} ${escapeHtml(mgr.meta.shortName)}...`,
+      {
+        parse_mode: 'HTML',
+        reply_parameters: { message_id: ctx.message?.message_id ?? 0 },
+      },
+    );
+
+    try {
+      const items = await ai.parseExplicitAddText(remainder, resolvedStoreId);
+      if (items.length === 0) {
+        await ctx.api.editMessageText(
+          ctx.chat.id,
+          loading.message_id,
+          `😕 לא הצלחתי לזהות מוצר מתוך "<b>${escapeHtml(remainder)}</b>".`,
+          { parse_mode: 'HTML' },
+        );
+        return;
+      }
+
+      await processParsedItems({
+        chatId: ctx.chat.id,
+        replyToMessageId: ctx.message?.message_id ?? loading.message_id,
+        statusMessageId: loading.message_id,
+        senderName,
+        items,
+      });
+    } catch (err) {
+      logger.error('/add command failed', err);
       await ctx.api.editMessageText(
         ctx.chat.id,
         loading.message_id,
@@ -2677,6 +2791,35 @@ export function createTelegramBot(deps: CreateTelegramBotDeps): Bot {
           await renderSlotsPicker(chatId, mgr.storeId, messageId);
           return;
         }
+
+        if (payload.kind === 'add_to_store') {
+          const targetStore =
+            payload.storeId === 'all' ? undefined : payload.storeId;
+          const targetLabel = targetStore
+            ? `${STORE_META[targetStore].emoji} ${STORE_META[targetStore].shortName}`
+            : 'שתי הרשתות';
+          await ctx.answerCallbackQuery(`מוסיף ל-${targetStore ? STORE_META[targetStore].shortName : 'כל הרשתות'}...`);
+          await ctx.editMessageText(
+            `⏳ מוסיף <b>${escapeHtml(payload.text)}</b> ל-${escapeHtml(targetLabel)}...`,
+            { parse_mode: 'HTML' },
+          );
+          const items = await ai.parseExplicitAddText(payload.text, targetStore);
+          if (items.length === 0) {
+            await ctx.editMessageText(
+              `😕 לא הצלחתי לזהות מוצר מתוך "<b>${escapeHtml(payload.text)}</b>".`,
+              { parse_mode: 'HTML' },
+            );
+            return;
+          }
+          await processParsedItems({
+            chatId: payload.chatId,
+            replyToMessageId: messageId,
+            statusMessageId: messageId,
+            senderName: payload.senderName,
+            items,
+          });
+          return;
+        }
       }
     } catch (err) {
       if (err instanceof StoreManualVerificationRequiredError) {
@@ -2704,12 +2847,22 @@ export function createTelegramBot(deps: CreateTelegramBotDeps): Bot {
       return;
     }
 
-    const storeCountText = stores.isMultiStore()
-      ? `ב-${stores.getEnabledStores().length} רשתות`
-      : `ב-${stores.getPrimaryStore().meta.shortName}`;
+    const distinctTargets = new Set(
+      parsed.items.map((item) => item.targetStore ?? 'all'),
+    );
+    const singleTargetStore =
+      distinctTargets.size === 1 && !distinctTargets.has('all')
+        ? (parsed.items[0]!.targetStore as StoreId)
+        : undefined;
+
+    const storeCountText = singleTargetStore
+      ? `ב-${STORE_META[singleTargetStore].emoji} ${STORE_META[singleTargetStore].shortName}`
+      : stores.isMultiStore()
+        ? `ב-${stores.getEnabledStores().length} רשתות`
+        : `ב-${stores.getPrimaryStore().meta.shortName}`;
 
     const statusMsg = await ctx.reply(
-      `⏳ מזהה ${parsed.items.length > 1 ? `${parsed.items.length} מצרכים` : 'מצרך'} ומעדכן עגלות ${storeCountText}...`,
+      `⏳ מזהה ${parsed.items.length > 1 ? `${parsed.items.length} מצרכים` : 'מצרך'} ומעדכן ${singleTargetStore ? 'עגלה' : 'עגלות'} ${storeCountText}...`,
       { reply_parameters: { message_id: ctx.message.message_id } },
     );
 
@@ -2756,11 +2909,15 @@ export function createTelegramBot(deps: CreateTelegramBotDeps): Bot {
         const results = await stores.removeAcrossStores({
           chatId: params.chatId,
           query: req.searchQuery,
+          targetStoreId: req.targetStore,
         });
         const removedAny = results.filter((r) => r.removedItem);
+        const targetLabel = req.targetStore
+          ? `ב-${STORE_META[req.targetStore].shortName}`
+          : 'באף עגלה';
         const msg =
           removedAny.length > 0
-            ? `🗑 <b>הוסר מהעגלות:</b> ${escapeHtml(req.searchQuery)}\n` +
+            ? `🗑 <b>הוסר מהעגלה${removedAny.length > 1 ? ' (כל הרשתות)' : ''}:</b> ${escapeHtml(req.searchQuery)}\n` +
               removedAny
                 .map(
                   (r) =>
@@ -2768,7 +2925,7 @@ export function createTelegramBot(deps: CreateTelegramBotDeps): Bot {
                     (r.cart ? ` (עגלה: ${formatCurrency(r.cart.totalPrice)})` : ''),
                 )
                 .join('\n')
-            : `ℹ️ לא נמצא באף עגלה מוצר תואם ל-"<b>${escapeHtml(req.searchQuery)}</b>" להסרה.`;
+            : `ℹ️ לא נמצא ${escapeHtml(targetLabel)} מוצר תואם ל-"<b>${escapeHtml(req.searchQuery)}</b>" להסרה.`;
 
         if (params.items.length === 1 && !statusDeleted) {
           statusDeleted = true;
@@ -2785,12 +2942,13 @@ export function createTelegramBot(deps: CreateTelegramBotDeps): Bot {
         continue;
       }
 
-      // Add across all enabled stores in parallel
+      // Add across target store(s) in parallel
       const multiResult = await stores.addItemAcrossStores({
         chatId: params.chatId,
         senderName: params.senderName,
         request: req,
         ai,
+        targetStoreId: req.targetStore,
       });
 
       const addedOutcomes = multiResult.outcomes.filter(
@@ -2798,8 +2956,15 @@ export function createTelegramBot(deps: CreateTelegramBotDeps): Bot {
       );
 
       if (addedOutcomes.length === 0) {
+        const firstErr = multiResult.outcomes.find((o) => o.status === 'error');
+        const storeScope = req.targetStore
+          ? `ב-${escapeHtml(STORE_META[req.targetStore].displayName)}`
+          : 'באף אחת מהרשתות';
+        const errNote = firstErr?.error
+          ? `\n⚠️ <i>${escapeHtml(firstErr.error.slice(0, 140))}</i>`
+          : '';
         const notFoundMsg =
-          `😕 לא נמצא מוצר זמין במלאי עבור "<b>${escapeHtml(req.searchQuery)}</b>" באף אחת מהרשתות.\n` +
+          `😕 לא נמצא מוצר זמין במלאי עבור "<b>${escapeHtml(req.searchQuery)}</b>" ${storeScope}.${errNote}\n` +
           `נסו לחפש ידנית עם <code>/search ${escapeHtml(req.searchQuery)}</code>.`;
         if (params.items.length === 1 && !statusDeleted) {
           statusDeleted = true;
@@ -2821,7 +2986,10 @@ export function createTelegramBot(deps: CreateTelegramBotDeps): Bot {
       let cardText: string;
       let keyboard: InlineKeyboard;
 
-      if (!stores.isMultiStore() && addedOutcomes.length === 1) {
+      if (
+        addedOutcomes.length === 1 &&
+        (!stores.isMultiStore() || Boolean(req.targetStore))
+      ) {
         const only = addedOutcomes[0]!;
         const ctrlToken = db.saveCallbackPayload({
           kind: 'item_ctrl',
@@ -2900,6 +3068,7 @@ export function createTelegramBot(deps: CreateTelegramBotDeps): Bot {
 export async function registerBotCommands(bot: Bot): Promise<void> {
   await withTimeout(
     bot.api.setMyCommands([
+      { command: 'add', description: 'הוספת מוצר לחנות ספציפית (שופרסל או חצי חינם)' },
       { command: 'compare', description: 'השוואת מחירים בין שופרסל וחצי חינם' },
       { command: 'mirror', description: 'העתקת כל הפריטים מהעגלה/הזמנה בשופרסל לחצי חינם' },
       { command: 'cart', description: 'הצגת העגלות ופירוט פריטים בכל חנות' },
