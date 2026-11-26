@@ -1,10 +1,17 @@
 import crypto from 'node:crypto';
 import fs from 'node:fs';
+import path from 'node:path';
+import puppeteer, {
+  type Browser,
+  type BrowserContext,
+  type Page,
+} from 'puppeteer-core';
 import { logger } from '../logger.js';
-import { formatCurrency } from '../utils/format.js';
+import { formatCurrency, formatHebrewDateTime } from '../utils/format.js';
 import {
   fetchTextWithTimeout,
   isTimeoutError,
+  withTimeout,
   type TimedTextResponse,
 } from '../utils/timeout.js';
 import {
@@ -29,16 +36,31 @@ const DEFAULT_USER_AGENT =
   'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36';
 
 export const HAZI_HINAM_HTTP_TIMEOUT_MS = 15_000;
+const BROWSER_NAV_TIMEOUT_MS = 35_000;
+const BROWSER_CLOSE_TIMEOUT_MS = 5_000;
+const BROWSER_PROTOCOL_TIMEOUT_MS = 45_000;
+const AUTH_RETRY_COOLDOWN_MS = 5 * 60_000;
 
 export interface HaziHinamClientOptions {
   username?: string;
   password?: string;
   sessionFilePath: string;
+  chromePath?: string;
+  browserWsEndpoint?: string;
+  proxyUrl?: string;
+  headless?: boolean;
+  screenshotsDir?: string;
   baseUrl?: string;
   authBaseUrl?: string;
   defaultDeliveryFee?: number;
   fetchFn?: typeof fetch;
   httpTimeoutMs?: number;
+}
+
+interface PersistedCookie {
+  name: string;
+  value: string;
+  domain?: string;
 }
 
 interface PersistedHaziSession {
@@ -47,7 +69,8 @@ interface PersistedHaziSession {
   accessToken?: string;
   expiresAt?: number;
   isGuest?: boolean;
-  cookies?: Array<{ name: string; value: string; domain?: string }>;
+  cookies?: PersistedCookie[];
+  selectedSlot?: DeliverySlot | null;
 }
 
 interface TrackedCartEntry {
@@ -285,6 +308,273 @@ function deepFindAccessToken(obj: unknown, depth = 0): string | null {
   return null;
 }
 
+function formatHourFromIso(iso: string): string {
+  const dt = new Date(iso);
+  if (Number.isNaN(dt.getTime())) return '';
+  return dt.toLocaleTimeString('he-IL', {
+    timeZone: 'Asia/Jerusalem',
+    hour: '2-digit',
+    minute: '2-digit',
+    hour12: false,
+  });
+}
+
+function normalizeHourText(raw: unknown): string {
+  if (typeof raw !== 'string') return '';
+  const trimmed = raw.trim();
+  const hm = /^(\d{1,2}):(\d{2})/.exec(trimmed);
+  if (hm) {
+    return `${hm[1]!.padStart(2, '0')}:${hm[2]!}`;
+  }
+  return trimmed;
+}
+
+function combineDateAndHourToIso(dateRaw: unknown, hourRaw?: unknown): string | null {
+  if (typeof dateRaw === 'number' && Number.isFinite(dateRaw) && dateRaw > 0) {
+    const dt = new Date(dateRaw);
+    return Number.isNaN(dt.getTime()) ? null : dt.toISOString();
+  }
+  if (typeof dateRaw !== 'string' || !dateRaw.trim()) return null;
+  const trimmed = dateRaw.trim();
+  const hourStr = normalizeHourText(hourRaw);
+
+  // Date-only format (YYYY-MM-DD) or DD/MM/YYYY with separate hour text
+  const ymd = /^(\d{4})-(\d{2})-(\d{2})$/.exec(trimmed);
+  if (ymd) {
+    const timePart = /^\d{2}:\d{2}$/.test(hourStr) ? `${hourStr}:00` : '09:00:00';
+    const dt = new Date(`${ymd[1]}-${ymd[2]}-${ymd[3]}T${timePart}+02:00`);
+    return Number.isNaN(dt.getTime()) ? null : dt.toISOString();
+  }
+
+  const dmy = /^(\d{1,2})[/.-](\d{1,2})[/.-](\d{4})$/.exec(trimmed);
+  if (dmy) {
+    const timePart = /^\d{2}:\d{2}$/.test(hourStr) ? `${hourStr}:00` : '09:00:00';
+    const dt = new Date(
+      `${dmy[3]}-${dmy[2]!.padStart(2, '0')}-${dmy[1]!.padStart(2, '0')}T${timePart}+02:00`,
+    );
+    return Number.isNaN(dt.getTime()) ? null : dt.toISOString();
+  }
+
+  const direct = new Date(trimmed);
+  if (!Number.isNaN(direct.getTime())) {
+    if (
+      /^\d{2}:\d{2}$/.test(hourStr) &&
+      trimmed.includes('T00:00:00')
+    ) {
+      const datePrefix = trimmed.slice(0, 10);
+      const combined = new Date(`${datePrefix}T${hourStr}:00+02:00`);
+      if (!Number.isNaN(combined.getTime())) return combined.toISOString();
+    }
+    return direct.toISOString();
+  }
+  return null;
+}
+
+function isSameIsraelDay(iso: string, now = new Date()): boolean {
+  const fmt = (d: Date) =>
+    d.toLocaleDateString('en-CA', { timeZone: 'Asia/Jerusalem' });
+  const target = new Date(iso);
+  if (Number.isNaN(target.getTime())) return false;
+  return fmt(target) === fmt(now);
+}
+
+export function parseHaziHinamDeliverySlots(
+  payload: Record<string, unknown>,
+  defaultDeliveryFee: number | null,
+): DeliverySlot[] {
+  const results = (payload['Results'] ?? payload['results'] ?? payload) as
+    | Record<string, unknown>
+    | Array<Record<string, unknown>>
+    | undefined;
+  if (!results) return [];
+
+  const rawEntries: Array<Record<string, unknown>> = Array.isArray(results)
+    ? results
+    : Array.isArray(results['Dates'])
+      ? (results['Dates'] as Array<Record<string, unknown>>)
+      : Array.isArray(results['Shipments'])
+        ? (results['Shipments'] as Array<Record<string, unknown>>)
+        : Array.isArray(results['DeliveryDates'])
+          ? (results['DeliveryDates'] as Array<Record<string, unknown>>)
+          : Array.isArray(results['TimeSlots'])
+            ? (results['TimeSlots'] as Array<Record<string, unknown>>)
+            : Array.isArray(results['Slots'])
+              ? (results['Slots'] as Array<Record<string, unknown>>)
+              : [];
+
+  const slots: DeliverySlot[] = [];
+  const seenCodes = new Set<string>();
+
+  const pushSlot = (
+    s: Record<string, unknown>,
+    parentDate?: unknown,
+  ): void => {
+    const rawCode =
+      s['Id'] ??
+      s['ShipmentId'] ??
+      s['SlotId'] ??
+      s['TimeSlotId'] ??
+      s['Code'] ??
+      s['id'];
+    const fromHourRaw = s['FromHour'] ?? s['StartHour'] ?? s['StartTime'] ?? s['fromHour'];
+    const toHourRaw = s['ToHour'] ?? s['EndHour'] ?? s['EndTime'] ?? s['toHour'];
+
+    const startIso = combineDateAndHourToIso(
+      s['FromDate'] ?? s['StartDate'] ?? s['DeliveryDate'] ?? s['Date'] ?? parentDate,
+      fromHourRaw,
+    );
+    if (!startIso) return;
+
+    const endIso = combineDateAndHourToIso(
+      s['ToDate'] ?? s['EndDate'] ?? (toHourRaw ? (s['DeliveryDate'] ?? s['Date'] ?? parentDate) : undefined),
+      toHourRaw,
+    );
+
+    const startHourText =
+      normalizeHourText(fromHourRaw) || formatHourFromIso(startIso);
+    const endHourText =
+      normalizeHourText(toHourRaw) || (endIso ? formatHourFromIso(endIso) : null);
+
+    const code =
+      rawCode !== undefined && rawCode !== null && String(rawCode).trim() !== ''
+        ? String(rawCode).trim()
+        : `${startIso.slice(0, 10)}_${startHourText}`;
+
+    const selectable =
+      s['IsAvailable'] !== false &&
+      s['Available'] !== false &&
+      s['Selectable'] !== false &&
+      s['IsFull'] !== true &&
+      s['IsClosed'] !== true;
+
+    if (!selectable || seenCodes.has(code)) return;
+    seenCodes.add(code);
+
+    const feeRaw = Number(
+      s['Price'] ??
+        s['DeliveryPrice'] ??
+        s['ShipmentPrice'] ??
+        s['Cost'] ??
+        NaN,
+    );
+
+    slots.push({
+      code,
+      startIso,
+      endIso,
+      startHourText,
+      endHourText: endHourText || null,
+      deliveryFee: Number.isFinite(feeRaw) && feeRaw >= 0 ? feeRaw : defaultDeliveryFee,
+      selectable: true,
+      isToday:
+        typeof s['IsToday'] === 'boolean'
+          ? s['IsToday']
+          : isSameIsraelDay(startIso),
+      rawSlot: parentDate !== undefined ? { ...s, ParentDate: parentDate } : s,
+    });
+  };
+
+  for (const entry of rawEntries) {
+    const nested =
+      (Array.isArray(entry['Hours']) ? entry['Hours'] : null) ??
+      (Array.isArray(entry['TimeSlots']) ? entry['TimeSlots'] : null) ??
+      (Array.isArray(entry['Shipments']) ? entry['Shipments'] : null) ??
+      (Array.isArray(entry['Slots']) ? entry['Slots'] : null);
+
+    if (nested && nested.length > 0) {
+      const parentDate =
+        entry['Date'] ?? entry['DeliveryDate'] ?? entry['FromDate'] ?? entry['DayDate'];
+      for (const child of nested) {
+        if (child && typeof child === 'object') {
+          pushSlot(child as Record<string, unknown>, parentDate);
+        }
+      }
+    } else {
+      pushSlot(entry);
+    }
+  }
+
+  slots.sort(
+    (a, b) => new Date(a.startIso).getTime() - new Date(b.startIso).getTime(),
+  );
+  return slots;
+}
+
+export function parseHaziHinamOrders(
+  payload: Record<string, unknown>,
+): ActiveOrderSummary[] {
+  const results = (payload['Results'] ?? payload['results'] ?? payload) as
+    | Record<string, unknown>
+    | Array<Record<string, unknown>>
+    | undefined;
+  if (!results) return [];
+
+  const rawOrders: Array<Record<string, unknown>> = Array.isArray(results)
+    ? results
+    : Array.isArray(results['Orders'])
+      ? (results['Orders'] as Array<Record<string, unknown>>)
+      : Array.isArray(results['ActiveOrders'])
+        ? (results['ActiveOrders'] as Array<Record<string, unknown>>)
+        : Array.isArray(results['Items'])
+          ? (results['Items'] as Array<Record<string, unknown>>)
+          : [];
+
+  const orders: ActiveOrderSummary[] = [];
+  for (const raw of rawOrders) {
+    const code = String(
+      raw['OrderId'] ?? raw['OrderNumber'] ?? raw['Id'] ?? raw['Code'] ?? '',
+    ).trim();
+    if (!code) continue;
+
+    const statusCode = String(
+      raw['StatusName'] ?? raw['Status'] ?? raw['OrderStatus'] ?? 'ACTIVE',
+    ).trim();
+    const statusLower = statusCode.toLowerCase();
+    if (
+      statusLower.includes('cancel') ||
+      statusLower.includes('בוטל') ||
+      statusLower.includes('delivered') ||
+      statusLower.includes('סופק') ||
+      raw['IsHistory'] === true
+    ) {
+      continue;
+    }
+
+    const fromHour = normalizeHourText(raw['FromHour'] ?? raw['StartHour']);
+    const toHour = normalizeHourText(raw['ToHour'] ?? raw['EndHour']);
+    const deliveryIso =
+      combineDateAndHourToIso(
+        raw['DeliveryDate'] ?? raw['SupplyDate'] ?? raw['FromDate'] ?? raw['OrderDate'],
+        fromHour,
+      ) ?? new Date().toISOString();
+
+    const totalPrice = Number(
+      raw['TotalToPay'] ?? raw['TotalPrice'] ?? raw['FinalPrice'] ?? 0,
+    );
+    const totalItems = Number(
+      raw['ItemsCount'] ?? raw['TotalItems'] ?? (Array.isArray(raw['Items']) ? raw['Items'].length : 0),
+    );
+
+    orders.push({
+      code,
+      deliveryIso,
+      deliveryHoursText:
+        fromHour && toHour ? `${fromHour}–${toHour}` : fromHour || null,
+      updatableUntilText:
+        typeof raw['UpdateUntil'] === 'string' && raw['UpdateUntil'].trim()
+          ? raw['UpdateUntil'].trim()
+          : null,
+      totalPrice: Number.isFinite(totalPrice) ? Number(totalPrice.toFixed(2)) : 0,
+      totalItems: Number.isFinite(totalItems) ? totalItems : 0,
+      statusCode,
+      isUpdatable: false,
+      isBeingUpdated: false,
+    });
+  }
+
+  return orders;
+}
+
 export class HaziHinamClient implements StoreClient {
   readonly storeId = 'hazi_hinam' as const;
   readonly meta = STORE_META.hazi_hinam;
@@ -298,9 +588,10 @@ export class HaziHinamClient implements StoreClient {
   private accessToken: string | null = null;
   private tokenExpiresAt = 0;
   private isGuestSession = true;
-  private oauthFailed = false;
+  private authRetryAfter = 0;
   private authFallbackReason: string | null = null;
   private cookieHeader: string | null = null;
+  private persistedCookies: PersistedCookie[] = [];
   private readonly knownProducts = new Map<string, CatalogProduct>();
   private readonly trackedCart = new Map<string, TrackedCartEntry>();
   private selectedSlot: DeliverySlot | null = null;
@@ -315,10 +606,22 @@ export class HaziHinamClient implements StoreClient {
     this.httpTimeoutMs = options.httpTimeoutMs ?? HAZI_HINAM_HTTP_TIMEOUT_MS;
     this.defaultDeliveryFee =
       options.defaultDeliveryFee ?? STORE_META.hazi_hinam.defaultDeliveryFee;
+    this.tryLoadSavedSession();
   }
 
   getAuthWarning(): string | null {
     return this.authFallbackReason;
+  }
+
+  isAuthenticated(): boolean {
+    if (!this.accessToken) {
+      this.tryLoadSavedSession();
+    }
+    return Boolean(
+      this.accessToken &&
+        !this.isGuestSession &&
+        Date.now() < this.tokenExpiresAt - 60_000,
+    );
   }
 
   private async fetchWithTimeout(
@@ -372,12 +675,21 @@ export class HaziHinamClient implements StoreClient {
         return false;
       }
 
-      // Support saved cookies (including Playwright storage_state format)
+      if (
+        parsed.selectedSlot &&
+        typeof parsed.selectedSlot.startIso === 'string' &&
+        new Date(parsed.selectedSlot.startIso).getTime() > Date.now()
+      ) {
+        this.selectedSlot = parsed.selectedSlot;
+      }
+
+      // Support saved cookies (including Puppeteer/Playwright storage_state format)
       if (Array.isArray(parsed.cookies) && parsed.cookies.length > 0) {
         const haziCookies = parsed.cookies.filter(
           (c) => !c.domain || c.domain.includes('hazi-hinam'),
         );
         if (haziCookies.length > 0) {
+          this.persistedCookies = haziCookies;
           this.cookieHeader = haziCookies
             .map((c) => `${c.name}=${c.value}`)
             .join('; ');
@@ -392,7 +704,10 @@ export class HaziHinamClient implements StoreClient {
               if (typeof decoded['access_token'] === 'string') {
                 this.accessToken = decoded['access_token'];
                 this.isGuestSession = false;
-                this.tokenExpiresAt = Date.now() + 12 * 60 * 60 * 1000;
+                this.tokenExpiresAt =
+                  parsed.expiresAt && parsed.expiresAt > Date.now() + 60_000
+                    ? parsed.expiresAt
+                    : Date.now() + 12 * 60 * 60 * 1000;
                 return true;
               }
             } catch {
@@ -430,6 +745,10 @@ export class HaziHinamClient implements StoreClient {
         accessToken: this.accessToken,
         expiresAt: this.tokenExpiresAt,
         isGuest: this.isGuestSession,
+        ...(this.persistedCookies.length > 0
+          ? { cookies: this.persistedCookies }
+          : {}),
+        selectedSlot: this.selectedSlot,
       };
       fs.writeFileSync(
         this.options.sessionFilePath,
@@ -443,44 +762,390 @@ export class HaziHinamClient implements StoreClient {
 
   async ensureAuthenticated(): Promise<void> {
     if (this.accessToken && Date.now() < this.tokenExpiresAt - 60_000) {
-      return;
+      // If we are on a guest token, credentials exist, and retry cooldown has expired, upgrade to full login
+      if (
+        !this.isGuestSession ||
+        !(this.options.username && this.options.password) ||
+        Date.now() < this.authRetryAfter
+      ) {
+        return;
+      }
     }
 
     if (this.tryLoadSavedSession()) {
-      // If we now have credentials configured (and OAuth hasn't failed yet) but only a guest token was saved, upgrade to OAuth
       if (
         !this.isGuestSession ||
-        this.oauthFailed ||
+        Date.now() < this.authRetryAfter ||
         !(this.options.username && this.options.password)
       ) {
         return;
       }
     }
 
-    if (this.options.username && this.options.password && !this.oauthFailed) {
+    if (
+      this.options.username &&
+      this.options.password &&
+      Date.now() >= this.authRetryAfter
+    ) {
       try {
         await this.performOAuthLogin(this.options.username, this.options.password);
         this.authFallbackReason = null;
+        this.authRetryAfter = 0;
         return;
-      } catch (err) {
-        const reason = err instanceof Error ? err.message : String(err);
+      } catch (oauthErr) {
+        const oauthReason =
+          oauthErr instanceof Error ? oauthErr.message : String(oauthErr);
+
+        // If Chromium is available and OAuth didn't hit a hard CAPTCHA gate, try browser login like Shufersal
+        const canTryBrowser =
+          Boolean(this.options.chromePath || this.options.browserWsEndpoint) &&
+          !(oauthErr instanceof StoreManualVerificationRequiredError);
+
+        if (canTryBrowser) {
+          logger.warn(
+            `Hazi Hinam OAuth login failed (${oauthReason}); attempting Chromium web login...`,
+          );
+          try {
+            await this.performBrowserLogin(
+              this.options.username,
+              this.options.password,
+            );
+            this.authFallbackReason = null;
+            this.authRetryAfter = 0;
+            return;
+          } catch (browserErr) {
+            const browserReason =
+              browserErr instanceof Error ? browserErr.message : String(browserErr);
+            logger.warn(
+              `Hazi Hinam Chromium login also failed (${browserReason}); falling back to guest session for live price comparison`,
+            );
+            this.authRetryAfter = Date.now() + AUTH_RETRY_COOLDOWN_MS;
+            this.authFallbackReason = browserReason;
+            try {
+              await this.initAnonymousSession();
+              return;
+            } catch (guestErr) {
+              logger.warn('Hazi Hinam anonymous session fallback also failed', guestErr);
+              throw browserErr;
+            }
+          }
+        }
+
         logger.warn(
-          `Hazi Hinam OAuth login failed (${reason}); falling back to guest session for live price comparison`,
+          `Hazi Hinam OAuth login failed (${oauthReason}); falling back to guest session for live price comparison`,
         );
-        this.oauthFailed = true;
-        this.authFallbackReason = reason;
+        this.authRetryAfter = Date.now() + AUTH_RETRY_COOLDOWN_MS;
+        this.authFallbackReason = oauthReason;
         // Fall back to anonymous session so price comparison & mirroring keep working!
         try {
           await this.initAnonymousSession();
           return;
         } catch (guestErr) {
           logger.warn('Hazi Hinam anonymous session fallback also failed', guestErr);
-          throw err;
+          throw oauthErr;
         }
       }
     }
 
     await this.initAnonymousSession();
+  }
+
+  private async detectBrowserSecurityGate(page: Page): Promise<void> {
+    const gateDetected = await withTimeout(
+      page.evaluate(() => {
+        const html = document.documentElement?.innerHTML?.toLowerCase() ?? '';
+        const title = document.title?.toLowerCase() ?? '';
+        return (
+          title.includes('just a moment') ||
+          title.includes('attention required') ||
+          html.includes('cf-turnstile') ||
+          html.includes('g-recaptcha') ||
+          html.includes('hcaptcha')
+        );
+      }),
+      10_000,
+      'Hazi Hinam security gate check timed out',
+    );
+
+    if (gateDetected) {
+      await this.captureBrowserScreenshot(page, 'hazi-security-gate');
+      throw new StoreManualVerificationRequiredError(
+        'hazi_hinam',
+        'SECURITY_GATE',
+        'אתר חצי חינם מציג בדיקת אבטחה/CAPTCHA בהתחברות. המערכת לא עוקפת CAPTCHA – ניתן להתחבר ידנית באתר חצי חינם או להמשיך במצב השוואת מחירים.',
+        STORE_META.hazi_hinam.cartUrl,
+      );
+    }
+  }
+
+  private async captureBrowserScreenshot(page: Page, tag: string): Promise<void> {
+    if (!this.options.screenshotsDir) return;
+    try {
+      const fullPath = path.join(
+        this.options.screenshotsDir,
+        `${tag}-${Date.now()}.png`,
+      );
+      await withTimeout(
+        page.screenshot({ path: fullPath }),
+        BROWSER_CLOSE_TIMEOUT_MS,
+        'Hazi Hinam screenshot timed out',
+      );
+      logger.info(`Saved diagnostic screenshot: ${fullPath}`);
+    } catch {
+      // Ignore screenshot failures
+    }
+  }
+
+  /**
+   * Browser-backed login fallback matching ShufersalClient.performLogin():
+   * launches headless Chromium, logs in via shop.hazi-hinam.co.il form,
+   * extracts auth cookies + Bearer token, persists them, and closes the browser.
+   */
+  private async performBrowserLogin(
+    username: string,
+    password: string,
+  ): Promise<void> {
+    let browser: Browser | null = null;
+    let context: BrowserContext | null = null;
+    const isRemote = Boolean(this.options.browserWsEndpoint);
+
+    try {
+      if (this.options.browserWsEndpoint) {
+        browser = await withTimeout(
+          puppeteer.connect({
+            browserWSEndpoint: this.options.browserWsEndpoint,
+            protocolTimeout: BROWSER_PROTOCOL_TIMEOUT_MS,
+          }),
+          BROWSER_NAV_TIMEOUT_MS,
+          'Timed out connecting to Chromium for Hazi Hinam login',
+        );
+      } else {
+        const launchArgs = [
+          '--no-sandbox',
+          '--disable-setuid-sandbox',
+          '--disable-dev-shm-usage',
+          '--disable-gpu',
+          '--lang=he-IL',
+          '--window-size=1366,900',
+        ];
+        if (this.options.proxyUrl) {
+          launchArgs.push(`--proxy-server=${this.options.proxyUrl}`);
+        }
+        browser = await withTimeout(
+          puppeteer.launch({
+            executablePath: this.options.chromePath,
+            headless: this.options.headless ?? true,
+            args: launchArgs,
+            timeout: BROWSER_NAV_TIMEOUT_MS,
+            protocolTimeout: BROWSER_PROTOCOL_TIMEOUT_MS,
+          }),
+          BROWSER_NAV_TIMEOUT_MS + 5_000,
+          'Timed out launching Chromium for Hazi Hinam login',
+        );
+      }
+
+      context = await withTimeout(
+        browser.createBrowserContext(),
+        BROWSER_NAV_TIMEOUT_MS,
+        'Timed out creating browser context for Hazi Hinam login',
+      );
+      const page = await withTimeout(
+        context.newPage(),
+        BROWSER_NAV_TIMEOUT_MS,
+        'Timed out creating page for Hazi Hinam login',
+      );
+      page.setDefaultTimeout(BROWSER_NAV_TIMEOUT_MS);
+      page.setDefaultNavigationTimeout(BROWSER_NAV_TIMEOUT_MS);
+      await page.setViewport({ width: 1366, height: 900 });
+
+      await page.goto(`${this.baseUrl}/login`, {
+        waitUntil: 'domcontentloaded',
+        timeout: BROWSER_NAV_TIMEOUT_MS,
+      });
+      await this.detectBrowserSecurityGate(page);
+
+      // If /login redirected to home, click a visible login trigger if present
+      const userSelector =
+        'input[type="email"], input[name*="email" i], input[name*="user" i], input[id*="email" i], input[id*="user" i], input[autocomplete="username"]';
+      const passSelector = 'input[type="password"]';
+
+      const hasLoginInputs = await page
+        .waitForSelector(passSelector, { visible: true, timeout: 8_000 })
+        .then(() => true)
+        .catch(() => false);
+
+      if (!hasLoginInputs) {
+        await withTimeout(
+          page.evaluate(() => {
+            const triggers = Array.from(
+              document.querySelectorAll<HTMLElement>('button, a, [role="button"]'),
+            );
+            const match = triggers.find((el) => {
+              const t = (el.textContent ?? '').trim();
+              return /התחבר|כניסה|login/i.test(t) && el.offsetParent !== null;
+            });
+            match?.click();
+          }),
+          5_000,
+          'Timed out clicking Hazi Hinam login button',
+        );
+        await page.waitForSelector(passSelector, {
+          visible: true,
+          timeout: 12_000,
+        });
+      }
+
+      await this.detectBrowserSecurityGate(page);
+
+      const userInput = await page.$(userSelector);
+      if (!userInput) {
+        await this.captureBrowserScreenshot(page, 'hazi-login-selectors-missing');
+        throw new Error('לא נמצא שדה שם משתמש/אימייל בטופס ההתחברות של חצי חינם');
+      }
+
+      await withTimeout(
+        page.evaluate((uSel: string, pSel: string) => {
+          const u = document.querySelector<HTMLInputElement>(uSel);
+          const p = document.querySelector<HTMLInputElement>(pSel);
+          if (u) u.value = '';
+          if (p) p.value = '';
+        }, userSelector, passSelector),
+        5_000,
+        'Timed out clearing Hazi Hinam login inputs',
+      );
+
+      await page.type(userSelector, username.trim());
+      await page.type(passSelector, password);
+
+      const submitted = await withTimeout(
+        page.evaluate((pSel: string) => {
+          const passEl = document.querySelector<HTMLInputElement>(pSel);
+          const form = passEl?.closest('form');
+          const btn =
+            form?.querySelector<HTMLElement>('button[type="submit"], input[type="submit"]') ??
+            Array.from(document.querySelectorAll<HTMLElement>('button')).find((b) =>
+              /התחבר|כניסה|אישור/i.test(b.textContent ?? ''),
+            );
+          if (btn) {
+            btn.click();
+            return true;
+          }
+          if (form) {
+            form.submit();
+            return true;
+          }
+          return false;
+        }, passSelector),
+        5_000,
+        'Timed out submitting Hazi Hinam login form',
+      );
+
+      if (!submitted) {
+        await page.keyboard.press('Enter');
+      }
+
+      // Wait up to 15s for H_Authentication cookie or access_token in storage
+      const authDeadline = Date.now() + 15_000;
+      let extractedToken: string | null = null;
+      let extractedCookies: PersistedCookie[] = [];
+
+      while (Date.now() < authDeadline) {
+        const rawCookies = await withTimeout(
+          context.cookies(),
+          5_000,
+          'Timed out reading Hazi Hinam browser cookies',
+        );
+        const haziCookies: PersistedCookie[] = rawCookies
+          .filter((c) => !c.domain || c.domain.includes('hazi-hinam'))
+          .map((c) => ({ name: c.name, value: c.value, domain: c.domain }));
+
+        const authCookie = haziCookies.find((c) => c.name === 'H_Authentication');
+        if (authCookie) {
+          try {
+            const decoded = JSON.parse(
+              decodeURIComponent(authCookie.value),
+            ) as Record<string, unknown>;
+            if (typeof decoded['access_token'] === 'string') {
+              extractedToken = decoded['access_token'];
+              extractedCookies = haziCookies;
+              break;
+            }
+          } catch {
+            // continue checking storage
+          }
+        }
+
+        const storageToken = await withTimeout(
+          page.evaluate(() => {
+            const readStore = (s: Storage): string | null => {
+              for (let i = 0; i < s.length; i++) {
+                const k = s.key(i);
+                if (!k) continue;
+                const v = s.getItem(k) ?? '';
+                if (v.includes('access_token')) {
+                  try {
+                    const parsed = JSON.parse(v) as Record<string, unknown>;
+                    if (typeof parsed['access_token'] === 'string') {
+                      return parsed['access_token'];
+                    }
+                  } catch {
+                    const m = /"access_token"\s*:\s*"([^"]+)"/.exec(v);
+                    if (m?.[1]) return m[1];
+                  }
+                }
+              }
+              return null;
+            };
+            return readStore(window.localStorage) ?? readStore(window.sessionStorage);
+          }),
+          5_000,
+          'Timed out reading Hazi Hinam browser storage',
+        ).catch(() => null);
+
+        if (storageToken) {
+          extractedToken = storageToken;
+          extractedCookies = haziCookies;
+          break;
+        }
+
+        await new Promise((r) => setTimeout(r, 500));
+      }
+
+      if (!extractedToken) {
+        await this.detectBrowserSecurityGate(page);
+        await this.captureBrowserScreenshot(page, 'hazi-login-failed');
+        throw new StoreAuthError(
+          'hazi_hinam',
+          'התחברות לחצי חינם דרך הדפדפן לא הושלמה – בדקו את HAZI_HINAM_USERNAME ו-HAZI_HINAM_PASSWORD',
+        );
+      }
+
+      this.accessToken = extractedToken;
+      this.tokenExpiresAt = Date.now() + 12 * 60 * 60 * 1000;
+      this.isGuestSession = false;
+      this.persistedCookies = extractedCookies;
+      this.cookieHeader =
+        extractedCookies.length > 0
+          ? extractedCookies.map((c) => `${c.name}=${c.value}`).join('; ')
+          : null;
+      this.saveSession();
+      logger.info('Authenticated to Hazi Hinam via Chromium web login successfully');
+    } finally {
+      if (context) {
+        await withTimeout(
+          context.close(),
+          BROWSER_CLOSE_TIMEOUT_MS,
+          'Timed out closing Hazi Hinam browser context',
+        ).catch(() => {});
+      }
+      if (browser && !isRemote) {
+        await withTimeout(
+          browser.close(),
+          BROWSER_CLOSE_TIMEOUT_MS,
+          'Timed out closing Hazi Hinam browser',
+        ).catch(() => {});
+      }
+    }
   }
 
   private async performOAuthLogin(
@@ -617,6 +1282,7 @@ export class HaziHinamClient implements StoreClient {
       logger.warn('Hazi Hinam returned 401; refreshing token and retrying...');
       this.accessToken = null;
       this.tokenExpiresAt = 0;
+      this.authRetryAfter = 0;
       return this.apiFetchJson(path, init, false);
     }
 
@@ -940,57 +1606,121 @@ export class HaziHinamClient implements StoreClient {
   }
 
   async getAvailableTimeSlots(): Promise<DeliverySlot[]> {
-    try {
-      const data = await this.apiFetchJson('/proxy/api/delivery/getDeliveryDates', {
-        method: 'POST',
-        body: {},
-      });
-      const results = (data['Results'] ?? {}) as Record<string, unknown>;
-      const rawSlots = Array.isArray(results['Dates'])
-        ? (results['Dates'] as Array<Record<string, unknown>>)
-        : Array.isArray(results['Shipments'])
-          ? (results['Shipments'] as Array<Record<string, unknown>>)
-          : [];
-
-      return rawSlots
-        .map((s): DeliverySlot | null => {
-          const code = String(s['Id'] ?? s['ShipmentId'] ?? '').trim();
-          const startIso = String(s['FromDate'] ?? s['StartDate'] ?? '').trim();
-          if (!code || !startIso) return null;
-          const fee = Number(s['Price'] ?? s['DeliveryPrice'] ?? this.defaultDeliveryFee ?? NaN);
-          return {
-            code,
-            startIso,
-            endIso: typeof s['ToDate'] === 'string' ? s['ToDate'] : null,
-            startHourText: String(s['FromHour'] ?? ''),
-            endHourText: typeof s['ToHour'] === 'string' ? s['ToHour'] : null,
-            deliveryFee: Number.isFinite(fee) ? fee : this.defaultDeliveryFee,
-            selectable: s['IsAvailable'] !== false,
-            isToday: false,
-            rawSlot: s,
-          };
-        })
-        .filter((s): s is DeliverySlot => s !== null && s.selectable);
-    } catch {
-      return [];
+    await this.ensureAuthenticated();
+    for (const attempt of [
+      { method: 'POST' as const, path: '/proxy/api/delivery/getDeliveryDates', body: {} },
+      { method: 'GET' as const, path: '/proxy/api/delivery/getDeliveryDates' },
+      { method: 'POST' as const, path: '/proxy/api/shipment/getShipments', body: {} },
+    ]) {
+      try {
+        const data = await this.apiFetchJson(attempt.path, {
+          method: attempt.method,
+          body: attempt.body,
+        });
+        const slots = parseHaziHinamDeliverySlots(data, this.defaultDeliveryFee);
+        if (slots.length > 0) {
+          return slots;
+        }
+      } catch (err) {
+        if (isTimeoutError(err)) {
+          logger.warn('Hazi Hinam delivery slots request timed out');
+          break;
+        }
+        // try next endpoint shape
+      }
     }
+    return [];
   }
 
   async getSelectedTimeSlot(): Promise<DeliverySlot | null> {
+    if (
+      this.selectedSlot &&
+      new Date(this.selectedSlot.startIso).getTime() <= Date.now()
+    ) {
+      this.selectedSlot = null;
+    }
     return this.selectedSlot;
   }
 
   async selectTimeSlot(slotCode: string): Promise<DeliverySlot> {
+    await this.ensureAuthenticated();
     const slots = await this.getAvailableTimeSlots();
     const match = slots.find((s) => s.code === slotCode);
     if (!match) {
-      throw new Error(`חלון המשלוח (${slotCode}) לא נמצא בחצי חינם`);
+      throw new Error(`חלון המשלוח המבוקש (${slotCode}) כבר אינו פנוי בחצי חינם`);
     }
+
+    if (!this.isGuestSession) {
+      const numericId = Number(match.code);
+      const idVal =
+        Number.isFinite(numericId) && numericId > 0 ? numericId : match.code;
+      const bodyPayload = {
+        Object: {
+          ...match.rawSlot,
+          Id: idVal,
+          ShipmentId: idVal,
+          DeliveryDate: match.startIso,
+        },
+      };
+
+      let reservedOnServer = false;
+      for (const endpoint of [
+        '/proxy/api/delivery/setDeliveryDate',
+        '/proxy/api/cart/setDeliveryDate',
+      ]) {
+        try {
+          const resp = await this.apiFetchJson(endpoint, {
+            method: 'POST',
+            body: bodyPayload,
+          });
+          if (resp['IsOK'] !== false) {
+            reservedOnServer = true;
+            break;
+          }
+        } catch (err) {
+          if (isTimeoutError(err)) break;
+          // try fallback endpoint
+        }
+      }
+      if (!reservedOnServer) {
+        logger.warn(
+          `Hazi Hinam server slot reservation fallback used for slot ${slotCode}; saved locally for cart/checkout`,
+        );
+      }
+    }
+
     this.selectedSlot = match;
+    this.saveSession();
     return match;
   }
 
   async getActiveOrders(): Promise<ActiveOrderSummary[]> {
+    await this.ensureAuthenticated();
+    if (this.isGuestSession) {
+      return [];
+    }
+    for (const attempt of [
+      { method: 'POST' as const, path: '/proxy/api/order/getOrders', body: {} },
+      { method: 'GET' as const, path: '/proxy/api/order/getOrders' },
+      { method: 'POST' as const, path: '/proxy/api/customer/getOrders', body: {} },
+    ]) {
+      try {
+        const data = await this.apiFetchJson(attempt.path, {
+          method: attempt.method,
+          body: attempt.body,
+        });
+        const orders = parseHaziHinamOrders(data);
+        if (orders.length > 0) {
+          return orders;
+        }
+      } catch (err) {
+        if (isTimeoutError(err)) {
+          logger.warn('Hazi Hinam active orders request timed out');
+          break;
+        }
+        // try next endpoint shape
+      }
+    }
     return [];
   }
 
@@ -1007,11 +1737,15 @@ export class HaziHinamClient implements StoreClient {
     }
 
     const total = formatCurrency(cart.totalPrice);
+    const slotNote = this.selectedSlot
+      ? ` (חלון משלוח שנבחר: ${formatHebrewDateTime(this.selectedSlot.startIso, this.selectedSlot.endHourText)})`
+      : '';
+
     if (this.isGuestSession) {
       throw new StoreManualVerificationRequiredError(
         'hazi_hinam',
         'MANUAL_CHECKOUT',
-        `עגלת חצי חינם חושבה בסך ${total} (במצב אורח – לא הוגדרו פרטי התחברות HAZI_HINAM_USERNAME/PASSWORD). התחברו לאתר חצי חינם כדי להשלים את ההזמנה או הגדירו פרטי התחברות ב-.env.`,
+        `עגלת חצי חינם חושבה בסך ${total}${slotNote} (במצב אורח – לא הוגדרו פרטי התחברות HAZI_HINAM_USERNAME/PASSWORD או שההתחברות נכשלה). התחברו לאתר חצי חינם כדי להשלים את ההזמנה או הגדירו פרטי התחברות ב-.env.`,
         STORE_META.hazi_hinam.cartUrl,
       );
     }
@@ -1019,12 +1753,12 @@ export class HaziHinamClient implements StoreClient {
     throw new StoreManualVerificationRequiredError(
       'hazi_hinam',
       'MANUAL_CHECKOUT',
-      `העגלה שלכם בחצי חינם מוכנה עם ${cart.items.length} פריטים בסך ${total}! להשלמת בחירת חלון המשלוח והתשלום המאובטח לחצו על הקישור הישיר לעגלה:`,
+      `העגלה שלכם בחצי חינם מוכנה עם ${cart.items.length} פריטים בסך ${total}${slotNote}! להשלמת התשלום המאובטח לחצו על הקישור הישיר לעגלה:`,
       STORE_META.hazi_hinam.cartUrl,
     );
   }
 
   async shutdown(): Promise<void> {
-    // Pure HTTP client; nothing to tear down
+    // Browser instances are short-lived for login only; nothing persistent to tear down
   }
 }

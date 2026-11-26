@@ -102,7 +102,8 @@ export type CallbackPayload =
       keepStoreId: StoreId;
     }
   | {
-      kind: 'otp_skip';
+      kind: 'store_slots';
+      storeId: StoreId;
     };
 
 export interface LearnedPreference {

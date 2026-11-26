@@ -386,13 +386,13 @@ describe('Bot hang prevention & hard timeouts', () => {
           enabledStores: ['shufersal'],
           shufersalUsername: 'u',
           shufersalPassword: 'p',
-          chromeHeadless: true,
+          headless: true,
+          dataDir: tmpDir,
           dbPath: path.join(tmpDir, 'bot-timeout.sqlite'),
           sessionFilePath: path.join(tmpDir, 's.json'),
           haziHinamSessionFilePath: path.join(tmpDir, 'h.json'),
-          superHavivSessionFilePath: path.join(tmpDir, 'sh.json'),
-          victorySessionFilePath: path.join(tmpDir, 'v.json'),
           screenshotsDir: tmpDir,
+          autoRemoveOutOfStock: true,
         };
 
         const bot = createTelegramBot({

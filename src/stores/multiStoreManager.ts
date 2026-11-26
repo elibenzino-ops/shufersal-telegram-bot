@@ -720,8 +720,7 @@ export class MultiStoreManager {
       }
     };
 
-    // Process each target store independently in parallel so fast REST stores (Hazi Hinam / Super Haviv)
-    // never block waiting on Chromium-backed stores (Victory)!
+    // Process each target store independently in parallel
     await Promise.all(
       targetManagers.map(async (targetMgr) => {
         if (failedStores.has(targetMgr.storeId)) {
@@ -733,10 +732,9 @@ export class MultiStoreManager {
         const hasAvailable = (list: CatalogProduct[]) =>
           list.some((c) => c.inStock && c.purchasable);
 
-        // Browser-backed store runs 1 item at a time on its Chromium tab; REST stores run 3 concurrently
-        const concurrency = targetMgr.storeId === 'victory' ? 1 : 3;
+        // Browser-backed Shufersal runs 1 item at a time on its Chromium tab; REST Hazi Hinam runs 3 concurrently
+        const concurrency = targetMgr.storeId === 'shufersal' ? 1 : 3;
         let cursor = 0;
-        let processedInStore = 0;
 
         const worker = async () => {
           while (cursor < preparedItems.length) {
@@ -780,16 +778,8 @@ export class MultiStoreManager {
               }
 
               // Stage 2+: cleaned Hebrew product name -> short core query -> broader 2-word query
-              // Cap queries on browser-backed Victory if it hasn't matched anything after initial items
-              const queriesToTry =
-                targetMgr.storeId === 'victory' &&
-                processedInStore >= 5 &&
-                summary.matchedCount === 0
-                  ? fallbackQueries.slice(0, 1)
-                  : fallbackQueries;
-
               if (!selection?.selected) {
-                for (const q of queriesToTry) {
+                for (const q of fallbackQueries) {
                   const found = await targetMgr.search(q, 12);
                   if (!hasAvailable(found)) continue;
                   const candidateSelection = await params.ai.selectBestProduct({
@@ -841,7 +831,6 @@ export class MultiStoreManager {
                 summary.missingItems.push(displayName);
               }
             } finally {
-              processedInStore++;
               completedWorkUnits++;
               await reportProgress();
             }
@@ -895,40 +884,6 @@ export class MultiStoreManager {
       storeSummaries: targetManagers.map((m) => summaryByStore.get(m.storeId)!),
       comparison,
     };
-  }
-
-  getUnauthenticatedSmsOtpStores(excludeStoreId?: StoreId): StoreId[] {
-    const out: StoreId[] = [];
-    for (const storeId of this.orderedStoreIds) {
-      if (excludeStoreId && storeId === excludeStoreId) continue;
-      const mgr = this.managers.get(storeId);
-      if (mgr && mgr.supportsSmsOtpLogin() && !mgr.isAuthenticated()) {
-        out.push(storeId);
-      }
-    }
-    return out;
-  }
-
-  async startSmsOtpLogin(
-    storeId: StoreId,
-    phoneNumber: string,
-  ): Promise<{ message: string }> {
-    const mgr = this.managers.get(storeId);
-    if (!mgr) {
-      throw new Error(`החנות ${storeId} אינה מופעלת ב-.env`);
-    }
-    return mgr.startSmsOtpLogin(phoneNumber);
-  }
-
-  async completeSmsOtpLogin(
-    storeId: StoreId,
-    otpCode: string,
-  ): Promise<{ message: string; isAuthenticated: boolean }> {
-    const mgr = this.managers.get(storeId);
-    if (!mgr) {
-      throw new Error(`החנות ${storeId} אינה מופעלת ב-.env`);
-    }
-    return mgr.completeSmsOtpLogin(otpCode);
   }
 
   async shutdown(): Promise<void> {

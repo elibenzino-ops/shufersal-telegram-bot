@@ -11,7 +11,7 @@ import { escapeHtml, formatQuantity } from './utils/format.js';
  * One-shot batch synchronization mode (ideal for GitHub Actions / cron jobs).
  * Pulls all unread Telegram group messages queued by Telegram's servers,
  * parses groceries via Gemini AI, updates carts across all enabled stores
- * (Shufersal, Hazi Hinam, Super Haviv), posts a cheapest-cart comparison summary
+ * (Shufersal and Hazi Hinam), posts a cheapest-cart comparison summary
  * back to the group, acknowledges the processed updates, and exits cleanly.
  */
 async function runBatchSync(): Promise<void> {

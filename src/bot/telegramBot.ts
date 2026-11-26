@@ -27,8 +27,6 @@ import {
   formatHebrewDateTime,
   formatHebrewDayHeader,
   formatQuantity,
-  maskIsraeliPhone,
-  normalizeIsraeliPhone,
 } from '../utils/format.js';
 import { TimeoutError, withTimeout } from '../utils/timeout.js';
 
@@ -347,7 +345,7 @@ function renderCartSummaryHtml(
         ? ` (דמי משלוח: ${formatCurrency(selectedSlot.deliveryFee)})`
         : '';
     lines.push(`🚚 <b>חלון משלוח שמור:</b> ${escapeHtml(slotText)}${feeText}`);
-  } else if (!cart.orderInUpdateMode && storeMeta.id === 'shufersal') {
+  } else if (!cart.orderInUpdateMode) {
     lines.push(`🕒 <i>טרם נבחר חלון משלוח – לבחירה לחצו או הקלידו /slots</i>`);
   }
 
@@ -439,13 +437,13 @@ export function createTelegramBot(deps: CreateTelegramBotDeps): Bot {
       return updateTimeoutMs;
     }
     const text = ctx.message?.text?.trim() ?? '';
-    if (/^\/(?:mirror|otp)(?:@\S+)?(?:\s|$)/i.test(text)) {
+    if (/^\/mirror(?:@\S+)?(?:\s|$)/i.test(text)) {
       return longUpdateTimeoutMs;
     }
     const cbData = ctx.callbackQuery?.data;
     if (cbData?.startsWith('a:')) {
       const payload = db.getCallbackPayload(cbData.slice(2));
-      if (payload?.kind === 'mirror_cart' || payload?.kind === 'otp_skip') {
+      if (payload?.kind === 'mirror_cart') {
         return longUpdateTimeoutMs;
       }
     }
@@ -556,9 +554,7 @@ export function createTelegramBot(deps: CreateTelegramBotDeps): Bot {
 
     kb.text('🗑 הסר / ערוך פריטים', 'nav:edit_cart')
       .text('🔄 רענן השוואה', 'nav:compare');
-    if (stores.getStore('shufersal')) {
-      kb.row().text('🚚 חלונות משלוח', 'nav:slots');
-    }
+    kb.row().text('🚚 חלונות משלוח', 'nav:slots');
     return kb;
   }
 
@@ -604,19 +600,17 @@ export function createTelegramBot(deps: CreateTelegramBotDeps): Bot {
         `• <i>"צריך 2 חלב תנובה 3%, קוטג' ולחם פרוס"</i>\n` +
         `• <i>"תוסיפו חצי קילו עגבניות שרי ובננות קצת ירוקות"</i>\n` +
         `• <i>"תורידו את הקוטג'"</i>\n\n` +
-        `אני ממלא אוטומטית את העגלה בכל הרשתות במקביל, משווה מחירים כולל דמי משלוח, ובזמן ההזמנה בוחרים את <b>העגלה הזולה ביותר 🏆</b>!\n\n` +
+        `אני ממלא אוטומטית את העגלה בשופרסל ובחצי חינם במקביל, משווה מחירים כולל דמי משלוח, ובזמן ההזמנה בוחרים את <b>העגלה הזולה ביותר 🏆</b>!\n\n` +
         `<b>פקודות זמינות:</b>\n` +
-        `• /compare – השוואת מחירים חיה בין כל הרשתות וזיהוי הסל הזול ביותר\n` +
-        `• /mirror – העתקת כל הפריטים מהעגלה/הזמנה בשופרסל לשאר הרשתות והשוואה\n` +
+        `• /compare – השוואת מחירים חיה בין שופרסל וחצי חינם וזיהוי הסל הזול ביותר\n` +
+        `• /mirror – העתקת כל הפריטים מהעגלה/הזמנה בשופרסל לחצי חינם והשוואה\n` +
         `• /cart – צפייה בעגלות ופירוט פריטים בכל חנות\n` +
         `• /remove <code>[מוצר]</code> – הסרה או עריכת כמות של פריטים בעגלות / בהזמנה שנטענה\n` +
         `• /stores – סטטוס החנויות המחוברות וקישורים ישירים\n` +
-        `• /search <code>&lt;מוצר&gt;</code> – חיפוש והשוואת מחיר של מוצר בכל הרשתות\n` +
-        `• /slots – בחירת יום ושעת משלוח\n` +
+        `• /search <code>&lt;מוצר&gt;</code> – חיפוש והשוואת מחיר של מוצר בשתי הרשתות\n` +
+        `• /slots – בחירת יום ושעת משלוח (שופרסל או חצי חינם)\n` +
         `• /orders – צפייה בהזמנות פעילות וטעינה לעדכון\n` +
         `• /checkout – השוואת עגלות ואישור הזמנה מהסופר הזול ביותר\n` +
-        `• /login_haviv <code>&lt;טלפון&gt;</code> – התחברות לסופר חביב באמצעות קוד SMS\n` +
-        `• /login_victory <code>&lt;טלפון&gt;</code> – התחברות לויקטורי אונליין באמצעות קוד SMS\n` +
         `• /clear – <b>(מנהלים)</b> ריקון העגלות\n` +
         `• /id – הצגת מזהי הקבוצה והמשתמש`,
       { parse_mode: 'HTML' },
@@ -627,6 +621,7 @@ export function createTelegramBot(deps: CreateTelegramBotDeps): Bot {
     const list = stores.getEnabledStores();
     const lines = [`🏪 <b>רשתות הסופרמרקט המחוברות לבוט (${list.length}):</b>\n`];
     for (const s of list) {
+      const mgr = stores.getStore(s.id);
       const fee =
         s.defaultDeliveryFee !== null
           ? `משלוח מוערך ${formatCurrency(s.defaultDeliveryFee)}`
@@ -638,12 +633,17 @@ export function createTelegramBot(deps: CreateTelegramBotDeps): Bot {
       const mode = s.supportsAutoCheckout
         ? 'תשלום אוטומטי או קישור קופה'
         : 'מילוי עגלה אוטומטי + קישור ישיר לתשלום';
-      const authWarn = stores.getStore(s.id)?.getAuthWarning();
+      const isAuthed = mgr?.isAuthenticated() ?? false;
+      const authStatus = isAuthed
+        ? '🔐 מחובר לחשבון'
+        : '👤 מצב אורח (הגדירו פרטי התחברות ב-.env לחיבור חשבון)';
+      const authWarn = mgr?.getAuthWarning();
       const warnLine = authWarn
-        ? `\n   ⚠️ <i>מצב אורח: ${escapeHtml(authWarn.slice(0, 120))}</i>`
+        ? `\n   ⚠️ <i>${escapeHtml(authWarn.slice(0, 140))}</i>`
         : '';
       lines.push(
         `${s.emoji} <b>${escapeHtml(s.displayName)}</b>\n` +
+          `   ${authStatus}\n` +
           `   🚚 ${fee}${min}\n` +
           `   💳 ${mode}${warnLine}\n` +
           `   🔗 <a href="${escapeHtml(s.cartUrl)}">עגלת ${escapeHtml(s.shortName)}</a>`,
@@ -672,218 +672,10 @@ export function createTelegramBot(deps: CreateTelegramBotDeps): Bot {
     }
   }
 
-  const OTP_PENDING_TTL_MS = 5 * 60_000;
-
-  type PendingPostOtpAction =
-    | { kind: 'compare'; chatId: number }
-    | {
-        kind: 'mirror';
-        chatId: number;
-        sourceStoreId: StoreId;
-        senderName: string;
-      };
-
-  interface PendingOtpState {
-    stage: 'awaiting_phone' | 'awaiting_code';
-    storeId: StoreId;
-    remainingStores: StoreId[];
-    expiresAt: number;
-    onComplete?: PendingPostOtpAction;
-  }
-
-  const pendingOtpByChat = new Map<number, PendingOtpState>();
-  const activeOtpChats = new Set<number>();
-
-  function getSavedSmsPhone(storeId: StoreId): string | null {
-    const envSpecific =
-      storeId === 'super_haviv'
-        ? config.superHavivPhone
-        : storeId === 'victory'
-          ? config.victoryPhone
-          : undefined;
-    if (envSpecific) return envSpecific;
-    if (config.smsLoginPhone) return config.smsLoginPhone;
-
-    const dbSpecific = db.getSetting(`sms_phone:${storeId}`);
-    if (dbSpecific) {
-      const normalized = normalizeIsraeliPhone(dbSpecific);
-      if (normalized) return normalized;
-    }
-    const dbDefault = db.getSetting('sms_phone:default');
-    if (dbDefault) {
-      const normalized = normalizeIsraeliPhone(dbDefault);
-      if (normalized) return normalized;
-    }
-    return null;
-  }
-
-  function saveSmsPhone(storeId: StoreId, phone: string): void {
-    db.setSetting(`sms_phone:${storeId}`, phone);
-    if (!db.getSetting('sms_phone:default')) {
-      db.setSetting('sms_phone:default', phone);
-    }
-  }
-
-  async function runPostOtpAction(action: PendingPostOtpAction): Promise<void> {
-    if (action.kind === 'compare') {
-      await runCompareForChat(action.chatId, true);
-      return;
-    }
-    await runMirrorForChat({
-      chatId: action.chatId,
-      sourceStoreId: action.sourceStoreId,
-      senderName: action.senderName,
-      skipAutoSmsLogin: true,
-    });
-  }
-
-  function buildOtpSkipKeyboard(): InlineKeyboard {
-    const skipTok = db.saveCallbackPayload({ kind: 'otp_skip' });
-    return new InlineKeyboard().text('⏭ דלג והמשך כאורח', `a:${skipTok}`);
-  }
-
-  async function beginAutoOtpQueue(
-    chatId: number,
-    queue: StoreId[],
-    action?: PendingPostOtpAction,
-  ): Promise<void> {
-    const unauthed = queue.filter((id) => {
-      const mgr = stores.getStore(id);
-      return Boolean(mgr && mgr.supportsSmsOtpLogin() && !mgr.isAuthenticated());
-    });
-
-    if (unauthed.length === 0) {
-      if (action) {
-        await runPostOtpAction(action);
-      }
-      return;
-    }
-
-    const [storeId, ...remainingStores] = unauthed as [StoreId, ...StoreId[]];
-    const meta = STORE_META[storeId];
-    const actionLabel =
-      action?.kind === 'mirror' ? 'העתקת הסל וההשוואה' : 'השוואת המחירים';
-    const skipKb = buildOtpSkipKeyboard();
-    const savedPhone = getSavedSmsPhone(storeId);
-
-    if (!savedPhone) {
-      pendingOtpByChat.set(chatId, {
-        stage: 'awaiting_phone',
-        storeId,
-        remainingStores,
-        expiresAt: Date.now() + OTP_PENDING_TTL_MS,
-        onComplete: action,
-      });
-      const storeNames = unauthed
-        .map(
-          (id) =>
-            `${STORE_META[id].emoji} <b>${escapeHtml(STORE_META[id].displayName)}</b>`,
-        )
-        .join(' ו-');
-      await bot.api.sendMessage(
-        chatId,
-        `📱 <b>התחברות אוטומטית לפני ${actionLabel}</b>\n\n` +
-          `כדי לחבר את ${storeNames} לחשבון שלך (כך שהעגלה תישמר באתר ולא תופיע ריקה), שלחו כאן <b>פעם אחת</b> את מספר הנייד שלכם (למשל <code>0501234567</code>).\n` +
-          `אשמור אותו אוטומטית לפעמים הבאות, אשלח קוד SMS, ומיד אמשיך ב-${actionLabel}!`,
-        { parse_mode: 'HTML', reply_markup: skipKb },
-      );
-      return;
-    }
-
-    if (activeOtpChats.has(chatId)) {
-      await bot.api.sendMessage(
-        chatId,
-        '⏳ כבר יש תהליך התחברות SMS פעיל בצ׳אט זה, רגע...',
-      );
-      return;
-    }
-
-    activeOtpChats.add(chatId);
-    const statusMsg = await bot.api.sendMessage(
-      chatId,
-      `📲 <b>מתחבר אוטומטית ל-${meta.emoji} ${escapeHtml(meta.displayName)}...</b>\n` +
-        `שולח קוד SMS למספר השמור (<code>${escapeHtml(maskIsraeliPhone(savedPhone))}</code>)...`,
-      { parse_mode: 'HTML' },
-    );
-
-    let failedAndShouldAdvance = false;
-    try {
-      const res = await stores.startSmsOtpLogin(storeId, savedPhone);
-      pendingOtpByChat.set(chatId, {
-        stage: 'awaiting_code',
-        storeId,
-        remainingStores,
-        expiresAt: Date.now() + OTP_PENDING_TTL_MS,
-        onComplete: action,
-      });
-      const nextHint =
-        remainingStores.length > 0
-          ? `לאחר מכן אחבר אוטומטית גם את ${remainingStores.map((id) => STORE_META[id].shortName).join(' ו-')} ואמשיך ב-${actionLabel}.`
-          : `מיד לאחר האימות אמשיך אוטומטית ב-${actionLabel}.`;
-      await bot.api
-        .editMessageText(
-          chatId,
-          statusMsg.message_id,
-          `📲 <b>${meta.emoji} ${escapeHtml(meta.displayName)}</b>\n${escapeHtml(res.message)}\n\n` +
-            `<i>פשוט הקלידו כאן את הקוד שקיבלתם ב-SMS. ${escapeHtml(nextHint)}</i>`,
-          { parse_mode: 'HTML', reply_markup: skipKb },
-        )
-        .catch(() => {});
-    } catch (err) {
-      logger.warn(
-        `Auto SMS OTP start failed for ${storeId}; continuing as guest`,
-        err,
-      );
-      const errMsg = err instanceof Error ? err.message : String(err);
-      await bot.api
-        .editMessageText(
-          chatId,
-          statusMsg.message_id,
-          `⚠️ התחברות SMS אוטומטית ל-${meta.emoji} <b>${escapeHtml(meta.displayName)}</b> לא הצליחה (${escapeHtml(errMsg.slice(0, 140))}).\n` +
-            `<i>ממשיך במצב אורח עבור ${escapeHtml(meta.shortName)}...</i>`,
-          { parse_mode: 'HTML' },
-        )
-        .catch(() => {});
-      failedAndShouldAdvance = true;
-    } finally {
-      activeOtpChats.delete(chatId);
-    }
-
-    if (failedAndShouldAdvance) {
-      await beginAutoOtpQueue(chatId, remainingStores, action);
-    }
-  }
-
-  async function ensureAutoSmsLoginBeforeAction(
-    chatId: number,
-    action: PendingPostOtpAction,
-  ): Promise<boolean> {
-    const excludeStoreId =
-      action.kind === 'mirror' ? action.sourceStoreId : undefined;
-    const unauthed = stores.getUnauthenticatedSmsOtpStores(excludeStoreId);
-    if (unauthed.length === 0) return false;
-
-    await beginAutoOtpQueue(chatId, unauthed, action);
-    return true;
-  }
-
-  async function runCompareForChat(
-    chatId: number,
-    skipAutoSmsLogin = false,
-  ): Promise<void> {
-    if (
-      !skipAutoSmsLogin &&
-      (await ensureAutoSmsLoginBeforeAction(chatId, {
-        kind: 'compare',
-        chatId,
-      }))
-    ) {
-      return;
-    }
-
+  async function runCompareForChat(chatId: number): Promise<void> {
     const loading = await bot.api.sendMessage(
       chatId,
-      '⚖️ משווה עגלות ומחירים חיים בין כל הרשתות המחוברות...',
+      '⚖️ משווה עגלות ומחירים חיים בין שופרסל לחצי חינם...',
     );
     try {
       await renderCompareView(chatId, loading.message_id);
@@ -899,7 +691,7 @@ export function createTelegramBot(deps: CreateTelegramBotDeps): Bot {
   }
 
   bot.command(['compare', 'cheapest'], async (ctx) => {
-    await runCompareForChat(ctx.chat.id, false);
+    await runCompareForChat(ctx.chat.id);
   });
 
   const activeMirrorChats = new Set<number>();
@@ -908,9 +700,8 @@ export function createTelegramBot(deps: CreateTelegramBotDeps): Bot {
     chatId: number;
     sourceStoreId: StoreId;
     senderName: string;
-    skipAutoSmsLogin?: boolean;
   }): Promise<void> {
-    const { chatId, sourceStoreId, senderName, skipAutoSmsLogin } = params;
+    const { chatId, sourceStoreId, senderName } = params;
     const sourceMeta = STORE_META[sourceStoreId];
 
     if (!stores.isMultiStore()) {
@@ -928,18 +719,6 @@ export function createTelegramBot(deps: CreateTelegramBotDeps): Bot {
         '⏳ העתקה והשוואה כבר רצה כרגע בקבוצה – אנא המתינו לסיומה.',
         { parse_mode: 'HTML' },
       );
-      return;
-    }
-
-    if (
-      !skipAutoSmsLogin &&
-      (await ensureAutoSmsLoginBeforeAction(chatId, {
-        kind: 'mirror',
-        chatId,
-        sourceStoreId,
-        senderName,
-      }))
-    ) {
       return;
     }
 
@@ -1075,198 +854,6 @@ export function createTelegramBot(deps: CreateTelegramBotDeps): Bot {
     });
   });
 
-  async function handleStartSmsOtpLogin(
-    ctx: Context,
-    storeId: StoreId,
-    rawPhone: string,
-  ): Promise<void> {
-    if (!ctx.chat) return;
-    const chatId = ctx.chat.id;
-    const meta = STORE_META[storeId];
-    const cmdName =
-      storeId === 'super_haviv' ? '/login_haviv' : '/login_victory';
-
-    if (!stores.getStore(storeId)) {
-      await ctx.reply(
-        `❌ ${meta.emoji} <b>${escapeHtml(meta.displayName)}</b> אינה מופעלת כרגע ב-<code>ENABLED_STORES</code>.`,
-        { parse_mode: 'HTML' },
-      );
-      return;
-    }
-
-    const trimmedPhone = rawPhone.trim();
-    const normalizedPhone = trimmedPhone
-      ? normalizeIsraeliPhone(trimmedPhone)
-      : getSavedSmsPhone(storeId);
-
-    if (!trimmedPhone && !normalizedPhone) {
-      await ctx.reply(
-        `📱 <b>התחברות ל-${meta.emoji} ${escapeHtml(meta.displayName)} באמצעות SMS</b>\n\n` +
-          `שלחו את הפקודה עם מספר הנייד שלכם:\n` +
-          `<code>${cmdName} 0501234567</code>\n\n` +
-          `לאחר קבלת ההודעה ב-SMS, פשוט כתבו את הקוד בצ'אט (או <code>/otp 123456</code>).`,
-        { parse_mode: 'HTML' },
-      );
-      return;
-    }
-
-    if (!normalizedPhone) {
-      await ctx.reply(
-        `❌ מספר הטלפון לא תקין. נא להזין מספר נייד ישראלי, למשל:\n<code>${cmdName} 0501234567</code>`,
-        { parse_mode: 'HTML' },
-      );
-      return;
-    }
-
-    saveSmsPhone(storeId, normalizedPhone);
-
-    if (activeOtpChats.has(chatId)) {
-      await ctx.reply('⏳ כבר יש תהליך התחברות SMS פעיל בצ׳אט זה, רגע...');
-      return;
-    }
-
-    activeOtpChats.add(chatId);
-    const statusMsg = await ctx.reply(
-      `⏳ שולח בקשת קוד SMS מ-${meta.emoji} <b>${escapeHtml(meta.displayName)}</b>...`,
-      { parse_mode: 'HTML' },
-    );
-
-    try {
-      const res = await stores.startSmsOtpLogin(storeId, normalizedPhone);
-      pendingOtpByChat.set(chatId, {
-        stage: 'awaiting_code',
-        storeId,
-        remainingStores: [],
-        expiresAt: Date.now() + OTP_PENDING_TTL_MS,
-      });
-      await bot.api
-        .editMessageText(
-          chatId,
-          statusMsg.message_id,
-          `📲 <b>${escapeHtml(meta.displayName)}</b>\n${escapeHtml(res.message)}\n\n` +
-            `<i>פשוט שלחו את הקוד כהודעה רגילה בצ׳אט (או <code>/otp 123456</code>) בתוך 5 דקות.</i>`,
-          { parse_mode: 'HTML' },
-        )
-        .catch(() => {});
-    } catch (err) {
-      logger.warn(`SMS OTP login start failed for ${storeId}`, err);
-      await bot.api
-        .editMessageText(
-          chatId,
-          statusMsg.message_id,
-          formatUserFacingError(err),
-          { parse_mode: 'HTML' },
-        )
-        .catch(() => {});
-    } finally {
-      activeOtpChats.delete(chatId);
-    }
-  }
-
-  async function handleCompleteSmsOtpLogin(
-    ctx: Context,
-    rawCode: string,
-  ): Promise<void> {
-    if (!ctx.chat) return;
-    const chatId = ctx.chat.id;
-    const pending = pendingOtpByChat.get(chatId);
-    if (!pending || Date.now() > pending.expiresAt) {
-      pendingOtpByChat.delete(chatId);
-      await ctx.reply(
-        `ℹ️ אין כרגע בקשת קוד SMS פעילה.\nהתחברות מתבצעת אוטומטית כשמריצים /mirror או /compare (או ידנית עם <code>/login_haviv 05XXXXXXXX</code>).`,
-        { parse_mode: 'HTML' },
-      );
-      return;
-    }
-
-    if (pending.stage === 'awaiting_phone') {
-      await ctx.reply(
-        `📱 אני ממתין קודם למספר הנייד שלך (למשל <code>0501234567</code>) כדי לשלוח קוד SMS.`,
-        { parse_mode: 'HTML' },
-      );
-      return;
-    }
-
-    const code = rawCode.replace(/\D/g, '');
-    if (code.length < 4 || code.length > 8) {
-      await ctx.reply(
-        `❌ קוד האימות צריך להכיל 4–8 ספרות. נסו שוב או שלחו <code>/otp 123456</code>.`,
-        { parse_mode: 'HTML' },
-      );
-      return;
-    }
-
-    if (activeOtpChats.has(chatId)) {
-      await ctx.reply('⏳ כבר מאמת קוד SMS, רגע...');
-      return;
-    }
-
-    const meta = STORE_META[pending.storeId];
-    activeOtpChats.add(chatId);
-    const statusMsg = await ctx.reply(
-      `⏳ מאמת קוד SMS מול ${meta.emoji} <b>${escapeHtml(meta.displayName)}</b>...`,
-      { parse_mode: 'HTML' },
-    );
-
-    let succeeded = false;
-    try {
-      const res = await stores.completeSmsOtpLogin(pending.storeId, code);
-      pendingOtpByChat.delete(chatId);
-      succeeded = true;
-      await bot.api
-        .editMessageText(
-          chatId,
-          statusMsg.message_id,
-          `✅ <b>${escapeHtml(meta.displayName)}</b>\n${escapeHtml(res.message)}`,
-          { parse_mode: 'HTML' },
-        )
-        .catch(() => {});
-    } catch (err) {
-      logger.warn(`SMS OTP login completion failed for ${pending.storeId}`, err);
-      const errMsg = err instanceof Error ? err.message : String(err);
-      if (
-        err instanceof StoreManualVerificationRequiredError ||
-        /פג תוקף|נסגר|אין חלון|אין תהליך/i.test(errMsg)
-      ) {
-        pendingOtpByChat.delete(chatId);
-      }
-      await bot.api
-        .editMessageText(
-          chatId,
-          statusMsg.message_id,
-          formatUserFacingError(err),
-          { parse_mode: 'HTML' },
-        )
-        .catch(() => {});
-    } finally {
-      activeOtpChats.delete(chatId);
-    }
-
-    if (succeeded) {
-      if (pending.remainingStores.length > 0) {
-        await beginAutoOtpQueue(
-          chatId,
-          pending.remainingStores,
-          pending.onComplete,
-        );
-      } else if (pending.onComplete) {
-        await runPostOtpAction(pending.onComplete);
-      }
-    }
-  }
-
-  bot.command('login_haviv', async (ctx) => {
-    await handleStartSmsOtpLogin(ctx, 'super_haviv', ctx.match ?? '');
-  });
-
-  bot.command('login_victory', async (ctx) => {
-    await handleStartSmsOtpLogin(ctx, 'victory', ctx.match ?? '');
-  });
-
-  bot.command('otp', async (ctx) => {
-    await handleCompleteSmsOtpLogin(ctx, ctx.match ?? '');
-  });
-
   function buildStoreCartActionKeyboard(
     storeId: StoreId,
     orderInUpdateMode: string | null,
@@ -1294,8 +881,12 @@ export function createTelegramBot(deps: CreateTelegramBotDeps): Bot {
       storeId,
     });
     kb.text('🔄 רענן עגלה', `a:${refreshTok}`);
-    if (storeId === 'shufersal' && !orderInUpdateMode) {
-      kb.text('🚚 בחר חלון משלוח', 'nav:slots');
+    if (!orderInUpdateMode) {
+      const slotsTok = db.saveCallbackPayload({
+        kind: 'store_slots',
+        storeId,
+      });
+      kb.text('🚚 בחר חלון משלוח', `a:${slotsTok}`);
     }
     if (hasItems && stores.isMultiStore()) {
       const mirrorTok = db.saveCallbackPayload({
@@ -1700,6 +1291,51 @@ export function createTelegramBot(deps: CreateTelegramBotDeps): Bot {
     }
   });
 
+  async function renderSlotsStoreChooser(
+    chatId: number,
+    messageIdToEdit?: number,
+  ): Promise<void> {
+    const enabled = stores.getEnabledStores();
+    if (enabled.length === 1) {
+      await renderSlotsPicker(chatId, enabled[0]!.id, messageIdToEdit);
+      return;
+    }
+
+    const lines = [
+      '🚚 <b>בחירת חלון משלוח — באיזו רשת תרצו לבחור מועד?</b>\n',
+    ];
+    const kb = new InlineKeyboard();
+
+    for (const meta of enabled) {
+      const mgr = stores.getStore(meta.id);
+      const selected = mgr ? await mgr.getSelectedSlot().catch(() => null) : null;
+      const statusText = selected
+        ? `שמור כרגע: ${escapeHtml(formatHebrewDateTime(selected.startIso, selected.endHourText))}`
+        : 'טרם נבחר חלון משלוח';
+      lines.push(
+        `${meta.emoji} <b>${escapeHtml(meta.displayName)}</b> — <i>${statusText}</i>`,
+      );
+      const tok = db.saveCallbackPayload({
+        kind: 'store_slots',
+        storeId: meta.id,
+      });
+      kb.text(`🚚 ${meta.emoji} חלונות משלוח ב-${meta.shortName}`, `a:${tok}`).row();
+    }
+
+    const html = lines.join('\n');
+    if (messageIdToEdit) {
+      await bot.api.editMessageText(chatId, messageIdToEdit, html, {
+        parse_mode: 'HTML',
+        reply_markup: kb,
+      });
+    } else {
+      await bot.api.sendMessage(chatId, html, {
+        parse_mode: 'HTML',
+        reply_markup: kb,
+      });
+    }
+  }
+
   async function renderSlotsPicker(
     chatId: number,
     storeId: StoreId,
@@ -1710,12 +1346,21 @@ export function createTelegramBot(deps: CreateTelegramBotDeps): Bot {
     const slots = await mgr.getAvailableSlots();
     if (slots.length === 0) {
       const msg =
-        `😕 לא נמצאו חלונות משלוח זמינים דרך ה-API ב-${mgr.meta.displayName}.\n` +
-        `ניתן לבחור חלון משלוח ישירות בקישור: ${mgr.meta.cartUrl}`;
+        `😕 לא נמצאו חלונות משלוח זמינים דרך ה-API ב-${escapeHtml(mgr.meta.displayName)}.\n` +
+        `ניתן לבחור חלון משלוח ישירות בקישור: <a href="${escapeHtml(mgr.meta.cartUrl)}">${escapeHtml(mgr.meta.displayName)}</a>`;
+      const kb = stores.isMultiStore()
+        ? new InlineKeyboard().text('⬅️ בחר רשת אחרת', 'nav:slots')
+        : undefined;
       if (messageIdToEdit) {
-        await bot.api.editMessageText(chatId, messageIdToEdit, msg);
+        await bot.api.editMessageText(chatId, messageIdToEdit, msg, {
+          parse_mode: 'HTML',
+          reply_markup: kb,
+        });
       } else {
-        await bot.api.sendMessage(chatId, msg);
+        await bot.api.sendMessage(chatId, msg, {
+          parse_mode: 'HTML',
+          reply_markup: kb,
+        });
       }
       return;
     }
@@ -1733,7 +1378,7 @@ export function createTelegramBot(deps: CreateTelegramBotDeps): Bot {
 
     if (!selectedDayKey || !byDay.has(selectedDayKey)) {
       text =
-        `🚚 <b>בחירת יום משלוח ב-${escapeHtml(mgr.meta.displayName)}:</b>\n` +
+        `🚚 <b>בחירת יום משלוח ב-${escapeHtml(mgr.meta.emoji)} ${escapeHtml(mgr.meta.displayName)}:</b>\n` +
         `בחרו את היום המבוקש מתוך החלונות הפנויים:`;
       for (const [dateKey, group] of byDay.entries()) {
         const tok = db.saveCallbackPayload({
@@ -1745,6 +1390,9 @@ export function createTelegramBot(deps: CreateTelegramBotDeps): Bot {
           `📅 ${group.label} (${group.slots.length} חלונות)`,
           `a:${tok}`,
         ).row();
+      }
+      if (stores.isMultiStore()) {
+        kb.text('⬅️ החלף רשת', 'nav:slots');
       }
     } else {
       const group = byDay.get(selectedDayKey)!;
@@ -1767,7 +1415,11 @@ export function createTelegramBot(deps: CreateTelegramBotDeps): Bot {
         });
         kb.text(`🕒 ${hours}${fee}`, `a:${tok}`).row();
       }
-      kb.text('⬅️ חזרה לבחירת יום', 'nav:slots');
+      const backToDaysTok = db.saveCallbackPayload({
+        kind: 'store_slots',
+        storeId: mgr.storeId,
+      });
+      kb.text('⬅️ חזרה לבחירת יום', `a:${backToDaysTok}`);
     }
 
     if (messageIdToEdit) {
@@ -1784,16 +1436,27 @@ export function createTelegramBot(deps: CreateTelegramBotDeps): Bot {
   }
 
   bot.command('slots', async (ctx) => {
-    const targetStore = stores.getStore('shufersal') ?? stores.getPrimaryStore();
+    const arg = (ctx.match ?? '').trim().toLowerCase();
+    let explicitStoreId: StoreId | undefined;
+    if (/^(?:hazi|hatzi|hazi[_-]?hinam|חצי)/.test(arg)) {
+      explicitStoreId = stores.getStore('hazi_hinam') ? 'hazi_hinam' : undefined;
+    } else if (/^(?:shufersal|שופרסל)/.test(arg)) {
+      explicitStoreId = stores.getStore('shufersal') ? 'shufersal' : undefined;
+    }
+
     const loading = await ctx.reply(
-      `🚚 בודק חלונות משלוח פנויים ב-${targetStore.meta.displayName}...`,
+      explicitStoreId
+        ? `🚚 בודק חלונות משלוח פנויים ב-${STORE_META[explicitStoreId].displayName}...`
+        : stores.isMultiStore()
+          ? '🚚 טוען אפשרויות חלונות משלוח...'
+          : `🚚 בודק חלונות משלוח פנויים ב-${stores.getPrimaryStore().meta.displayName}...`,
     );
     try {
-      await renderSlotsPicker(
-        ctx.chat.id,
-        targetStore.storeId,
-        loading.message_id,
-      );
+      if (explicitStoreId) {
+        await renderSlotsPicker(ctx.chat.id, explicitStoreId, loading.message_id);
+      } else {
+        await renderSlotsStoreChooser(ctx.chat.id, loading.message_id);
+      }
     } catch (err) {
       logger.error('/slots command failed', err);
       await ctx.api.editMessageText(
@@ -1806,63 +1469,101 @@ export function createTelegramBot(deps: CreateTelegramBotDeps): Bot {
   });
 
   bot.command('orders', async (ctx) => {
-    const shufersal = stores.getStore('shufersal');
-    if (!shufersal) {
-      await ctx.reply(
-        'ℹ️ מעקב ועדכון הזמנות פתוחות נתמך כרגע בחשבון שופרסל אונליין.',
-      );
-      return;
-    }
-
-    const loading = await ctx.reply('📦 בודק הזמנות פעילות בחשבון שופרסל...');
+    const enabledStores = stores.getEnabledStores();
+    const loading = await ctx.reply(
+      enabledStores.length > 1
+        ? '📦 בודק הזמנות פעילות בשופרסל ובחצי חינם...'
+        : `📦 בודק הזמנות פעילות ב-${enabledStores[0]!.displayName}...`,
+    );
     try {
-      const orders = await shufersal.getActiveOrders();
-      if (orders.length === 0) {
+      const results = await Promise.all(
+        enabledStores.map(async (meta) => {
+          const mgr = stores.getStore(meta.id)!;
+          try {
+            const orders = await mgr.getActiveOrders();
+            return { meta, orders, error: null as string | null };
+          } catch (err) {
+            logger.warn(`Failed fetching active orders for ${meta.id}`, err);
+            return {
+              meta,
+              orders: [],
+              error: err instanceof Error ? err.message : String(err),
+            };
+          }
+        }),
+      );
+
+      const totalOrders = results.reduce((sum, r) => sum + r.orders.length, 0);
+      if (totalOrders === 0) {
+        const errNotes = results
+          .filter((r) => r.error)
+          .map((r) => `⚠️ ${r.meta.emoji} ${escapeHtml(r.meta.shortName)}: ${escapeHtml(r.error!.slice(0, 100))}`);
+        const emptyText =
+          '📭 אין כרגע הזמנות פעילות ממתינות בחשבונות המחוברים.' +
+          (errNotes.length > 0 ? `\n\n${errNotes.join('\n')}` : '');
         await ctx.api.editMessageText(
           ctx.chat.id,
           loading.message_id,
-          '📭 אין כרגע הזמנות פעילות ממתינות בחשבון שופרסל.',
+          emptyText,
+          { parse_mode: 'HTML' },
         );
         return;
       }
 
       const kb = new InlineKeyboard();
-      const lines = [`📦 <b>הזמנות פעילות בשופרסל אונליין:</b>\n`];
+      const sections: string[] = [];
 
-      orders.forEach((order, i) => {
-        const dtText = formatHebrewDateTime(
-          order.deliveryIso,
-          order.deliveryHoursText?.split('–')[1] ?? null,
-        );
-        const updateDeadline = order.updatableUntilText
-          ? `\n   ⏳ ניתן לעדכון עד: ${escapeHtml(order.updatableUntilText)}`
-          : '';
-        const activeTag = order.isBeingUpdated
-          ? ' ✅ <b>(נטענה כעת לעגלה לעדכון!)</b>'
-          : '';
+      for (const { meta, orders } of results) {
+        if (orders.length === 0) continue;
+        const lines = [`📦 <b>הזמנות פעילות ב-${meta.emoji} ${escapeHtml(meta.displayName)}:</b>`];
 
-        lines.push(
-          `${i + 1}. <b>הזמנה #${escapeHtml(order.code)}</b>${activeTag}\n` +
-            `   🚚 משלוח: ${escapeHtml(dtText)}\n` +
-            `   💰 סה"כ: ${formatCurrency(order.totalPrice)} (${order.totalItems} פריטים)` +
-            updateDeadline,
-        );
+        orders.forEach((order, i) => {
+          const dtText = formatHebrewDateTime(
+            order.deliveryIso,
+            order.deliveryHoursText?.split('–')[1] ?? null,
+          );
+          const updateDeadline = order.updatableUntilText
+            ? `\n   ⏳ ניתן לעדכון עד: ${escapeHtml(order.updatableUntilText)}`
+            : '';
+          const activeTag = order.isBeingUpdated
+            ? ' ✅ <b>(נטענה כעת לעגלה לעדכון!)</b>'
+            : '';
 
-        if (order.isUpdatable && !order.isBeingUpdated) {
-          const tok = db.saveCallbackPayload({
-            kind: 'order_edit',
-            storeId: 'shufersal',
-            orderCode: order.code,
-          });
-          kb.text(`✏️ טען הזמנה #${order.code} לעדכון מוצרים`, `a:${tok}`).row();
-        }
-      });
+          lines.push(
+            `${i + 1}. <b>הזמנה #${escapeHtml(order.code)}</b>${activeTag}\n` +
+              `   🚚 משלוח: ${escapeHtml(dtText)}\n` +
+              `   💰 סה"כ: ${formatCurrency(order.totalPrice)} (${order.totalItems} פריטים)` +
+              updateDeadline,
+          );
+
+          if (
+            meta.supportsOrderUpdate &&
+            order.isUpdatable &&
+            !order.isBeingUpdated
+          ) {
+            const tok = db.saveCallbackPayload({
+              kind: 'order_edit',
+              storeId: meta.id,
+              orderCode: order.code,
+            });
+            kb.text(
+              `✏️ טען הזמנה #${order.code} (${meta.shortName}) לעדכון`,
+              `a:${tok}`,
+            ).row();
+          }
+        });
+
+        sections.push(lines.join('\n\n'));
+      }
 
       await ctx.api.editMessageText(
         ctx.chat.id,
         loading.message_id,
-        lines.join('\n\n'),
-        { parse_mode: 'HTML', reply_markup: kb },
+        sections.join('\n\n'),
+        {
+          parse_mode: 'HTML',
+          reply_markup: kb.inline_keyboard.length > 0 ? kb : undefined,
+        },
       );
     } catch (err) {
       logger.error('/orders command failed', err);
@@ -1964,7 +1665,11 @@ export function createTelegramBot(deps: CreateTelegramBotDeps): Bot {
       !cart.orderInUpdateMode
     ) {
       const updatableOrder = activeOrders.find((o) => o.isUpdatable);
-      const kb = new InlineKeyboard().text('🚚 בחר חלון משלוח חדש', 'nav:slots');
+      const slotsTok = db.saveCallbackPayload({
+        kind: 'store_slots',
+        storeId: mgr.storeId,
+      });
+      const kb = new InlineKeyboard().text('🚚 בחר חלון משלוח חדש', `a:${slotsTok}`);
       if (updatableOrder) {
         const editTok = db.saveCallbackPayload({
           kind: 'order_edit',
@@ -2031,8 +1736,15 @@ export function createTelegramBot(deps: CreateTelegramBotDeps): Bot {
       )
       .row();
 
-    if (mgr.storeId === 'shufersal') {
-      kb.text('🕒 החלף חלון משלוח', 'nav:slots');
+    if (!cart.orderInUpdateMode) {
+      const slotsTok = db.saveCallbackPayload({
+        kind: 'store_slots',
+        storeId: mgr.storeId,
+      });
+      kb.text(
+        selectedSlot ? '🕒 החלף חלון משלוח' : '🚚 בחר חלון משלוח',
+        `a:${slotsTok}`,
+      );
     }
     if (stores.isMultiStore()) {
       kb.text('⚖️ החלף חנות', 'nav:checkout');
@@ -2165,8 +1877,7 @@ export function createTelegramBot(deps: CreateTelegramBotDeps): Bot {
 
       if (data === 'nav:slots') {
         await ctx.answerCallbackQuery('טוען חלונות משלוח...');
-        const target = stores.getStore('shufersal') ?? stores.getPrimaryStore();
-        await renderSlotsPicker(chatId, target.storeId, messageId);
+        await renderSlotsStoreChooser(chatId, messageId);
         return;
       }
 
@@ -2924,16 +2635,12 @@ export function createTelegramBot(deps: CreateTelegramBotDeps): Bot {
           return;
         }
 
-        if (payload.kind === 'otp_skip') {
-          const pending = pendingOtpByChat.get(chatId);
-          pendingOtpByChat.delete(chatId);
-          await ctx.answerCallbackQuery('ממשיך במצב אורח...');
-          await ctx
-            .editMessageText('⏭ דילגת על התחברות SMS — ממשיך במצב אורח...')
-            .catch(() => {});
-          if (pending?.onComplete) {
-            await runPostOtpAction(pending.onComplete);
-          }
+        if (payload.kind === 'store_slots') {
+          const mgr = stores.getStore(payload.storeId) ?? stores.getPrimaryStore();
+          await ctx.answerCallbackQuery(
+            `טוען חלונות משלוח ב-${mgr.meta.shortName}...`,
+          );
+          await renderSlotsPicker(chatId, mgr.storeId, messageId);
           return;
         }
       }
@@ -2956,27 +2663,6 @@ export function createTelegramBot(deps: CreateTelegramBotDeps): Bot {
   bot.on('message:text', async (ctx) => {
     const text = ctx.message.text.trim();
     if (!text || text.startsWith('/')) return;
-
-    const pendingOtp = pendingOtpByChat.get(ctx.chat.id);
-    if (pendingOtp) {
-      if (Date.now() > pendingOtp.expiresAt) {
-        pendingOtpByChat.delete(ctx.chat.id);
-      } else if (pendingOtp.stage === 'awaiting_phone') {
-        const normalizedPhone = normalizeIsraeliPhone(text);
-        if (normalizedPhone) {
-          saveSmsPhone(pendingOtp.storeId, normalizedPhone);
-          db.setSetting('sms_phone:default', normalizedPhone);
-          const queue = [pendingOtp.storeId, ...pendingOtp.remainingStores];
-          const action = pendingOtp.onComplete;
-          pendingOtpByChat.delete(ctx.chat.id);
-          await beginAutoOtpQueue(ctx.chat.id, queue, action);
-          return;
-        }
-      } else if (/^\d{4,8}$/.test(text.replace(/[\s\-]/g, ''))) {
-        await handleCompleteSmsOtpLogin(ctx, text);
-        return;
-      }
-    }
 
     const senderName = getSenderDisplayName(ctx);
     const parsed = await ai.parseGroupMessage(text);
@@ -3180,18 +2866,15 @@ export function createTelegramBot(deps: CreateTelegramBotDeps): Bot {
 export async function registerBotCommands(bot: Bot): Promise<void> {
   await withTimeout(
     bot.api.setMyCommands([
-      { command: 'compare', description: 'השוואת מחירים בין שופרסל, חצי חינם, סופר חביב וויקטורי' },
-      { command: 'mirror', description: 'העתקת כל הפריטים מהעגלה/הזמנה בשופרסל לשאר הרשתות' },
+      { command: 'compare', description: 'השוואת מחירים בין שופרסל וחצי חינם' },
+      { command: 'mirror', description: 'העתקת כל הפריטים מהעגלה/הזמנה בשופרסל לחצי חינם' },
       { command: 'cart', description: 'הצגת העגלות ופירוט פריטים בכל חנות' },
       { command: 'remove', description: 'הסרה או עריכת כמות של פריטים בעגלות / בהזמנה' },
       { command: 'checkout', description: 'בחירת הסל הזול ביותר ואישור הזמנה' },
-      { command: 'stores', description: 'רשימת החנויות המחוברות וקישורים לעגלות' },
-      { command: 'slots', description: 'בחירת יום ושעת משלוח' },
+      { command: 'stores', description: 'רשימת החנויות המחוברות, סטטוס התחברות וקישורים לעגלות' },
+      { command: 'slots', description: 'בחירת יום ושעת משלוח (שופרסל או חצי חינם)' },
       { command: 'orders', description: 'צפייה בהזמנות פעילות וטעינה לעדכון' },
-      { command: 'search', description: 'חיפוש והשוואת מחיר של מוצר בכל החנויות' },
-      { command: 'login_haviv', description: 'התחברות לסופר חביב באמצעות קוד SMS' },
-      { command: 'login_victory', description: 'התחברות לויקטורי אונליין באמצעות קוד SMS' },
-      { command: 'otp', description: 'שליחת קוד אימות SMS להתחברות לחנות' },
+      { command: 'search', description: 'חיפוש והשוואת מחיר של מוצר בשתי החנויות' },
       { command: 'clear', description: '(מנהל) ריקון העגלות' },
       { command: 'id', description: 'הצגת מזהה הקבוצה והמשתמש' },
       { command: 'help', description: 'מדריך שימוש בבוט הקניות' },

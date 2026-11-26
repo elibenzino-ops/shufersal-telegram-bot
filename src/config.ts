@@ -7,7 +7,6 @@ import {
   isStoreId,
   type StoreId,
 } from './stores/types.js';
-import { normalizeIsraeliPhone } from './utils/format.js';
 
 dotenv.config();
 
@@ -31,7 +30,7 @@ export function parseEnabledStores(
   hasShufersalCreds: boolean,
 ): StoreId[] {
   if (!raw || !raw.trim()) {
-    // Enable all 3 stores by default; only include Shufersal when its credentials are configured
+    // Enable both stores by default; only include Shufersal when its credentials are configured
     return ALL_STORE_IDS.filter(
       (id) => id !== 'shufersal' || hasShufersalCreds,
     );
@@ -45,18 +44,6 @@ export function parseEnabledStores(
     hazi: 'hazi_hinam',
     hatzi: 'hazi_hinam',
     'חצי חינם': 'hazi_hinam',
-    super_haviv: 'super_haviv',
-    'super-haviv': 'super_haviv',
-    superhaviv: 'super_haviv',
-    haviv: 'super_haviv',
-    'סופר חביב': 'super_haviv',
-    'חביב': 'super_haviv',
-    victory: 'victory',
-    victoryonline: 'victory',
-    victory_online: 'victory',
-    'victory-online': 'victory',
-    'ויקטורי': 'victory',
-    'ויקטורי אונליין': 'victory',
   };
 
   const result: StoreId[] = [];
@@ -113,25 +100,6 @@ const EnvSchema = z.object({
   HAZI_HINAM_PASSWORD: z.string().optional(),
   HAZI_HINAM_DELIVERY_FEE: z.string().optional(),
 
-  // Super Haviv Online (סופר חביב)
-  SUPER_HAVIV_USERNAME: z.string().optional(),
-  SUPER_HAVIV_PASSWORD: z.string().optional(),
-  SUPER_HAVIV_PHONE: z.string().optional(),
-  SUPER_HAVIV_BRANCH_ID: z.string().optional(),
-  SUPER_HAVIV_AREA_ID: z.string().optional(),
-  SUPER_HAVIV_DELIVERY_FEE: z.string().optional(),
-
-  // Victory Online (ויקטורי אונליין)
-  VICTORY_USERNAME: z.string().optional(),
-  VICTORY_PASSWORD: z.string().optional(),
-  VICTORY_PHONE: z.string().optional(),
-  VICTORY_BRANCH_ID: z.string().optional(),
-  VICTORY_AREA_ID: z.string().optional(),
-  VICTORY_DELIVERY_FEE: z.string().optional(),
-
-  // Shared Israeli mobile phone for automatic SMS OTP login (Super Haviv / Victory)
-  SMS_LOGIN_PHONE: z.string().optional(),
-
   GEMINI_API_KEY: z.string().min(1, 'חובה להגדיר GEMINI_API_KEY לזיהוי חכם של מצרכים'),
   GEMINI_MODEL: z.string().default('gemini-3.8-flash'),
 
@@ -164,22 +132,6 @@ export interface AppConfig {
   haziHinamPassword?: string;
   haziHinamDeliveryFee?: number;
 
-  superHavivUsername?: string;
-  superHavivPassword?: string;
-  superHavivPhone?: string;
-  superHavivBranchId?: number;
-  superHavivAreaId?: number;
-  superHavivDeliveryFee?: number;
-
-  victoryUsername?: string;
-  victoryPassword?: string;
-  victoryPhone?: string;
-  victoryBranchId?: number;
-  victoryAreaId?: number;
-  victoryDeliveryFee?: number;
-
-  smsLoginPhone?: string;
-
   geminiApiKey: string;
   geminiModel: string;
   chromePath?: string;
@@ -190,8 +142,6 @@ export interface AppConfig {
   dbPath: string;
   sessionFilePath: string;
   haziHinamSessionFilePath: string;
-  superHavivSessionFilePath: string;
-  victorySessionFilePath: string;
   screenshotsDir: string;
   autoRemoveOutOfStock: boolean;
 }
@@ -216,7 +166,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
   );
   if (enabledStores.length === 0) {
     throw new Error(
-      'לא הופעלה אף חנות! הגדירו ENABLED_STORES (למשל shufersal,hazi_hinam,super_haviv,victory) ו/או פרטי התחברות.',
+      'לא הופעלה אף חנות! הגדירו ENABLED_STORES (למשל shufersal,hazi_hinam) ו/או פרטי התחברות.',
     );
   }
 
@@ -228,36 +178,9 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
 
   const haziHinamUsername = data.HAZI_HINAM_USERNAME?.trim() || undefined;
   const haziHinamPassword = data.HAZI_HINAM_PASSWORD || undefined;
-  const superHavivUsername = data.SUPER_HAVIV_USERNAME?.trim() || undefined;
-  const superHavivPassword = data.SUPER_HAVIV_PASSWORD || undefined;
-  const victoryUsername = data.VICTORY_USERNAME?.trim() || undefined;
-  const victoryPassword = data.VICTORY_PASSWORD || undefined;
-
-  const smsLoginPhone = data.SMS_LOGIN_PHONE?.trim()
-    ? (normalizeIsraeliPhone(data.SMS_LOGIN_PHONE) ?? undefined)
-    : undefined;
-  const superHavivPhone =
-    (data.SUPER_HAVIV_PHONE?.trim()
-      ? (normalizeIsraeliPhone(data.SUPER_HAVIV_PHONE) ?? undefined)
-      : undefined) ??
-    (superHavivUsername
-      ? (normalizeIsraeliPhone(superHavivUsername) ?? undefined)
-      : undefined);
-  const victoryPhone =
-    (data.VICTORY_PHONE?.trim()
-      ? (normalizeIsraeliPhone(data.VICTORY_PHONE) ?? undefined)
-      : undefined) ??
-    (victoryUsername
-      ? (normalizeIsraeliPhone(victoryUsername) ?? undefined)
-      : undefined);
 
   const chromePath = detectChromeExecutable();
-  const needsBrowser =
-    enabledStores.includes('shufersal') ||
-    (enabledStores.includes('super_haviv') &&
-      Boolean(superHavivUsername && superHavivPassword)) ||
-    (enabledStores.includes('victory') &&
-      Boolean(victoryUsername && victoryPassword));
+  const needsBrowser = enabledStores.includes('shufersal');
 
   if (needsBrowser && !chromePath && !data.BROWSER_WS_ENDPOINT) {
     throw new Error(
@@ -284,22 +207,6 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
     haziHinamPassword,
     haziHinamDeliveryFee: parseOptionalNumber(data.HAZI_HINAM_DELIVERY_FEE),
 
-    superHavivUsername,
-    superHavivPassword,
-    superHavivPhone,
-    superHavivBranchId: parseOptionalNumber(data.SUPER_HAVIV_BRANCH_ID),
-    superHavivAreaId: parseOptionalNumber(data.SUPER_HAVIV_AREA_ID),
-    superHavivDeliveryFee: parseOptionalNumber(data.SUPER_HAVIV_DELIVERY_FEE),
-
-    victoryUsername,
-    victoryPassword,
-    victoryPhone,
-    victoryBranchId: parseOptionalNumber(data.VICTORY_BRANCH_ID),
-    victoryAreaId: parseOptionalNumber(data.VICTORY_AREA_ID),
-    victoryDeliveryFee: parseOptionalNumber(data.VICTORY_DELIVERY_FEE),
-
-    smsLoginPhone,
-
     geminiApiKey: data.GEMINI_API_KEY,
     geminiModel: data.GEMINI_MODEL,
     chromePath,
@@ -310,8 +217,6 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
     dbPath: path.join(dataDir, 'bot.sqlite'),
     sessionFilePath: path.join(dataDir, 'shufersal-session.json'),
     haziHinamSessionFilePath: path.join(dataDir, 'hazi-hinam-session.json'),
-    superHavivSessionFilePath: path.join(dataDir, 'super-haviv-session.json'),
-    victorySessionFilePath: path.join(dataDir, 'victory-session.json'),
     screenshotsDir,
     autoRemoveOutOfStock: data.AUTO_REMOVE_OUT_OF_STOCK,
   };

@@ -1,10 +1,8 @@
-export type StoreId = 'shufersal' | 'hazi_hinam' | 'super_haviv' | 'victory';
+export type StoreId = 'shufersal' | 'hazi_hinam';
 
 export const ALL_STORE_IDS: readonly StoreId[] = [
   'shufersal',
   'hazi_hinam',
-  'super_haviv',
-  'victory',
 ] as const;
 
 export interface StoreMeta {
@@ -45,39 +43,10 @@ export const STORE_META: Record<StoreId, StoreMeta> = {
     supportsAutoCheckout: false,
     supportsOrderUpdate: false,
   },
-  super_haviv: {
-    id: 'super_haviv',
-    displayName: 'סופר חביב אונליין',
-    shortName: 'סופר חביב',
-    emoji: '🔵',
-    baseUrl: 'https://www.superhaviv.co.il',
-    cartUrl: 'https://www.superhaviv.co.il/cart',
-    defaultDeliveryFee: 34,
-    minimumOrderAmount: 200,
-    supportsAutoCheckout: false,
-    supportsOrderUpdate: false,
-  },
-  victory: {
-    id: 'victory',
-    displayName: 'ויקטורי אונליין',
-    shortName: 'ויקטורי',
-    emoji: '🟠',
-    baseUrl: 'https://www.victoryonline.co.il',
-    cartUrl: 'https://www.victoryonline.co.il/cart',
-    defaultDeliveryFee: 35.9,
-    minimumOrderAmount: 250,
-    supportsAutoCheckout: false,
-    supportsOrderUpdate: false,
-  },
 };
 
 export function isStoreId(value: string): value is StoreId {
-  return (
-    value === 'shufersal' ||
-    value === 'hazi_hinam' ||
-    value === 'super_haviv' ||
-    value === 'victory'
-  );
+  return value === 'shufersal' || value === 'hazi_hinam';
 }
 
 export type SellingMethodCode = 'BY_UNIT' | 'BY_WEIGHT' | 'BY_PACKAGE';
@@ -228,10 +197,6 @@ export interface StoreClient {
   placeOrder(options: { removeMissingItems: boolean }): Promise<CheckoutResult>;
   getAuthWarning?(): string | null;
   isAuthenticated?(): boolean;
-  startSmsOtpLogin?(phoneNumber: string): Promise<{ message: string }>;
-  completeSmsOtpLogin?(
-    otpCode: string,
-  ): Promise<{ message: string; isAuthenticated: boolean }>;
   shutdown(): Promise<void>;
 }
 
