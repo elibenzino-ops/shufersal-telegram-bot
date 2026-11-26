@@ -27,10 +27,15 @@ import {
   type SerializedSessionCookies,
   type ShufersalSellingMethodCode,
 } from './types.js';
+import { TimeoutError, withTimeout } from '../utils/timeout.js';
 
 export const BASE_URL = 'https://www.shufersal.co.il';
 export const WEBAPP_URL = `${BASE_URL}/online/he`;
 const NAVIGATION_TIMEOUT = 35_000;
+export const SHUFERSAL_REQUEST_TIMEOUT_MS = 20_000;
+const HEALTHCHECK_TIMEOUT_MS = 5_000;
+const CLOSE_TIMEOUT_MS = 5_000;
+const PROTOCOL_TIMEOUT_MS = 45_000;
 
 declare global {
   interface Window {
@@ -54,6 +59,7 @@ export interface ShufersalClientOptions {
   headless: boolean;
   sessionFilePath: string;
   screenshotsDir: string;
+  requestTimeoutMs?: number;
 }
 
 interface ApiRequestOptions {
@@ -81,17 +87,32 @@ export class ShufersalClient implements StoreClient {
   readonly storeId = 'shufersal' as const;
   readonly meta = STORE_META.shufersal;
 
+  private readonly requestTimeoutMs: number;
   private browser: Browser | null = null;
   private context: BrowserContext | null = null;
   private page: Page | null = null;
   private csrfToken: string | undefined;
 
-  constructor(private readonly options: ShufersalClientOptions) {}
+  constructor(private readonly options: ShufersalClientOptions) {
+    this.requestTimeoutMs =
+      options.requestTimeoutMs ?? SHUFERSAL_REQUEST_TIMEOUT_MS;
+  }
+
+  private get outerEvaluateTimeoutMs(): number {
+    return (
+      this.requestTimeoutMs +
+      Math.min(3_000, Math.max(25, Math.round(this.requestTimeoutMs * 0.25)))
+    );
+  }
 
   async ensureConnected(): Promise<void> {
     if (this.page && !this.page.isClosed()) {
       try {
-        await this.page.evaluate(() => document.title);
+        await withTimeout(
+          this.page.evaluate(() => document.title),
+          HEALTHCHECK_TIMEOUT_MS,
+          'Shufersal browser healthcheck timed out',
+        );
         return;
       } catch {
         logger.warn('Existing Shufersal browser page became unresponsive; recreating session');
@@ -104,8 +125,18 @@ export class ShufersalClient implements StoreClient {
       throw new Error('Failed to initialize Chromium browser');
     }
 
-    this.context = await this.browser.createBrowserContext();
-    this.page = await this.context.newPage();
+    this.context = await withTimeout(
+      this.browser.createBrowserContext(),
+      NAVIGATION_TIMEOUT,
+      'Timed out creating Shufersal browser context',
+    );
+    this.page = await withTimeout(
+      this.context.newPage(),
+      NAVIGATION_TIMEOUT,
+      'Timed out creating Shufersal browser page',
+    );
+    this.page.setDefaultTimeout(NAVIGATION_TIMEOUT);
+    this.page.setDefaultNavigationTimeout(NAVIGATION_TIMEOUT);
     await this.page.setViewport({ width: 1366, height: 900 });
     try {
       await this.page.emulateTimezone('Asia/Jerusalem');
@@ -132,9 +163,14 @@ export class ShufersalClient implements StoreClient {
 
     if (this.options.browserWsEndpoint) {
       logger.info(`Connecting to remote browser endpoint: ${this.options.browserWsEndpoint}`);
-      this.browser = await puppeteer.connect({
-        browserWSEndpoint: this.options.browserWsEndpoint,
-      });
+      this.browser = await withTimeout(
+        puppeteer.connect({
+          browserWSEndpoint: this.options.browserWsEndpoint,
+          protocolTimeout: PROTOCOL_TIMEOUT_MS,
+        }),
+        NAVIGATION_TIMEOUT,
+        'Timed out connecting to remote Chromium browser',
+      );
       return;
     }
 
@@ -151,11 +187,17 @@ export class ShufersalClient implements StoreClient {
     }
 
     logger.info(`Launching Chromium from: ${this.options.chromePath}`);
-    this.browser = await puppeteer.launch({
-      executablePath: this.options.chromePath,
-      headless: this.options.headless,
-      args: launchArgs,
-    });
+    this.browser = await withTimeout(
+      puppeteer.launch({
+        executablePath: this.options.chromePath,
+        headless: this.options.headless,
+        args: launchArgs,
+        timeout: NAVIGATION_TIMEOUT,
+        protocolTimeout: PROTOCOL_TIMEOUT_MS,
+      }),
+      NAVIGATION_TIMEOUT + 5_000,
+      'Timed out launching Chromium browser',
+    );
   }
 
   private async tryRestoreSavedCookies(): Promise<boolean> {
@@ -219,20 +261,24 @@ export class ShufersalClient implements StoreClient {
   }
 
   private async detectSecurityGate(page: Page): Promise<void> {
-    const gateDetected = await page.evaluate(() => {
-      const html = document.documentElement?.innerHTML?.toLowerCase() ?? '';
-      const title = document.title?.toLowerCase() ?? '';
-      if (
-        title.includes('just a moment') ||
-        title.includes('attention required') ||
-        html.includes('cf-turnstile') ||
-        html.includes('g-recaptcha') ||
-        html.includes('hcaptcha')
-      ) {
-        return true;
-      }
-      return false;
-    });
+    const gateDetected = await withTimeout(
+      page.evaluate(() => {
+        const html = document.documentElement?.innerHTML?.toLowerCase() ?? '';
+        const title = document.title?.toLowerCase() ?? '';
+        if (
+          title.includes('just a moment') ||
+          title.includes('attention required') ||
+          html.includes('cf-turnstile') ||
+          html.includes('g-recaptcha') ||
+          html.includes('hcaptcha')
+        ) {
+          return true;
+        }
+        return false;
+      }),
+      10_000,
+      'Shufersal security gate check timed out',
+    );
 
     if (gateDetected) {
       await this.captureErrorScreenshot('security-gate');
@@ -818,28 +864,55 @@ export class ShufersalClient implements StoreClient {
 
   private async authenticateCheckout(): Promise<CheckoutAuthConfig> {
     if (!this.page) throw new Error('Browser page not initialized');
+    const fetchTimeoutMs = this.requestTimeoutMs;
+    const outerTimeoutMs = this.outerEvaluateTimeoutMs;
 
-    const authForm = await this.page.evaluate(async (url) => {
-      const response = await fetch(url, { credentials: 'include' });
-      if (!response.ok) {
-        throw new Error(`Failed loading checkout auth (${String(response.status)})`);
-      }
-      const doc = new DOMParser().parseFromString(
-        await response.text(),
-        'text/html',
-      );
-      const form = doc.querySelector('form#checkoutPwd');
-      if (!form) return null;
-      const fields: Record<string, string> = {};
-      form.querySelectorAll('input').forEach((input) => {
-        if (input.name) fields[input.name] = input.value;
-      });
-      return {
-        fields,
-        verifyPath: form.getAttribute('action'),
-        submitPath: form.getAttribute('data-action2'),
-      };
-    }, `${WEBAPP_URL}/cart/checkout/auth?redirect_url=%2Fcheckout&checkout_flow=true`);
+    const authForm = await withTimeout(
+      this.page.evaluate(
+        async (url, timeoutMs) => {
+          const controller = new AbortController();
+          const timer = setTimeout(() => controller.abort(), timeoutMs);
+          try {
+            const response = await fetch(url, {
+              credentials: 'include',
+              signal: controller.signal,
+            });
+            if (!response.ok) {
+              throw new Error(`Failed loading checkout auth (${String(response.status)})`);
+            }
+            const doc = new DOMParser().parseFromString(
+              await response.text(),
+              'text/html',
+            );
+            const form = doc.querySelector('form#checkoutPwd');
+            if (!form) return null;
+            const fields: Record<string, string> = {};
+            form.querySelectorAll('input').forEach((input) => {
+              if (input.name) fields[input.name] = input.value;
+            });
+            return {
+              fields,
+              verifyPath: form.getAttribute('action'),
+              submitPath: form.getAttribute('data-action2'),
+            };
+          } catch (err) {
+            if (
+              controller.signal.aborted ||
+              (err instanceof Error && err.name === 'AbortError')
+            ) {
+              throw new Error('SHUFERSAL_REQUEST_TIMEOUT');
+            }
+            throw err;
+          } finally {
+            clearTimeout(timer);
+          }
+        },
+        `${WEBAPP_URL}/cart/checkout/auth?redirect_url=%2Fcheckout&checkout_flow=true`,
+        fetchTimeoutMs,
+      ),
+      outerTimeoutMs,
+      `שופרסל לא הגיב בטעינת אימות הקופה תוך ${Math.ceil(fetchTimeoutMs / 1000)} שניות`,
+    );
 
     if (!authForm?.verifyPath || !authForm.submitPath) {
       throw new Error(
@@ -860,24 +933,44 @@ export class ShufersalClient implements StoreClient {
       j_password: this.options.password,
     };
 
-    const verifyResult = await this.page.evaluate(
-      async (url, formFields) => {
-        const res = await fetch(url, {
-          method: 'POST',
-          credentials: 'include',
-          headers: {
-            'content-type': 'application/x-www-form-urlencoded; charset=UTF-8',
-            'x-requested-with': 'XMLHttpRequest',
-          },
-          body: new URLSearchParams(formFields).toString(),
-        });
-        if (!res.ok) {
-          throw new Error(`Checkout password verification HTTP ${String(res.status)}`);
-        }
-        return (await res.json()) as { success: boolean; message?: string | null };
-      },
-      `${BASE_URL}${authForm.verifyPath}`,
-      fields,
+    const verifyResult = await withTimeout(
+      this.page.evaluate(
+        async (url, formFields, timeoutMs) => {
+          const controller = new AbortController();
+          const timer = setTimeout(() => controller.abort(), timeoutMs);
+          try {
+            const res = await fetch(url, {
+              method: 'POST',
+              credentials: 'include',
+              headers: {
+                'content-type': 'application/x-www-form-urlencoded; charset=UTF-8',
+                'x-requested-with': 'XMLHttpRequest',
+              },
+              body: new URLSearchParams(formFields).toString(),
+              signal: controller.signal,
+            });
+            if (!res.ok) {
+              throw new Error(`Checkout password verification HTTP ${String(res.status)}`);
+            }
+            return (await res.json()) as { success: boolean; message?: string | null };
+          } catch (err) {
+            if (
+              controller.signal.aborted ||
+              (err instanceof Error && err.name === 'AbortError')
+            ) {
+              throw new Error('SHUFERSAL_REQUEST_TIMEOUT');
+            }
+            throw err;
+          } finally {
+            clearTimeout(timer);
+          }
+        },
+        `${BASE_URL}${authForm.verifyPath}`,
+        fields,
+        fetchTimeoutMs,
+      ),
+      outerTimeoutMs,
+      `שופרסל לא הגיב באימות הסיסמה בקופה תוך ${Math.ceil(fetchTimeoutMs / 1000)} שניות`,
     );
 
     if (!verifyResult.success) {
@@ -886,36 +979,56 @@ export class ShufersalClient implements StoreClient {
       );
     }
 
-    const checkoutPage = await this.page.evaluate(
-      async (url, formFields) => {
-        const res = await fetch(url, {
-          method: 'POST',
-          credentials: 'include',
-          headers: { 'content-type': 'application/x-www-form-urlencoded' },
-          body: new URLSearchParams(formFields).toString(),
-        });
-        const html = await res.text();
-        const csrfToken = html.match(/CSRFToken\s*[:=]\s*["']([^"']+)["']/)?.[1];
-        if (csrfToken && window.ACC?.config) {
-          window.ACC.config.CSRFToken = csrfToken;
-        }
-        const doc = new DOMParser().parseFromString(html, 'text/html');
-        return {
-          url: res.url,
-          csrfToken,
-          threeDSecureEnabled: html.match(
-            /miglog\.threeDSecure\.enabled\s*=\s*(true|false)/,
-          )?.[1],
-          threeDSecureTestMode: html.match(
-            /miglog\.threeDSecure\.isTestMode\s*=\s*(true|false)/,
-          )?.[1],
-          paymeScriptUrls: Array.from(doc.querySelectorAll('script[src]'))
-            .map((s) => s.getAttribute('src') ?? '')
-            .filter((src) => src.includes('paymeservice.com')),
-        };
-      },
-      `${BASE_URL}${authForm.submitPath}`,
-      fields,
+    const checkoutPage = await withTimeout(
+      this.page.evaluate(
+        async (url, formFields, timeoutMs) => {
+          const controller = new AbortController();
+          const timer = setTimeout(() => controller.abort(), timeoutMs);
+          try {
+            const res = await fetch(url, {
+              method: 'POST',
+              credentials: 'include',
+              headers: { 'content-type': 'application/x-www-form-urlencoded' },
+              body: new URLSearchParams(formFields).toString(),
+              signal: controller.signal,
+            });
+            const html = await res.text();
+            const csrfToken = html.match(/CSRFToken\s*[:=]\s*["']([^"']+)["']/)?.[1];
+            if (csrfToken && window.ACC?.config) {
+              window.ACC.config.CSRFToken = csrfToken;
+            }
+            const doc = new DOMParser().parseFromString(html, 'text/html');
+            return {
+              url: res.url,
+              csrfToken,
+              threeDSecureEnabled: html.match(
+                /miglog\.threeDSecure\.enabled\s*=\s*(true|false)/,
+              )?.[1],
+              threeDSecureTestMode: html.match(
+                /miglog\.threeDSecure\.isTestMode\s*=\s*(true|false)/,
+              )?.[1],
+              paymeScriptUrls: Array.from(doc.querySelectorAll('script[src]'))
+                .map((s) => s.getAttribute('src') ?? '')
+                .filter((src) => src.includes('paymeservice.com')),
+            };
+          } catch (err) {
+            if (
+              controller.signal.aborted ||
+              (err instanceof Error && err.name === 'AbortError')
+            ) {
+              throw new Error('SHUFERSAL_REQUEST_TIMEOUT');
+            }
+            throw err;
+          } finally {
+            clearTimeout(timer);
+          }
+        },
+        `${BASE_URL}${authForm.submitPath}`,
+        fields,
+        fetchTimeoutMs,
+      ),
+      outerTimeoutMs,
+      `שופרסל לא הגיב בטעינת דף הקופה תוך ${Math.ceil(fetchTimeoutMs / 1000)} שניות`,
     );
 
     if (!checkoutPage.url.includes('/miglog-checkout')) {
@@ -943,24 +1056,28 @@ export class ShufersalClient implements StoreClient {
     if (!config.threeDSecureEnabled || !this.page) return '';
     if (config.paymeScriptUrls.length === 0) return '';
 
-    const hash = await this.page.evaluate(
-      async (scriptUrls, isTestMode) => {
-        if (!window.PayMe) {
-          for (const src of scriptUrls) {
-            await new Promise<void>((resolve, reject) => {
-              const script = document.createElement('script');
-              script.src = src;
-              script.onload = () => resolve();
-              script.onerror = () => reject(new Error(`Failed loading ${src}`));
-              document.head.appendChild(script);
-            });
+    const hash = await withTimeout(
+      this.page.evaluate(
+        async (scriptUrls, isTestMode) => {
+          if (!window.PayMe) {
+            for (const src of scriptUrls) {
+              await new Promise<void>((resolve, reject) => {
+                const script = document.createElement('script');
+                script.src = src;
+                script.onload = () => resolve();
+                script.onerror = () => reject(new Error(`Failed loading ${src}`));
+                document.head.appendChild(script);
+              });
+            }
           }
-        }
-        const data = await window.PayMe?.clientData(isTestMode);
-        return data?.hash ?? '';
-      },
-      config.paymeScriptUrls,
-      config.threeDSecureTestMode,
+          const data = await window.PayMe?.clientData(isTestMode);
+          return data?.hash ?? '';
+        },
+        config.paymeScriptUrls,
+        config.threeDSecureTestMode,
+      ),
+      this.outerEvaluateTimeoutMs,
+      'טעינת אימות PayMe בשופרסל ארכה יותר מדי זמן',
     );
 
     return encodeURIComponent(hash);
@@ -1006,12 +1123,20 @@ export class ShufersalClient implements StoreClient {
     if (this.csrfToken) return this.csrfToken;
     if (!this.page) throw new Error('Browser page not initialized');
 
-    const handle = await this.page.waitForFunction(
-      () => window.ACC?.config?.CSRFToken,
-      { timeout: 10_000 },
+    const handle = await withTimeout(
+      this.page.waitForFunction(
+        () => window.ACC?.config?.CSRFToken,
+        { timeout: 10_000 },
+      ),
+      12_000,
+      'Shufersal CSRFToken wait timed out',
     );
-    const token = await handle.jsonValue();
-    await handle.dispose();
+    const token = await withTimeout(
+      handle.jsonValue(),
+      5_000,
+      'Shufersal CSRFToken read timed out',
+    );
+    await handle.dispose().catch(() => {});
     if (!token) {
       throw new Error('CSRFToken not found on Shufersal page');
     }
@@ -1051,6 +1176,10 @@ export class ShufersalClient implements StoreClient {
     options: ApiRequestOptions,
     format: ResponseFormat,
   ): Promise<unknown> {
+    const fetchTimeoutMs = this.requestTimeoutMs;
+    const outerTimeoutMs = this.outerEvaluateTimeoutMs;
+    const shortPath = options.path.split('?')[0];
+
     const executeOnce = async (): Promise<unknown> => {
       if (!this.page) throw new Error('Browser page not initialized');
       const csrfToken =
@@ -1060,134 +1189,172 @@ export class ShufersalClient implements StoreClient {
         ? options.path
         : `${WEBAPP_URL}${options.path}`;
 
-      const result = await this.page.evaluate(
-        async (url, method, body, form, csrf, responseFormat) => {
-          const headers: Record<string, string> = {
-            accept:
-              responseFormat === 'json'
-                ? 'application/json, text/plain, */*'
-                : 'text/html, */*; q=0.01',
-            'x-requested-with': 'XMLHttpRequest',
-          };
-
-          if (form) {
-            headers['content-type'] =
-              'application/x-www-form-urlencoded; charset=UTF-8';
-          } else if (body !== undefined) {
-            headers['content-type'] = 'application/json';
-          }
-
-          if (csrf) {
-            headers['csrftoken'] = csrf;
-          }
-
-          let requestBody: string | undefined;
-          if (form) {
-            requestBody = new URLSearchParams(form).toString();
-          } else if (body !== undefined) {
-            requestBody = JSON.stringify(body);
-          }
-
-          const response = await fetch(url, {
-            method,
-            headers,
-            body: requestBody,
-            mode: 'cors',
-            credentials: 'include',
-            redirect: responseFormat === 'page' ? 'follow' : 'manual',
-          });
-
-          if (
-            response.type === 'opaqueredirect' ||
-            (response.status >= 300 && response.status < 400)
-          ) {
-            const loc = response.headers.get('location') ?? '';
-            if (loc.includes('/login') || response.type === 'opaqueredirect') {
-              throw new Error('REDIRECT_TO_LOGIN');
-            }
-          }
-
-          if (!response.ok) {
-            const errText = (await response.text().catch(() => '')).slice(0, 300);
-            throw new Error(
-              `HTTP ${String(response.status)} ${response.statusText}: ${errText}`,
-            );
-          }
-
-          const contentType = response.headers.get('content-type') ?? '';
-
-          if (responseFormat === 'cart') {
-            const html = await response.text();
-            const doc = new DOMParser().parseFromString(html, 'text/html');
-            const articles = Array.from(
-              doc.querySelectorAll('article[data-product-code]'),
-            ).map((el) => {
-              const priceText =
-                (
-                  el.querySelector('.miglog-prod-totalPrize')?.textContent ?? ''
-                ).trim() || '0';
-
-              const nameFromDom =
-                el.querySelector('.miglog-prod-name, .text.description, h3, h4')
-                  ?.textContent?.trim() ||
-                el.querySelector('img')?.getAttribute('alt')?.trim() ||
-                undefined;
-
-              return {
-                productCode: el.getAttribute('data-product-code') ?? '',
-                productName: nameFromDom,
-                quantity: parseFloat(el.getAttribute('data-entry-qty') ?? '0'),
-                entryNumber: parseInt(
-                  el.getAttribute('data-entry-number') ?? '0',
-                  10,
-                ),
-                itemPrice: parseFloat(priceText.replace(/[^\d.]/g, '')) || 0,
-                isOutOfStock: el.classList.contains(
-                  'miglog-cart-prod-notInStock',
-                ),
-                sellingMethod:
-                  el.getAttribute('data-selling-method') ?? undefined,
+      try {
+        const result = await withTimeout(
+          this.page.evaluate(
+            async (url, method, body, form, csrf, responseFormat, timeoutMs) => {
+              const headers: Record<string, string> = {
+                accept:
+                  responseFormat === 'json'
+                    ? 'application/json, text/plain, */*'
+                    : 'text/html, */*; q=0.01',
+                'x-requested-with': 'XMLHttpRequest',
               };
-            });
 
-            const modificationsScript =
-              Array.from(doc.querySelectorAll('script'))
-                .map((s) => s.textContent ?? '')
-                .find((t) => t.includes('miglog.cart.modifications')) ?? null;
+              if (form) {
+                headers['content-type'] =
+                  'application/x-www-form-urlencoded; charset=UTF-8';
+              } else if (body !== undefined) {
+                headers['content-type'] = 'application/json';
+              }
 
-            return {
-              articles,
-              bodyText: doc.body?.textContent ?? '',
-              modificationsScript,
-            };
-          }
+              if (csrf) {
+                headers['csrftoken'] = csrf;
+              }
 
-          if (responseFormat === 'page') {
-            return {
-              url: response.url,
-              html: await response.text(),
-            };
-          }
+              let requestBody: string | undefined;
+              if (form) {
+                requestBody = new URLSearchParams(form).toString();
+              } else if (body !== undefined) {
+                requestBody = JSON.stringify(body);
+              }
 
-          if (contentType.includes('application/json')) {
-            return (await response.json()) as unknown;
-          }
-          const rawText = await response.text();
-          try {
-            return JSON.parse(rawText) as unknown;
-          } catch {
-            return undefined;
-          }
-        },
-        fullUrl,
-        options.method,
-        options.body,
-        options.form,
-        csrfToken,
-        format,
-      );
+              const controller = new AbortController();
+              const timer = setTimeout(() => controller.abort(), timeoutMs);
 
-      return result;
+              try {
+                const response = await fetch(url, {
+                  method,
+                  headers,
+                  body: requestBody,
+                  mode: 'cors',
+                  credentials: 'include',
+                  redirect: responseFormat === 'page' ? 'follow' : 'manual',
+                  signal: controller.signal,
+                });
+
+                if (
+                  response.type === 'opaqueredirect' ||
+                  (response.status >= 300 && response.status < 400)
+                ) {
+                  const loc = response.headers.get('location') ?? '';
+                  if (loc.includes('/login') || response.type === 'opaqueredirect') {
+                    throw new Error('REDIRECT_TO_LOGIN');
+                  }
+                }
+
+                if (!response.ok) {
+                  const errText = (await response.text().catch(() => '')).slice(0, 300);
+                  throw new Error(
+                    `HTTP ${String(response.status)} ${response.statusText}: ${errText}`,
+                  );
+                }
+
+                const contentType = response.headers.get('content-type') ?? '';
+
+                if (responseFormat === 'cart') {
+                  const html = await response.text();
+                  const doc = new DOMParser().parseFromString(html, 'text/html');
+                  const articles = Array.from(
+                    doc.querySelectorAll('article[data-product-code]'),
+                  ).map((el) => {
+                    const priceText =
+                      (
+                        el.querySelector('.miglog-prod-totalPrize')?.textContent ?? ''
+                      ).trim() || '0';
+
+                    const nameFromDom =
+                      el.querySelector('.miglog-prod-name, .text.description, h3, h4')
+                        ?.textContent?.trim() ||
+                      el.querySelector('img')?.getAttribute('alt')?.trim() ||
+                      undefined;
+
+                    return {
+                      productCode: el.getAttribute('data-product-code') ?? '',
+                      productName: nameFromDom,
+                      quantity: parseFloat(el.getAttribute('data-entry-qty') ?? '0'),
+                      entryNumber: parseInt(
+                        el.getAttribute('data-entry-number') ?? '0',
+                        10,
+                      ),
+                      itemPrice: parseFloat(priceText.replace(/[^\d.]/g, '')) || 0,
+                      isOutOfStock: el.classList.contains(
+                        'miglog-cart-prod-notInStock',
+                      ),
+                      sellingMethod:
+                        el.getAttribute('data-selling-method') ?? undefined,
+                    };
+                  });
+
+                  const modificationsScript =
+                    Array.from(doc.querySelectorAll('script'))
+                      .map((s) => s.textContent ?? '')
+                      .find((t) => t.includes('miglog.cart.modifications')) ?? null;
+
+                  return {
+                    articles,
+                    bodyText: doc.body?.textContent ?? '',
+                    modificationsScript,
+                  };
+                }
+
+                if (responseFormat === 'page') {
+                  return {
+                    url: response.url,
+                    html: await response.text(),
+                  };
+                }
+
+                if (contentType.includes('application/json')) {
+                  return (await response.json()) as unknown;
+                }
+                const rawText = await response.text();
+                try {
+                  return JSON.parse(rawText) as unknown;
+                } catch {
+                  return undefined;
+                }
+              } catch (fetchErr) {
+                if (
+                  controller.signal.aborted ||
+                  (fetchErr instanceof Error && fetchErr.name === 'AbortError')
+                ) {
+                  throw new Error('SHUFERSAL_REQUEST_TIMEOUT');
+                }
+                throw fetchErr;
+              } finally {
+                clearTimeout(timer);
+              }
+            },
+            fullUrl,
+            options.method,
+            options.body,
+            options.form,
+            csrfToken,
+            format,
+            fetchTimeoutMs,
+          ),
+          outerTimeoutMs,
+          `שופרסל לא הגיב תוך ${Math.ceil(fetchTimeoutMs / 1000)} שניות (${options.method} ${shortPath})`,
+        );
+
+        return result;
+      } catch (err) {
+        if (err instanceof TimeoutError) {
+          logger.warn(
+            `Shufersal Chromium page.evaluate hung on ${options.method} ${shortPath} (${outerTimeoutMs}ms); resetting browser session`,
+          );
+          await this.closeSessionOnly();
+          throw err;
+        }
+        if (err instanceof Error && err.message.includes('SHUFERSAL_REQUEST_TIMEOUT')) {
+          throw new TimeoutError(
+            `שופרסל לא הגיב תוך ${Math.ceil(fetchTimeoutMs / 1000)} שניות (${options.method} ${shortPath})`,
+            fetchTimeoutMs,
+          );
+        }
+        throw err;
+      }
     };
 
     try {
@@ -1212,7 +1379,11 @@ export class ShufersalClient implements StoreClient {
     try {
       const filename = `${tag}-${Date.now()}.png`;
       const fullPath = path.join(this.options.screenshotsDir, filename);
-      await this.page.screenshot({ path: fullPath });
+      await withTimeout(
+        this.page.screenshot({ path: fullPath }),
+        CLOSE_TIMEOUT_MS,
+        'Shufersal error screenshot timed out',
+      );
       logger.info(`Saved diagnostic screenshot: ${fullPath}`);
       return fullPath;
     } catch {
@@ -1221,25 +1392,37 @@ export class ShufersalClient implements StoreClient {
   }
 
   private async closeSessionOnly(): Promise<void> {
-    try {
-      await this.context?.close();
-    } catch {
-      // Ignore disconnect errors
-    }
+    const ctx = this.context;
     this.context = null;
     this.page = null;
     this.csrfToken = undefined;
+    if (ctx) {
+      try {
+        await withTimeout(
+          ctx.close(),
+          CLOSE_TIMEOUT_MS,
+          'Timed out closing Shufersal browser context',
+        );
+      } catch {
+        // Ignore disconnect or close timeout errors
+      }
+    }
   }
 
   async shutdown(): Promise<void> {
     await this.closeSessionOnly();
-    if (this.browser && !this.options.browserWsEndpoint) {
+    const browser = this.browser;
+    this.browser = null;
+    if (browser && !this.options.browserWsEndpoint) {
       try {
-        await this.browser.close();
+        await withTimeout(
+          browser.close(),
+          CLOSE_TIMEOUT_MS,
+          'Timed out closing Shufersal browser process',
+        );
       } catch {
         // Ignore browser shutdown errors
       }
     }
-    this.browser = null;
   }
 }

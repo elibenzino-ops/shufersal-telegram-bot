@@ -3,6 +3,11 @@ import fs from 'node:fs';
 import { logger } from '../logger.js';
 import { formatCurrency } from '../utils/format.js';
 import {
+  fetchTextWithTimeout,
+  isTimeoutError,
+  type TimedTextResponse,
+} from '../utils/timeout.js';
+import {
   STORE_META,
   StoreAuthError,
   StoreManualVerificationRequiredError,
@@ -23,7 +28,7 @@ export const HAZI_HINAM_AUTH_URL = 'https://auth.hazi-hinam.co.il';
 const DEFAULT_USER_AGENT =
   'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36';
 
-const HTTP_TIMEOUT_MS = 15_000;
+export const HAZI_HINAM_HTTP_TIMEOUT_MS = 15_000;
 
 export interface HaziHinamClientOptions {
   username?: string;
@@ -33,6 +38,7 @@ export interface HaziHinamClientOptions {
   authBaseUrl?: string;
   defaultDeliveryFee?: number;
   fetchFn?: typeof fetch;
+  httpTimeoutMs?: number;
 }
 
 interface PersistedHaziSession {
@@ -286,6 +292,7 @@ export class HaziHinamClient implements StoreClient {
   private readonly baseUrl: string;
   private readonly authBaseUrl: string;
   private readonly fetchFn: typeof fetch;
+  private readonly httpTimeoutMs: number;
   private readonly defaultDeliveryFee: number | null;
 
   private accessToken: string | null = null;
@@ -305,6 +312,7 @@ export class HaziHinamClient implements StoreClient {
       '',
     );
     this.fetchFn = options.fetchFn ?? fetch;
+    this.httpTimeoutMs = options.httpTimeoutMs ?? HAZI_HINAM_HTTP_TIMEOUT_MS;
     this.defaultDeliveryFee =
       options.defaultDeliveryFee ?? STORE_META.hazi_hinam.defaultDeliveryFee;
   }
@@ -316,22 +324,15 @@ export class HaziHinamClient implements StoreClient {
   private async fetchWithTimeout(
     url: string,
     init?: RequestInit,
-  ): Promise<Response> {
-    const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), HTTP_TIMEOUT_MS);
-    try {
-      return await this.fetchFn(url, {
-        ...init,
-        signal: init?.signal ?? controller.signal,
-      });
-    } catch (err) {
-      if (err instanceof Error && err.name === 'AbortError') {
-        throw new Error(`חצי חינם לא הגיב תוך ${HTTP_TIMEOUT_MS / 1000} שניות`);
-      }
-      throw err;
-    } finally {
-      clearTimeout(timer);
-    }
+  ): Promise<TimedTextResponse> {
+    const secs = Math.max(1, Math.ceil(this.httpTimeoutMs / 1000));
+    return fetchTextWithTimeout(
+      this.fetchFn,
+      url,
+      init,
+      this.httpTimeoutMs,
+      `חצי חינם לא הגיב תוך ${secs} שניות`,
+    );
   }
 
   private baseHeaders(includeAuth = true): Record<string, string> {
@@ -514,7 +515,7 @@ export class HaziHinamClient implements StoreClient {
       body: form.toString(),
     });
 
-    const rawText = await res.text();
+    const rawText = res.text;
     let parsed: Record<string, unknown> = {};
     try {
       parsed = JSON.parse(rawText) as Record<string, unknown>;
@@ -571,7 +572,12 @@ export class HaziHinamClient implements StoreClient {
       throw new Error(`Hazi Hinam /proxy/init failed with HTTP ${res.status}`);
     }
 
-    const data = (await res.json()) as Record<string, unknown>;
+    let data: Record<string, unknown>;
+    try {
+      data = JSON.parse(res.text) as Record<string, unknown>;
+    } catch {
+      throw new Error('Hazi Hinam /proxy/init returned invalid JSON');
+    }
     const results = (data['Results'] ?? data['results'] ?? {}) as Record<
       string,
       unknown
@@ -614,7 +620,7 @@ export class HaziHinamClient implements StoreClient {
       return this.apiFetchJson(path, init, false);
     }
 
-    const text = await res.text();
+    const text = res.text;
     if (!res.ok) {
       throw new Error(`Hazi Hinam ${path} failed (HTTP ${res.status}): ${text.slice(0, 180)}`);
     }
@@ -740,7 +746,11 @@ export class HaziHinamClient implements StoreClient {
           // If server returned empty/partial cart in guest mode while we have tracked additions, keep tracked state
           return this.buildTrackedCartState();
         }
-      } catch {
+      } catch (err) {
+        if (isTimeoutError(err)) {
+          logger.warn('Hazi Hinam getCart timed out; returning locally tracked cart state');
+          break;
+        }
         // try next endpoint shape
       }
     }
@@ -750,6 +760,8 @@ export class HaziHinamClient implements StoreClient {
   async setItemsInCart(items: AddCartItemInput[]): Promise<CartState> {
     await this.ensureAuthenticated();
     const isBatch = items.length > 1;
+    let consecutiveTimeouts = 0;
+    let skipRemainingNetwork = false;
 
     for (const item of items) {
       const numericId = Number(item.productCode);
@@ -761,46 +773,69 @@ export class HaziHinamClient implements StoreClient {
       const known = this.knownProducts.get(item.productCode);
       const existing = this.trackedCart.get(item.productCode);
 
-      const body: Record<string, unknown> = {
-        Object: {
-          ItemId: Number.isFinite(numericId) && numericId > 0 ? numericId : item.productCode,
-          Quantity: cleanQty,
-          ...(item.comment ? { Remarks: item.comment } : {}),
-        },
-      };
+      if (!skipRemainingNetwork) {
+        const body: Record<string, unknown> = {
+          Object: {
+            ItemId: Number.isFinite(numericId) && numericId > 0 ? numericId : item.productCode,
+            Quantity: cleanQty,
+            ...(item.comment ? { Remarks: item.comment } : {}),
+          },
+        };
 
-      try {
-        const resp = await this.apiFetchJson('/proxy/api/item/addItemToCart', {
-          method: 'POST',
-          body,
-        });
+        try {
+          const resp = await this.apiFetchJson('/proxy/api/item/addItemToCart', {
+            method: 'POST',
+            body,
+          });
+          consecutiveTimeouts = 0;
 
-        if (resp['IsOK'] === false) {
-          const errInfo = JSON.stringify(resp['ErrorResponse'] ?? resp).slice(0, 180);
-          if (isBatch) {
+          if (resp['IsOK'] === false) {
+            const errInfo = JSON.stringify(resp['ErrorResponse'] ?? resp).slice(0, 180);
+            if (isBatch) {
+              logger.warn(
+                `Hazi Hinam rejected batch item ${item.productCode}: ${errInfo}`,
+              );
+              continue;
+            }
+            throw new Error(`חצי חינם דחה את הוספת המוצר (${item.productCode}): ${errInfo}`);
+          }
+        } catch (err) {
+          const timedOut = isTimeoutError(err);
+          if (timedOut) {
+            consecutiveTimeouts++;
+          } else {
+            consecutiveTimeouts = 0;
+          }
+
+          if (!isBatch) {
+            throw err;
+          }
+
+          if (timedOut && consecutiveTimeouts >= 2) {
+            if (!this.isGuestSession) {
+              logger.warn(
+                'Hazi Hinam timed out repeatedly during authenticated batch cart sync; aborting batch',
+              );
+              throw err;
+            }
             logger.warn(
-              `Hazi Hinam rejected batch item ${item.productCode}: ${errInfo}`,
+              'Hazi Hinam timed out repeatedly during guest batch sync; tracking remaining items locally',
+            );
+            skipRemainingNetwork = true;
+          } else if (!this.isGuestSession) {
+            logger.warn(
+              `Hazi Hinam failed adding batch item ${item.productCode}; continuing batch`,
+              err,
             );
             continue;
+          } else {
+            // In guest mode, if addItemToCart endpoint fails, still keep tracked live price for comparison
+            logger.warn(
+              `Hazi Hinam guest addItemToCart failed for ${item.productCode}; tracking locally`,
+              err,
+            );
           }
-          throw new Error(`חצי חינם דחה את הוספת המוצר (${item.productCode}): ${errInfo}`);
         }
-      } catch (err) {
-        if (isBatch && !this.isGuestSession) {
-          logger.warn(
-            `Hazi Hinam failed adding batch item ${item.productCode}; continuing batch`,
-            err,
-          );
-          continue;
-        }
-        if (!isBatch) {
-          throw err;
-        }
-        // In guest mode, if addItemToCart endpoint fails, still keep tracked live price for comparison
-        logger.warn(
-          `Hazi Hinam guest addItemToCart failed for ${item.productCode}; tracking locally`,
-          err,
-        );
       }
 
       this.trackedCart.set(item.productCode, {
@@ -813,6 +848,9 @@ export class HaziHinamClient implements StoreClient {
       });
     }
 
+    if (skipRemainingNetwork) {
+      return this.buildTrackedCartState();
+    }
     return this.getCartState();
   }
 
@@ -844,6 +882,7 @@ export class HaziHinamClient implements StoreClient {
       Number.isFinite(numericId) && numericId > 0 ? numericId : productCode;
 
     let removedOnServer = false;
+    let timedOut = false;
     for (const attempt of [
       {
         path: '/proxy/api/item/removeItemFromCart',
@@ -863,7 +902,11 @@ export class HaziHinamClient implements StoreClient {
           removedOnServer = true;
           break;
         }
-      } catch {
+      } catch (err) {
+        if (isTimeoutError(err)) {
+          timedOut = true;
+          break;
+        }
         // try fallback endpoint
       }
     }
@@ -872,6 +915,9 @@ export class HaziHinamClient implements StoreClient {
       logger.warn(`Hazi Hinam server removal fallback used for item ${productCode}`);
     }
     this.trackedCart.delete(productCode);
+    if (timedOut) {
+      return this.buildTrackedCartState();
+    }
     return this.getCartState();
   }
 
@@ -882,10 +928,12 @@ export class HaziHinamClient implements StoreClient {
         method: 'POST',
         body: {},
       });
-    } catch {
-      const codes = [...this.trackedCart.keys()];
-      for (const code of codes) {
-        await this.removeFromCart(code).catch(() => {});
+    } catch (err) {
+      if (!isTimeoutError(err)) {
+        const codes = [...this.trackedCart.keys()];
+        for (const code of codes) {
+          await this.removeFromCart(code).catch(() => {});
+        }
       }
     }
     this.trackedCart.clear();

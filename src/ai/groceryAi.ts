@@ -1,6 +1,7 @@
 import { GoogleGenAI, Type } from '@google/genai';
 import { logger } from '../logger.js';
 import type { CatalogProduct } from '../shufersal/types.js';
+import { TimeoutError, withTimeout } from '../utils/timeout.js';
 
 export interface ParsedGroceryItem {
   rawText: string;
@@ -23,8 +24,33 @@ export interface ProductSelectionResult {
   reason?: string;
 }
 
+export interface GroceryAiOptions {
+  requestTimeoutMs?: number;
+  transientCooldownMs?: number;
+}
+
 export const DEFAULT_GEMINI_MODEL = 'gemini-3.8-flash';
 const QUOTA_FALLBACK_MODELS = ['gemini-2.5-flash-lite', 'gemini-2.0-flash-lite'];
+export const GEMINI_REQUEST_TIMEOUT_MS = 12_000;
+export const GEMINI_TRANSIENT_COOLDOWN_MS = 60_000;
+
+export function isGeminiTransientError(errorMessage: string): boolean {
+  const lower = errorMessage.toLowerCase();
+  return (
+    errorMessage.includes('503') ||
+    errorMessage.includes('504') ||
+    errorMessage.includes('UNAVAILABLE') ||
+    errorMessage.includes('DEADLINE_EXCEEDED') ||
+    errorMessage.includes('GEMINI_REQUEST_TIMEOUT') ||
+    lower.includes('high demand') ||
+    lower.includes('overloaded') ||
+    lower.includes('temporarily unavailable') ||
+    lower.includes('service unavailable') ||
+    lower.includes('timed out') ||
+    lower.includes('timeout') ||
+    lower.includes('aborted')
+  );
+}
 
 export function extractRecommendedGeminiModel(errorMessage: string): string | null {
   // Matches e.g. "Please update your code to use models/gemini-3.8-flash"
@@ -157,12 +183,32 @@ function scoreCandidateMatch(query: string, candidate: CatalogProduct): number {
 export class GroceryAiService {
   private readonly ai: GoogleGenAI;
   private activeModel: string;
+  private readonly requestTimeoutMs: number;
+  private readonly transientCooldownMs: number;
   private readonly unavailableModels = new Set<string>();
+  private readonly modelCooldownUntil = new Map<string, number>();
   private quotaExhaustedUntil = 0;
   private quotaWarningLoggedUntil = 0;
+  private transientUnavailableUntil = 0;
+  private transientWarningLoggedUntil = 0;
 
-  constructor(apiKey: string, model: string = DEFAULT_GEMINI_MODEL) {
-    this.ai = new GoogleGenAI({ apiKey });
+  constructor(
+    apiKey: string,
+    model: string = DEFAULT_GEMINI_MODEL,
+    options?: GroceryAiOptions,
+  ) {
+    this.requestTimeoutMs =
+      options?.requestTimeoutMs ?? GEMINI_REQUEST_TIMEOUT_MS;
+    this.transientCooldownMs =
+      options?.transientCooldownMs ?? GEMINI_TRANSIENT_COOLDOWN_MS;
+    this.ai = new GoogleGenAI({
+      apiKey,
+      httpOptions: {
+        timeout: this.requestTimeoutMs,
+        // Disable @google/genai's 5-attempt exponential backoff (up to 60s/retry) so 429/503 fail fast into our fallback & cooldown
+        retryOptions: { attempts: 1 },
+      },
+    });
     this.activeModel = model.trim() || DEFAULT_GEMINI_MODEL;
   }
 
@@ -174,6 +220,54 @@ export class GroceryAiService {
     return Date.now() < this.quotaExhaustedUntil;
   }
 
+  isTemporarilyUnavailable(): boolean {
+    return Date.now() < this.transientUnavailableUntil;
+  }
+
+  isInCooldown(): boolean {
+    return this.isQuotaExhausted() || this.isTemporarilyUnavailable();
+  }
+
+  private pickAvailablePrimaryModel(): string {
+    const now = Date.now();
+    if (
+      !this.unavailableModels.has(this.activeModel) &&
+      now >= (this.modelCooldownUntil.get(this.activeModel) ?? 0)
+    ) {
+      return this.activeModel;
+    }
+
+    const candidates = [
+      ...QUOTA_FALLBACK_MODELS,
+      DEFAULT_GEMINI_MODEL,
+    ];
+    for (const candidate of candidates) {
+      if (
+        !this.unavailableModels.has(candidate) &&
+        now >= (this.modelCooldownUntil.get(candidate) ?? 0)
+      ) {
+        return candidate;
+      }
+    }
+    return this.activeModel;
+  }
+
+  private activateTransientCooldown(reasonMsg: string): never {
+    const parsedDelay = extractRetryDelayMs(reasonMsg);
+    const cooldownMs = parsedDelay
+      ? Math.min(Math.max(parsedDelay, 15_000), 180_000)
+      : this.transientCooldownMs;
+    this.transientUnavailableUntil = Date.now() + cooldownMs;
+    if (Date.now() >= this.transientWarningLoggedUntil) {
+      this.transientWarningLoggedUntil = this.transientUnavailableUntil;
+      const secs = Math.ceil(cooldownMs / 1000);
+      logger.warn(
+        `Gemini API temporarily unavailable (${reasonMsg.slice(0, 140)}); using fast local Hebrew matching for the next ~${secs}s`,
+      );
+    }
+    throw new Error('GEMINI_TRANSIENT_COOLDOWN');
+  }
+
   private async generateWithAutoFallback(params: {
     contents: string;
     config: Record<string, unknown>;
@@ -181,16 +275,38 @@ export class GroceryAiService {
     if (this.isQuotaExhausted()) {
       throw new Error('GEMINI_QUOTA_COOLDOWN');
     }
+    if (this.isTemporarilyUnavailable()) {
+      throw new Error('GEMINI_TRANSIENT_COOLDOWN');
+    }
 
-    const tryCall = (modelName: string) =>
-      this.ai.models.generateContent({
+    const deadline = Date.now() + this.requestTimeoutMs;
+    const primaryModel = this.pickAvailablePrimaryModel();
+
+    const tryCall = (modelName: string, timeoutMs: number) => {
+      const callTimeout = Math.max(1, Math.round(timeoutMs));
+      const controller = new AbortController();
+      const reqPromise = this.ai.models.generateContent({
         model: modelName,
         contents: params.contents,
-        config: params.config,
+        config: {
+          ...params.config,
+          abortSignal: controller.signal,
+          httpOptions: {
+            timeout: callTimeout,
+            retryOptions: { attempts: 1 },
+          },
+        },
       });
+      return withTimeout(
+        reqPromise,
+        callTimeout,
+        `GEMINI_REQUEST_TIMEOUT: Gemini "${modelName}" timed out after ${callTimeout}ms`,
+        () => controller.abort(),
+      );
+    };
 
     try {
-      return await tryCall(this.activeModel);
+      return await tryCall(primaryModel, this.requestTimeoutMs);
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
       const isModelNotFound =
@@ -199,15 +315,21 @@ export class GroceryAiService {
         msg.includes('no longer available');
 
       if (isModelNotFound) {
-        this.unavailableModels.add(this.activeModel);
+        this.unavailableModels.add(primaryModel);
         const suggested =
           extractRecommendedGeminiModel(msg) ?? DEFAULT_GEMINI_MODEL;
-        if (suggested && suggested !== this.activeModel && !this.unavailableModels.has(suggested)) {
+        const remaining = deadline - Date.now();
+        if (
+          remaining > 0 &&
+          suggested &&
+          suggested !== primaryModel &&
+          !this.unavailableModels.has(suggested)
+        ) {
           logger.warn(
-            `Gemini model "${this.activeModel}" returned 404/NOT_FOUND; automatically switching to "${suggested}"`,
+            `Gemini model "${primaryModel}" returned 404/NOT_FOUND; automatically switching to "${suggested}"`,
           );
           this.activeModel = suggested;
-          return await tryCall(this.activeModel);
+          return await tryCall(suggested, remaining);
         }
       }
 
@@ -219,20 +341,24 @@ export class GroceryAiService {
       if (isQuotaError) {
         // Try a lite model with its own Free Tier quota bucket before entering cooldown
         for (const liteModel of QUOTA_FALLBACK_MODELS) {
-          if (liteModel === this.activeModel || this.unavailableModels.has(liteModel)) {
+          const remaining = deadline - Date.now();
+          if (remaining <= 0) break;
+          if (liteModel === primaryModel || this.unavailableModels.has(liteModel)) {
             continue;
           }
           try {
             logger.warn(
-              `Gemini model "${this.activeModel}" hit 429 quota limit; switching to "${liteModel}"`,
+              `Gemini model "${primaryModel}" hit 429 quota limit; switching to "${liteModel}"`,
             );
-            const res = await tryCall(liteModel);
+            const res = await tryCall(liteModel, remaining);
             this.activeModel = liteModel;
             return res;
           } catch (liteErr) {
             const liteMsg = liteErr instanceof Error ? liteErr.message : String(liteErr);
             if (liteMsg.includes('404') || liteMsg.includes('NOT_FOUND')) {
               this.unavailableModels.add(liteModel);
+            } else if (liteErr instanceof TimeoutError || isGeminiTransientError(liteMsg)) {
+              this.modelCooldownUntil.set(liteModel, Date.now() + this.transientCooldownMs);
             }
           }
         }
@@ -254,6 +380,54 @@ export class GroceryAiService {
         throw new Error('GEMINI_QUOTA_COOLDOWN');
       }
 
+      const isTimedOut =
+        err instanceof TimeoutError || msg.includes('GEMINI_REQUEST_TIMEOUT');
+      const isTransient = isTimedOut || isGeminiTransientError(msg);
+
+      if (isTransient) {
+        this.modelCooldownUntil.set(
+          primaryModel,
+          Date.now() + this.transientCooldownMs,
+        );
+
+        // On fast 503 UNAVAILABLE / high-demand errors, try lighter fallback models within the 12s budget
+        if (!isTimedOut) {
+          const fallbackCandidates = [
+            ...new Set([...QUOTA_FALLBACK_MODELS, DEFAULT_GEMINI_MODEL]),
+          ];
+          for (const fallbackModel of fallbackCandidates) {
+            const remaining = deadline - Date.now();
+            if (remaining <= 0) break;
+            if (
+              fallbackModel === primaryModel ||
+              this.unavailableModels.has(fallbackModel) ||
+              Date.now() < (this.modelCooldownUntil.get(fallbackModel) ?? 0)
+            ) {
+              continue;
+            }
+            try {
+              logger.warn(
+                `Gemini model "${primaryModel}" returned 503/high-demand; trying fallback "${fallbackModel}"`,
+              );
+              return await tryCall(fallbackModel, remaining);
+            } catch (fbErr) {
+              const fbMsg = fbErr instanceof Error ? fbErr.message : String(fbErr);
+              if (fbMsg.includes('404') || fbMsg.includes('NOT_FOUND')) {
+                this.unavailableModels.add(fallbackModel);
+              } else if (fbErr instanceof TimeoutError || isGeminiTransientError(fbMsg)) {
+                this.modelCooldownUntil.set(
+                  fallbackModel,
+                  Date.now() + this.transientCooldownMs,
+                );
+                if (fbErr instanceof TimeoutError) break;
+              }
+            }
+          }
+        }
+
+        this.activateTransientCooldown(msg);
+      }
+
       throw err;
     }
   }
@@ -264,7 +438,7 @@ export class GroceryAiService {
       return { isGroceryRelated: false, items: [] };
     }
 
-    if (this.isQuotaExhausted()) {
+    if (this.isInCooldown()) {
       return this.fallbackParse(trimmed);
     }
 
@@ -346,7 +520,11 @@ export class GroceryAiService {
         items: sanitizedItems,
       };
     } catch (err) {
-      if (!(err instanceof Error && err.message === 'GEMINI_QUOTA_COOLDOWN')) {
+      const isCooldown =
+        err instanceof Error &&
+        (err.message === 'GEMINI_QUOTA_COOLDOWN' ||
+          err.message === 'GEMINI_TRANSIENT_COOLDOWN');
+      if (!isCooldown) {
         logger.error('Gemini parseGroupMessage failed; using fallback line parser', err);
       }
       return this.fallbackParse(trimmed);
@@ -458,8 +636,8 @@ export class GroceryAiService {
       };
     }
 
-    // If Gemini is currently in 429 quota cooldown, resolve locally in 0ms without hitting network
-    if (this.isQuotaExhausted()) {
+    // If Gemini is currently in quota or transient 503/timeout cooldown, resolve locally in 0ms without hitting network
+    if (this.isInCooldown()) {
       const fallback = this.pickFallbackCandidate(
         params.request,
         available,
@@ -611,7 +789,11 @@ ${strictRule}`;
         reason: parsed?.reason,
       };
     } catch (err) {
-      if (!(err instanceof Error && err.message === 'GEMINI_QUOTA_COOLDOWN')) {
+      const isCooldown =
+        err instanceof Error &&
+        (err.message === 'GEMINI_QUOTA_COOLDOWN' ||
+          err.message === 'GEMINI_TRANSIENT_COOLDOWN');
+      if (!isCooldown) {
         logger.warn('Gemini selectBestProduct failed; using fallback candidate check', err);
       }
       const fallback = this.pickFallbackCandidate(

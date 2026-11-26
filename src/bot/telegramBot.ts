@@ -30,12 +30,20 @@ import {
   maskIsraeliPhone,
   normalizeIsraeliPhone,
 } from '../utils/format.js';
+import { TimeoutError, withTimeout } from '../utils/timeout.js';
+
+export const TELEGRAM_UPDATE_TIMEOUT_MS = 90_000;
+export const TELEGRAM_LONG_UPDATE_TIMEOUT_MS = 240_000;
+const TELEGRAM_API_TIMEOUT_SECONDS = 60;
+const TIMEOUT_NOTIFY_MS = 5_000;
 
 export interface CreateTelegramBotDeps {
   config: AppConfig;
   db: BotDatabase;
   stores: MultiStoreManager;
   ai: GroceryAiService;
+  updateTimeoutMs?: number;
+  longUpdateTimeoutMs?: number;
 }
 
 function getSenderDisplayName(ctx: Context): string {
@@ -412,7 +420,100 @@ export async function checkIsUserAdmin(
 
 export function createTelegramBot(deps: CreateTelegramBotDeps): Bot {
   const { config, db, stores, ai } = deps;
-  const bot = new Bot(config.telegramBotToken);
+  const updateTimeoutMs = deps.updateTimeoutMs ?? TELEGRAM_UPDATE_TIMEOUT_MS;
+  const longUpdateTimeoutMs =
+    deps.longUpdateTimeoutMs ??
+    (deps.updateTimeoutMs !== undefined
+      ? Math.max(deps.updateTimeoutMs, TELEGRAM_UPDATE_TIMEOUT_MS)
+      : TELEGRAM_LONG_UPDATE_TIMEOUT_MS);
+
+  const bot = new Bot(config.telegramBotToken, {
+    client: { timeoutSeconds: TELEGRAM_API_TIMEOUT_SECONDS },
+  });
+
+  function resolveUpdateTimeoutMs(ctx: Context): number {
+    if (
+      deps.updateTimeoutMs !== undefined &&
+      deps.longUpdateTimeoutMs === undefined
+    ) {
+      return updateTimeoutMs;
+    }
+    const text = ctx.message?.text?.trim() ?? '';
+    if (/^\/(?:mirror|otp)(?:@\S+)?(?:\s|$)/i.test(text)) {
+      return longUpdateTimeoutMs;
+    }
+    const cbData = ctx.callbackQuery?.data;
+    if (cbData?.startsWith('a:')) {
+      const payload = db.getCallbackPayload(cbData.slice(2));
+      if (payload?.kind === 'mirror_cart' || payload?.kind === 'otp_skip') {
+        return longUpdateTimeoutMs;
+      }
+    }
+    return updateTimeoutMs;
+  }
+
+  // Hard per-update timeout middleware so no hung store/Chromium/AI call can ever freeze Grammy's polling loop
+  bot.use(async (ctx, next) => {
+    const timeoutMs = resolveUpdateTimeoutMs(ctx);
+    const updateId = ctx.update.update_id;
+    const chatId = ctx.chat?.id;
+    const preview = (
+      ctx.message?.text ??
+      ctx.callbackQuery?.data ??
+      'update'
+    ).slice(0, 60);
+
+    let timedOut = false;
+    const nextPromise = next();
+    nextPromise.catch((lateErr) => {
+      if (timedOut) {
+        logger.error(
+          `Timed-out Telegram update #${updateId} (${preview}) later rejected`,
+          lateErr,
+        );
+      }
+    });
+
+    try {
+      await withTimeout(
+        nextPromise,
+        timeoutMs,
+        `Telegram update #${updateId} timed out after ${timeoutMs}ms (${preview})`,
+        () => {
+          timedOut = true;
+        },
+      );
+    } catch (err) {
+      if (err instanceof TimeoutError) {
+        logger.error(
+          `Telegram update #${updateId} (chat=${chatId ?? 'unknown'}, "${preview}") exceeded hard timeout (${timeoutMs}ms); releasing polling loop`,
+        );
+        if (ctx.callbackQuery) {
+          await withTimeout(
+            ctx.answerCallbackQuery({
+              text: '⏱ הפעולה ארכה יותר מדי זמן ונעצרה',
+              show_alert: false,
+            }),
+            TIMEOUT_NOTIFY_MS,
+            'answerCallbackQuery timeout',
+          ).catch(() => {});
+        }
+        if (chatId !== undefined) {
+          await withTimeout(
+            bot.api.sendMessage(
+              chatId,
+              '⏱ <b>הפעולה ארכה יותר מדי זמן ונעצרה</b> כדי שהבוט יישאר זמין.\nאפשר לנסות שוב בעוד רגע.',
+              { parse_mode: 'HTML' },
+            ),
+            TIMEOUT_NOTIFY_MS,
+            'timeout notice sendMessage timeout',
+          ).catch(() => {});
+        }
+        return;
+      }
+      throw err;
+    }
+  });
 
   async function isUserAdmin(ctx: Context): Promise<boolean> {
     return checkIsUserAdmin(ctx, config.adminUserIds);
@@ -852,30 +953,38 @@ export function createTelegramBot(deps: CreateTelegramBotDeps): Bot {
 
     try {
       let lastReported = 0;
-      const result = await stores.mirrorCartToOtherStores({
-        chatId,
-        sourceStoreId,
-        senderName,
-        ai,
-        clearTargetFirst: true,
-        onProgress: async (done, total) => {
-          if (done === total || done === 1 || done - lastReported >= 3) {
-            lastReported = done;
-            try {
-              await bot.api.editMessageText(
-                chatId,
-                statusMsg.message_id,
-                `⏳ <b>מעתיק ומשווה פריטים מ-${escapeHtml(sourceMeta.displayName)}...</b>\n` +
-                  `📦 התקדמות: <b>${done}/${total}</b> פריטים` +
-                  (done === total ? '\n🔄 מסנכרן עגלות ומחשב מחיר סופי...' : ''),
-                { parse_mode: 'HTML' },
-              );
-            } catch {
-              // Ignore transient Telegram rate-limit or unchanged-message edit errors
+      const mirrorTimeoutMs =
+        longUpdateTimeoutMs > 10_000
+          ? longUpdateTimeoutMs - 5_000
+          : longUpdateTimeoutMs;
+      const result = await withTimeout(
+        stores.mirrorCartToOtherStores({
+          chatId,
+          sourceStoreId,
+          senderName,
+          ai,
+          clearTargetFirst: true,
+          onProgress: async (done, total) => {
+            if (done === total || done === 1 || done - lastReported >= 3) {
+              lastReported = done;
+              try {
+                await bot.api.editMessageText(
+                  chatId,
+                  statusMsg.message_id,
+                  `⏳ <b>מעתיק ומשווה פריטים מ-${escapeHtml(sourceMeta.displayName)}...</b>\n` +
+                    `📦 התקדמות: <b>${done}/${total}</b> פריטים` +
+                    (done === total ? '\n🔄 מסנכרן עגלות ומחשב מחיר סופי...' : ''),
+                  { parse_mode: 'HTML' },
+                );
+              } catch {
+                // Ignore transient Telegram rate-limit or unchanged-message edit errors
+              }
             }
-          }
-        },
-      });
+          },
+        }),
+        mirrorTimeoutMs,
+        `העתקת העגלה מ-${sourceMeta.shortName} ארכה יותר מדי זמן ונעצרה`,
+      );
 
       if (result.totalSourceItems === 0) {
         await bot.api.editMessageText(
@@ -3069,21 +3178,25 @@ export function createTelegramBot(deps: CreateTelegramBotDeps): Bot {
 }
 
 export async function registerBotCommands(bot: Bot): Promise<void> {
-  await bot.api.setMyCommands([
-    { command: 'compare', description: 'השוואת מחירים בין שופרסל, חצי חינם, סופר חביב וויקטורי' },
-    { command: 'mirror', description: 'העתקת כל הפריטים מהעגלה/הזמנה בשופרסל לשאר הרשתות' },
-    { command: 'cart', description: 'הצגת העגלות ופירוט פריטים בכל חנות' },
-    { command: 'remove', description: 'הסרה או עריכת כמות של פריטים בעגלות / בהזמנה' },
-    { command: 'checkout', description: 'בחירת הסל הזול ביותר ואישור הזמנה' },
-    { command: 'stores', description: 'רשימת החנויות המחוברות וקישורים לעגלות' },
-    { command: 'slots', description: 'בחירת יום ושעת משלוח' },
-    { command: 'orders', description: 'צפייה בהזמנות פעילות וטעינה לעדכון' },
-    { command: 'search', description: 'חיפוש והשוואת מחיר של מוצר בכל החנויות' },
-    { command: 'login_haviv', description: 'התחברות לסופר חביב באמצעות קוד SMS' },
-    { command: 'login_victory', description: 'התחברות לויקטורי אונליין באמצעות קוד SMS' },
-    { command: 'otp', description: 'שליחת קוד אימות SMS להתחברות לחנות' },
-    { command: 'clear', description: '(מנהל) ריקון העגלות' },
-    { command: 'id', description: 'הצגת מזהה הקבוצה והמשתמש' },
-    { command: 'help', description: 'מדריך שימוש בבוט הקניות' },
-  ]);
+  await withTimeout(
+    bot.api.setMyCommands([
+      { command: 'compare', description: 'השוואת מחירים בין שופרסל, חצי חינם, סופר חביב וויקטורי' },
+      { command: 'mirror', description: 'העתקת כל הפריטים מהעגלה/הזמנה בשופרסל לשאר הרשתות' },
+      { command: 'cart', description: 'הצגת העגלות ופירוט פריטים בכל חנות' },
+      { command: 'remove', description: 'הסרה או עריכת כמות של פריטים בעגלות / בהזמנה' },
+      { command: 'checkout', description: 'בחירת הסל הזול ביותר ואישור הזמנה' },
+      { command: 'stores', description: 'רשימת החנויות המחוברות וקישורים לעגלות' },
+      { command: 'slots', description: 'בחירת יום ושעת משלוח' },
+      { command: 'orders', description: 'צפייה בהזמנות פעילות וטעינה לעדכון' },
+      { command: 'search', description: 'חיפוש והשוואת מחיר של מוצר בכל החנויות' },
+      { command: 'login_haviv', description: 'התחברות לסופר חביב באמצעות קוד SMS' },
+      { command: 'login_victory', description: 'התחברות לויקטורי אונליין באמצעות קוד SMS' },
+      { command: 'otp', description: 'שליחת קוד אימות SMS להתחברות לחנות' },
+      { command: 'clear', description: '(מנהל) ריקון העגלות' },
+      { command: 'id', description: 'הצגת מזהה הקבוצה והמשתמש' },
+      { command: 'help', description: 'מדריך שימוש בבוט הקניות' },
+    ]),
+    15_000,
+    'Telegram setMyCommands timed out after 15s',
+  );
 }
